@@ -73,7 +73,7 @@ def create_user(
         whatsapp_number=data.whatsapp_number,
         department=data.department,
         title=data.title,
-        employee_id=data.employee_id,
+        employee_id=data.employee_id or None,
         role=data.role,
         location_id=data.location_id,
         preferred_channels=data.preferred_channels,
@@ -86,8 +86,14 @@ def create_user(
         resource_type="user",
         details={"email": data.email}
     ))
-    db.commit()
-    db.refresh(user)
+    try:
+        db.commit()
+        db.refresh(user)
+    except Exception as e:
+        db.rollback()
+        if "unique" in str(e).lower() or "duplicate" in str(e).lower():
+            raise HTTPException(status_code=400, detail="A user with this email or employee ID already exists")
+        raise HTTPException(status_code=500, detail="Failed to create user")
     return user
 
 
@@ -115,6 +121,8 @@ def update_user(
         raise HTTPException(status_code=404, detail="User not found")
 
     for field, value in data.model_dump(exclude_none=True).items():
+        if field == 'employee_id' and value == '':
+            value = None
         setattr(user, field, value)
 
     db.add(AuditLog(user_id=current_user.id, action="update_user", resource_type="user", resource_id=user_id))
