@@ -2,12 +2,14 @@ from fastapi import APIRouter, Request, Form, Depends, HTTPException
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
-from typing import Optional
+from typing import Optional, List
 from app.database import get_db
+from app.core.deps import get_current_user, require_manager
 from app.models import (
     Notification, NotificationResponse, IncomingMessage,
     User, ResponseType, AlertChannel, DeliveryLog, DeliveryStatus
 )
+from app.schemas import IncomingMessageResponse
 from datetime import datetime, timezone
 import logging
 
@@ -178,12 +180,13 @@ async def voice_response(
     return Response(content=twiml, media_type="application/xml")
 
 
-@router.get("/incoming-messages")
+@router.get("/incoming-messages", response_model=List[IncomingMessageResponse])
 def get_incoming_messages(
     limit: int = 50,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
-    """View incoming messages (internal use)."""
+    """View incoming messages (authenticated users only)."""
     messages = db.query(IncomingMessage).order_by(
         desc(IncomingMessage.received_at)
     ).limit(limit).all()
