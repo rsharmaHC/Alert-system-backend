@@ -116,9 +116,15 @@ def update_user(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin)
 ):
-    user = db.query(User).filter(User.id == user_id, User.deleted_at == None).first()
+    # Check for user including soft-deleted
+    user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    
+    # Auto-restore soft-deleted user
+    if user.deleted_at is not None:
+        user.deleted_at = None
+        user.is_active = True
 
     # Check for duplicate employee_id if it's being updated
     if data.employee_id is not None:
@@ -205,7 +211,9 @@ async def import_users_csv(
                 failed += 1
                 continue
 
-            existing = db.query(User).filter(User.email == email, User.deleted_at == None).first()
+            # Check for existing user (including soft-deleted)
+            existing = db.query(User).filter(User.email == email).first()
+            is_restored = False
 
             role_str = row.get('role', 'viewer').strip().lower()
             try:
@@ -214,6 +222,13 @@ async def import_users_csv(
                 role = UserRole.VIEWER
 
             if existing:
+                # Restore soft-deleted user
+                if existing.deleted_at is not None:
+                    existing.deleted_at = None
+                    existing.is_active = True
+                    is_restored = True
+                
+                # Update user fields
                 existing.first_name = first_name
                 existing.last_name = last_name
                 existing.phone = row.get('phone', '').strip() or existing.phone
@@ -221,6 +236,8 @@ async def import_users_csv(
                 existing.title = row.get('title', '').strip() or existing.title
                 existing.employee_id = row.get('employee_id', '').strip() or existing.employee_id
                 updated += 1
+                if is_restored:
+                    logger.info(f"Restored soft-deleted user: {email}")
             else:
                 import secrets
                 default_password = secrets.token_urlsafe(12)
