@@ -120,7 +120,9 @@ def update_user(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    for field, value in data.model_dump(exclude_none=True).items():
+    # Use exclude_unset=True to only update fields that were explicitly provided
+    # This allows setting fields to None (to clear them) while not requiring all fields
+    for field, value in data.model_dump(exclude_unset=True).items():
         if field == 'employee_id' and value == '':
             value = None
         setattr(user, field, value)

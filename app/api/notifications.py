@@ -68,7 +68,8 @@ def update_incident(
     if not incident:
         raise HTTPException(status_code=404, detail="Incident not found")
 
-    for field, value in data.model_dump(exclude_none=True).items():
+    # Use exclude_unset=True to allow clearing fields to None
+    for field, value in data.model_dump(exclude_unset=True).items():
         setattr(incident, field, value)
 
     if data.status == IncidentStatus.RESOLVED:

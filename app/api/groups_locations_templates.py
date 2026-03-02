@@ -92,7 +92,8 @@ def update_group(
     group = db.query(Group).filter(Group.id == group_id).first()
     if not group:
         raise HTTPException(status_code=404, detail="Group not found")
-    for field, value in data.model_dump(exclude_none=True).items():
+    # Use exclude_unset=True to allow clearing fields to None
+    for field, value in data.model_dump(exclude_unset=True).items():
         setattr(group, field, value)
     db.commit()
     db.refresh(group)
@@ -204,7 +205,8 @@ def update_location(
     location = db.query(Location).filter(Location.id == location_id).first()
     if not location:
         raise HTTPException(status_code=404, detail="Location not found")
-    for field, value in data.model_dump(exclude_none=True).items():
+    # Use exclude_unset=True to allow clearing fields to None
+    for field, value in data.model_dump(exclude_unset=True).items():
         setattr(location, field, value)
     db.commit()
     db.refresh(location)
@@ -266,7 +268,8 @@ def update_template(
     template = db.query(NotificationTemplate).filter(NotificationTemplate.id == template_id).first()
     if not template:
         raise HTTPException(status_code=404, detail="Template not found")
-    for field, value in data.model_dump(exclude_none=True).items():
+    # Use exclude_unset=True to allow clearing fields to None
+    for field, value in data.model_dump(exclude_unset=True).items():
         setattr(template, field, value)
     db.commit()
     db.refresh(template)
