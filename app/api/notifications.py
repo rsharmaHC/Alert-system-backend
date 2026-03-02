@@ -68,7 +68,8 @@ def update_incident(
     if not incident:
         raise HTTPException(status_code=404, detail="Incident not found")
 
-    for field, value in data.model_dump(exclude_none=True).items():
+    # Use exclude_unset=True to allow clearing fields to None
+    for field, value in data.model_dump(exclude_unset=True).items():
         setattr(incident, field, value)
 
     if data.status == IncidentStatus.RESOLVED:
@@ -138,7 +139,8 @@ def create_notification(
         slack_webhook_url=data.slack_webhook_url,
         teams_webhook_url=data.teams_webhook_url,
         created_by_id=current_user.id,
-        status=NotificationStatus.SCHEDULED if data.scheduled_at else NotificationStatus.DRAFT
+        # Set status to SENDING for immediate send, SCHEDULED for future
+        status=NotificationStatus.SCHEDULED if data.scheduled_at else NotificationStatus.SENDING
     )
 
     if data.target_group_ids:
@@ -159,7 +161,7 @@ def create_notification(
     db.commit()
     db.refresh(notification)
 
-    # Send immediately if not scheduled
+    # Send immediately if not scheduled (task will change status to SENT when complete)
     if not data.scheduled_at:
         send_notification_task.delay(notification.id)
 
@@ -291,7 +293,7 @@ def submit_response(
     response = NRModel(
         notification_id=notification_id,
         user_id=current_user.id,
-        channel=AlertChannel.SMS,
+        channel=AlertChannel.WEB,
         response_type=data.response_type,
         message=data.message,
         latitude=data.latitude,

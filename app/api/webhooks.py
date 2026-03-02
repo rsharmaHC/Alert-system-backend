@@ -1,18 +1,70 @@
 from fastapi import APIRouter, Request, Form, Depends, HTTPException
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
-from sqlalchemy import desc
-from typing import Optional
+from sqlalchemy import desc, update
+from typing import Optional, List
 from app.database import get_db
+from app.core.deps import get_current_user, require_manager
 from app.models import (
     Notification, NotificationResponse, IncomingMessage,
     User, ResponseType, AlertChannel, DeliveryLog, DeliveryStatus
 )
+from app.schemas import IncomingMessageResponse
 from datetime import datetime, timezone
 import logging
 
 router = APIRouter(prefix="/webhooks", tags=["Webhooks"])
 logger = logging.getLogger(__name__)
+
+
+def _find_user_by_phone(db: Session, phone_number: str) -> Optional[User]:
+    """Find user by phone number with proper validation.
+    
+    Handles various phone formats: +1234567890, 1234567890, (123) 456-7890
+    Returns None if phone number is empty, invalid, or ambiguous (multiple matches).
+    """
+    if not phone_number or not phone_number.strip():
+        return None
+    
+    # Clean and extract digits
+    phone_clean = ''.join(c for c in phone_number if c.isdigit())
+    
+    if len(phone_clean) < 10:
+        logger.warning(f"Invalid phone number format: {phone_number}")
+        return None
+    
+    # Get last 10 digits for matching (handles country codes)
+    last_10 = phone_clean[-10:]
+    
+    # Strategy 1: Try exact match on full cleaned number (most precise)
+    exact_match = db.query(User).filter(User.phone == phone_clean).first()
+    if exact_match:
+        return exact_match
+    
+    # Strategy 2: Try match with + prefix
+    with_plus = f"+{phone_clean}"
+    exact_match = db.query(User).filter(User.phone == with_plus).first()
+    if exact_match:
+        return exact_match
+    
+    # Strategy 3: Match by last 10 digits - but check for AMBIGUOUS matches
+    # This prevents matching wrong user when multiple have same last 10 digits
+    matches = db.query(User).filter(
+        User.phone.ilike(f"%{last_10}")  # Ends with last 10 digits
+    ).all()
+    
+    if len(matches) == 1:
+        return matches[0]  # Unambiguous match
+    elif len(matches) > 1:
+        # AMBIGUOUS - multiple users have numbers ending in same 10 digits
+        logger.warning(
+            f"Ambiguous phone match for {phone_number} (last 10: {last_10}). "
+            f"Found {len(matches)} users: {[u.email for u in matches]}. "
+            "Cannot determine correct user - response not recorded."
+        )
+        return None  # Don't guess - better to fail than match wrong user
+    
+    return None  # No match found
 
 
 @router.post("/sms/inbound")
@@ -39,12 +91,7 @@ async def sms_inbound(
         response_type = ResponseType.CUSTOM
 
     # Find the user by phone
-    phone_variants = [From, From.replace("+1", ""), From[-10:]]
-    user = None
-    for ph in phone_variants:
-        user = db.query(User).filter(User.phone.contains(ph[-10:])).first()
-        if user:
-            break
+    user = _find_user_by_phone(db, From)
 
     # Find the most recent active notification sent to this user
     notification = None
@@ -122,10 +169,12 @@ async def sms_status_callback(
                 log.status = new_status
                 if new_status == DeliveryStatus.DELIVERED:
                     log.delivered_at = datetime.now(timezone.utc)
-                    # Update notification delivered_count
-                    notif = log.notification
-                    if notif:
-                        notif.delivered_count = (notif.delivered_count or 0) + 1
+                    # Update notification delivered_count atomically to avoid race condition
+                    db.execute(
+                        update(Notification)
+                        .where(Notification.id == log.notification_id)
+                        .values(delivered_count=Notification.delivered_count + 1)
+                    )
             db.commit()
 
     return Response(content="", status_code=200)
@@ -144,7 +193,8 @@ async def voice_response(
 
     response_type = ResponseType.SAFE if Digits == "1" else ResponseType.NEED_HELP if Digits == "2" else ResponseType.ACKNOWLEDGED
 
-    user = db.query(User).filter(User.phone.contains(From[-10:])).first()
+    # Find user by phone with proper validation (prevents matching empty From)
+    user = _find_user_by_phone(db, From)
 
     latest_log = None
     if user:
@@ -178,13 +228,33 @@ async def voice_response(
     return Response(content=twiml, media_type="application/xml")
 
 
-@router.get("/incoming-messages")
+@router.get("/incoming-messages", response_model=List[IncomingMessageResponse])
 def get_incoming_messages(
     limit: int = 50,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
-    """View incoming messages (internal use)."""
-    messages = db.query(IncomingMessage).order_by(
+    """View incoming messages (authenticated users only)."""
+    # Query with user relationship to include user_name in response
+    messages = db.query(IncomingMessage).outerjoin(
+        User, IncomingMessage.user_id == User.id
+    ).order_by(
         desc(IncomingMessage.received_at)
     ).limit(limit).all()
-    return messages
+    
+    # Build response with user_name from related user
+    result = []
+    for msg in messages:
+        result.append({
+            "id": msg.id,
+            "from_number": msg.from_number,
+            "body": msg.body,
+            "channel": msg.channel,
+            "user_id": msg.user_id,
+            "user_name": msg.user.full_name if msg.user else None,
+            "notification_id": msg.notification_id,
+            "is_processed": msg.is_processed,
+            "received_at": msg.received_at
+        })
+    
+    return result

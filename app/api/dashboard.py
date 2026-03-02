@@ -27,14 +27,19 @@ def get_dashboard_stats(
     total_locations = db.query(Location).filter(Location.is_active == True).count()
     active_incidents = db.query(Incident).filter(Incident.status == IncidentStatus.ACTIVE).count()
 
+    # Count notifications that were actually dispatched today
+    # Include: SENT (completed), SENDING (in progress), FAILED (attempted but failed, e.g., zero recipients)
+    # Exclude: DRAFT (never sent), SCHEDULED (not yet sent)
+    dispatched_statuses = [NotificationStatus.SENT, NotificationStatus.SENDING, NotificationStatus.FAILED]
+    
     notifications_today = db.query(Notification).filter(
         Notification.created_at >= today_start,
-        Notification.status.in_([NotificationStatus.SENT, NotificationStatus.SENDING])
+        Notification.status.in_(dispatched_statuses)
     ).count()
 
     notifications_week = db.query(Notification).filter(
         Notification.created_at >= week_start,
-        Notification.status.in_([NotificationStatus.SENT, NotificationStatus.SENDING])
+        Notification.status.in_(dispatched_statuses)
     ).count()
 
     recent_notifications = db.query(Notification).order_by(

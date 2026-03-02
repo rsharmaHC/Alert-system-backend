@@ -103,6 +103,8 @@ class CSVImportResponse(BaseModel):
     updated: int
     failed: int
     errors: List[str]
+    # Passwords for newly created users (only for new accounts, not updates)
+    created_users: List[dict] = []  # [{email, password}, ...]
 
 
 # ─── LOCATION ─────────────────────────────────────────────────────────────────
@@ -125,6 +127,7 @@ class LocationUpdate(BaseModel):
     city: Optional[str] = None
     state: Optional[str] = None
     zip_code: Optional[str] = None
+    country: Optional[str] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     geofence_radius_miles: Optional[float] = None
@@ -167,6 +170,7 @@ class GroupUpdate(BaseModel):
     location_id: Optional[int] = None
     dynamic_filter: Optional[dict] = None
     is_active: Optional[bool] = None
+    member_ids: Optional[List[int]] = None  # Replace entire member list if provided
 
 
 class GroupMemberAdd(BaseModel):
@@ -330,7 +334,10 @@ class DeliveryLogResponse(BaseModel):
 
 
 class NotificationResponseCreate(BaseModel):
-    notification_id: int
+    """Schema for submitting a safety response to a notification.
+    
+    Note: notification_id is provided via URL path parameter, not in request body.
+    """
     response_type: ResponseType
     message: Optional[str] = None
     latitude: Optional[float] = None
@@ -379,5 +386,3 @@ class IncomingMessageResponse(BaseModel):
     is_processed: bool
     received_at: datetime
 
-    class Config:
-        from_attributes = True

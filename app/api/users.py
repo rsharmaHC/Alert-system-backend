@@ -120,7 +120,24 @@ def update_user(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    for field, value in data.model_dump(exclude_none=True).items():
+    # Check for duplicate employee_id if it's being updated
+    if data.employee_id is not None:
+        employee_id_value = data.employee_id if data.employee_id != '' else None
+        if employee_id_value:
+            existing = db.query(User).filter(
+                User.employee_id == employee_id_value,
+                User.deleted_at == None,
+                User.id != user_id  # Exclude current user from check
+            ).first()
+            if existing:
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Employee ID '{employee_id_value}' already assigned to another user"
+                )
+
+    # Use exclude_unset=True to only update fields that were explicitly provided
+    # This allows setting fields to None (to clear them) while not requiring all fields
+    for field, value in data.model_dump(exclude_unset=True).items():
         if field == 'employee_id' and value == '':
             value = None
         setattr(user, field, value)
@@ -160,6 +177,8 @@ async def import_users_csv(
     """
     Import users from CSV. Expected columns:
     first_name, last_name, email, phone, department, title, employee_id, role
+    
+    Returns passwords for newly created users - admin must distribute these securely.
     """
     if not file.filename.endswith('.csv'):
         raise HTTPException(status_code=400, detail="File must be a CSV")
@@ -169,6 +188,7 @@ async def import_users_csv(
 
     created, updated, failed = 0, 0, 0
     errors = []
+    created_users = []  # Track new users and their passwords
 
     for i, row in enumerate(reader, start=2):
         try:
@@ -218,6 +238,13 @@ async def import_users_csv(
                 )
                 db.add(user)
                 created += 1
+                # Track new user credentials for secure distribution
+                created_users.append({
+                    "email": email,
+                    "password": default_password,
+                    "first_name": first_name,
+                    "last_name": last_name
+                })
 
         except Exception as e:
             errors.append(f"Row {i}: {str(e)}")
@@ -230,7 +257,13 @@ async def import_users_csv(
         details={"created": created, "updated": updated, "failed": failed}
     ))
     db.commit()
-    return CSVImportResponse(created=created, updated=updated, failed=failed, errors=errors[:20])
+    return CSVImportResponse(
+        created=created,
+        updated=updated,
+        failed=failed,
+        errors=errors[:20],
+        created_users=created_users
+    )
 
 
 @router.get("/meta/departments")
