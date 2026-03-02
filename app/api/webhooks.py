@@ -21,12 +21,12 @@ def _find_user_by_phone(db: Session, phone_number: str) -> Optional[User]:
     """Find user by phone number with proper validation.
     
     Handles various phone formats: +1234567890, 1234567890, (123) 456-7890
-    Returns None if phone number is empty or no match found.
+    Returns None if phone number is empty, invalid, or ambiguous (multiple matches).
     """
     if not phone_number or not phone_number.strip():
         return None
     
-    # Clean and extract last 10 digits for matching
+    # Clean and extract digits
     phone_clean = ''.join(c for c in phone_number if c.isdigit())
     
     if len(phone_clean) < 10:
@@ -36,21 +36,35 @@ def _find_user_by_phone(db: Session, phone_number: str) -> Optional[User]:
     # Get last 10 digits for matching (handles country codes)
     last_10 = phone_clean[-10:]
     
-    # Try multiple matching strategies
-    phone_variants = [
-        phone_number,  # Original format
-        f"+{phone_clean}",  # With + prefix
-        phone_clean,  # Digits only
-        last_10,  # Last 10 digits
-    ]
+    # Strategy 1: Try exact match on full cleaned number (most precise)
+    exact_match = db.query(User).filter(User.phone == phone_clean).first()
+    if exact_match:
+        return exact_match
     
-    for ph in phone_variants:
-        if ph and len(ph) >= 10:
-            user = db.query(User).filter(User.phone.contains(ph[-10:])).first()
-            if user:
-                return user
+    # Strategy 2: Try match with + prefix
+    with_plus = f"+{phone_clean}"
+    exact_match = db.query(User).filter(User.phone == with_plus).first()
+    if exact_match:
+        return exact_match
     
-    return None
+    # Strategy 3: Match by last 10 digits - but check for AMBIGUOUS matches
+    # This prevents matching wrong user when multiple have same last 10 digits
+    matches = db.query(User).filter(
+        User.phone.ilike(f"%{last_10}")  # Ends with last 10 digits
+    ).all()
+    
+    if len(matches) == 1:
+        return matches[0]  # Unambiguous match
+    elif len(matches) > 1:
+        # AMBIGUOUS - multiple users have numbers ending in same 10 digits
+        logger.warning(
+            f"Ambiguous phone match for {phone_number} (last 10: {last_10}). "
+            f"Found {len(matches)} users: {[u.email for u in matches]}. "
+            "Cannot determine correct user - response not recorded."
+        )
+        return None  # Don't guess - better to fail than match wrong user
+    
+    return None  # No match found
 
 
 @router.post("/sms/inbound")
