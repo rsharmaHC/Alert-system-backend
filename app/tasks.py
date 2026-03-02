@@ -23,6 +23,11 @@ def send_notification_task(self, notification_id: int):
             logger.error(f"Notification {notification_id} not found")
             return
 
+        # Prevent re-processing if already sent
+        if notification.status in [NotificationStatus.SENT, NotificationStatus.PARTIALLY_SENT]:
+            logger.info(f"Notification {notification_id} already processed (status={notification.status})")
+            return
+
         notification.status = NotificationStatus.SENDING
         db.commit()
 
@@ -37,30 +42,53 @@ def send_notification_task(self, notification_id: int):
             db.commit()
             return
 
-        # Dispatch per recipient per channel
+        # Dispatch per recipient per channel (skip if already sent)
+        dispatched_count = 0
         for user in recipients:
             for channel in notification.channels:
-                _send_to_channel.delay(notification_id, user.id, channel)
+                # Check if already dispatched to avoid duplicates on retry
+                existing_log = db.query(DeliveryLog).filter(
+                    DeliveryLog.notification_id == notification_id,
+                    DeliveryLog.user_id == user.id,
+                    DeliveryLog.channel == channel
+                ).first()
+                
+                if not existing_log:
+                    _send_to_channel.delay(notification_id, user.id, channel)
+                    dispatched_count += 1
 
         notification.status = NotificationStatus.SENT
         notification.sent_at = datetime.now(timezone.utc)
         db.commit()
 
-        # Send to webhooks (not per-user)
-        if AlertChannel.SLACK in notification.channels and notification.slack_webhook_url:
-            webhook_service.send_slack(
-                notification.slack_webhook_url,
-                notification.message,
-                notification.title
-            )
-        if AlertChannel.TEAMS in notification.channels and notification.teams_webhook_url:
-            webhook_service.send_teams(
-                notification.teams_webhook_url,
-                notification.message,
-                notification.title
-            )
+        logger.info(f"Notification {notification_id}: dispatched {dispatched_count} subtasks to {len(recipients)} recipients")
 
-        logger.info(f"Notification {notification_id} dispatched to {len(recipients)} recipients")
+        # Send to webhooks AFTER marking notification as SENT (webhook failure won't trigger retry)
+        webhook_errors = []
+        if AlertChannel.SLACK in notification.channels and notification.slack_webhook_url:
+            try:
+                webhook_service.send_slack(
+                    notification.slack_webhook_url,
+                    notification.message,
+                    notification.title
+                )
+            except Exception as e:
+                logger.error(f"Slack webhook failed for notification {notification_id}: {e}")
+                webhook_errors.append(f"Slack: {e}")
+                
+        if AlertChannel.TEAMS in notification.channels and notification.teams_webhook_url:
+            try:
+                webhook_service.send_teams(
+                    notification.teams_webhook_url,
+                    notification.message,
+                    notification.title
+                )
+            except Exception as e:
+                logger.error(f"Teams webhook failed for notification {notification_id}: {e}")
+                webhook_errors.append(f"Teams: {e}")
+
+        if webhook_errors:
+            logger.warning(f"Notification {notification_id} sent successfully but webhooks failed: {webhook_errors}")
 
     except Exception as e:
         logger.error(f"Error dispatching notification {notification_id}: {e}")
@@ -81,6 +109,17 @@ def _send_to_channel(self, notification_id: int, user_id: int, channel: str):
         user = db.query(User).filter(User.id == user_id).first()
 
         if not notification or not user:
+            return
+
+        # Idempotency check: skip if already processed (prevents duplicates on retry)
+        existing_log = db.query(DeliveryLog).filter(
+            DeliveryLog.notification_id == notification_id,
+            DeliveryLog.user_id == user_id,
+            DeliveryLog.channel == channel
+        ).first()
+        
+        if existing_log and existing_log.status in [DeliveryStatus.SENT, DeliveryStatus.DELIVERED]:
+            logger.info(f"Notification {notification_id} to user {user_id} via {channel} already sent, skipping duplicate")
             return
 
         log = DeliveryLog(
