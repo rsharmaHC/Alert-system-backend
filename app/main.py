@@ -92,9 +92,17 @@ app = FastAPI(
 
 # ─── MIDDLEWARE ───────────────────────────────────────────────────────────────
 
+# Allow production frontend + localhost + Vercel preview URLs
+allowed_origins = [
+    settings.FRONTEND_URL or "http://localhost:3000",
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "https://alert-system-frontend-jq7u.vercel.app",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.FRONTEND_URL, "http://localhost:3000", "http://localhost:5173"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
