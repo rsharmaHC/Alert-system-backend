@@ -221,7 +221,26 @@ def get_incoming_messages(
     current_user: User = Depends(get_current_user)
 ):
     """View incoming messages (authenticated users only)."""
-    messages = db.query(IncomingMessage).order_by(
+    # Query with user relationship to include user_name in response
+    messages = db.query(IncomingMessage).outerjoin(
+        User, IncomingMessage.user_id == User.id
+    ).order_by(
         desc(IncomingMessage.received_at)
     ).limit(limit).all()
-    return messages
+    
+    # Build response with user_name from related user
+    result = []
+    for msg in messages:
+        result.append({
+            "id": msg.id,
+            "from_number": msg.from_number,
+            "body": msg.body,
+            "channel": msg.channel,
+            "user_id": msg.user_id,
+            "user_name": msg.user.full_name if msg.user else None,
+            "notification_id": msg.notification_id,
+            "is_processed": msg.is_processed,
+            "received_at": msg.received_at
+        })
+    
+    return result

@@ -379,5 +379,3 @@ class IncomingMessageResponse(BaseModel):
     is_processed: bool
     received_at: datetime
 
-    class Config:
-        from_attributes = True
