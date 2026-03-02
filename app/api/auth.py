@@ -26,16 +26,25 @@ def login(request: LoginRequest, req: Request, db: Session = Depends(get_db)):
         User.deleted_at == None
     ).first()
 
-    if not user or not verify_password(request.password, user.hashed_password):
+    # Check if user exists
+    if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid email or password"
+            detail="No account found with this email address"
         )
 
+    # Check if account is active
     if not user.is_active:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Account is deactivated. Contact your administrator."
+        )
+
+    # Check password
+    if not verify_password(request.password, user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect password"
         )
 
     access_token = create_access_token({"sub": str(user.id), "role": user.role})
@@ -128,14 +137,20 @@ def logout(
 @router.post("/forgot-password")
 def forgot_password(request: PasswordResetRequest, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == request.email, User.deleted_at == None).first()
-    # Always return success to prevent email enumeration
-    if user:
-        token = secrets.token_urlsafe(32)
-        user.password_reset_token = token
-        user.password_reset_expires = datetime.now(timezone.utc) + timedelta(hours=1)
-        db.commit()
-        email_service.send_password_reset_email(user.email, token, user.full_name)
-    return {"message": "If that email exists, a reset link has been sent."}
+    
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No account found with this email address"
+        )
+    
+    token = secrets.token_urlsafe(32)
+    user.password_reset_token = token
+    user.password_reset_expires = datetime.now(timezone.utc) + timedelta(hours=1)
+    db.commit()
+    email_service.send_password_reset_email(user.email, token, user.full_name)
+    
+    return {"message": "Password reset email sent successfully"}
 
 
 @router.post("/reset-password")
