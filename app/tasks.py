@@ -217,17 +217,31 @@ def process_scheduled_notifications():
     db = SessionLocal()
     try:
         now = datetime.now(timezone.utc)
-        due_notifications = db.query(Notification).filter(
-            Notification.status == NotificationStatus.SCHEDULED,
-            Notification.scheduled_at <= now
+        
+        # Atomically claim due notifications to prevent duplicate dispatch
+        # Update status from SCHEDULED to SENDING in a single query
+        claimed = db.execute(
+            update(Notification)
+            .where(
+                Notification.status == NotificationStatus.SCHEDULED,
+                Notification.scheduled_at <= now
+            )
+            .values(status=NotificationStatus.SENDING)
+            .returning(Notification.id)
         ).all()
+        
+        db.commit()
+        
+        # Dispatch only the notifications we claimed
+        for (notification_id,) in claimed:
+            logger.info(f"Dispatching scheduled notification {notification_id}")
+            send_notification_task.delay(notification_id)
 
-        for notification in due_notifications:
-            logger.info(f"Dispatching scheduled notification {notification.id}")
-            send_notification_task.delay(notification.id)
-
-        if due_notifications:
-            logger.info(f"Dispatched {len(due_notifications)} scheduled notifications")
+        if claimed:
+            logger.info(f"Dispatched {len(claimed)} scheduled notifications")
+    except Exception as e:
+        logger.error(f"Error processing scheduled notifications: {e}")
+        db.rollback()
     finally:
         db.close()
 
