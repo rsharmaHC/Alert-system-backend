@@ -291,7 +291,7 @@ def submit_response(
     response = NRModel(
         notification_id=notification_id,
         user_id=current_user.id,
-        channel=AlertChannel.SMS,
+        channel=AlertChannel.WEB,
         response_type=data.response_type,
         message=data.message,
         latitude=data.latitude,

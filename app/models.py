@@ -54,6 +54,7 @@ class AlertChannel(str, enum.Enum):
     WHATSAPP = "whatsapp"
     SLACK = "slack"
     TEAMS = "teams"
+    WEB = "web"
 
 
 class IncidentSeverity(str, enum.Enum):

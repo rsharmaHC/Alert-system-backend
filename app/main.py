@@ -5,7 +5,9 @@ from contextlib import asynccontextmanager
 import logging
 
 from app.config import settings
-from app.database import engine, Base
+from app.database import engine, Base, SessionLocal
+from app.models import User, UserRole
+from app.core.security import hash_password
 from app.api.auth import router as auth_router
 from app.api.users import router as users_router
 from app.api.groups_locations_templates import (
@@ -24,6 +26,29 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def ensure_alertchannel_enum():
+    """Ensure 'web' value exists in alertchannel enum (PostgreSQL)."""
+    db = SessionLocal()
+    try:
+        # Check if 'web' already exists in the enum
+        result = db.execute(
+            "SELECT EXISTS(SELECT 1 FROM pg_enum WHERE enumlabel = 'web' AND enumtypid = (SELECT oid FROM pg_type WHERE typname = 'alertchannel'))"
+        ).scalar()
+        
+        if not result:
+            # Add 'web' to the alertchannel enum
+            db.execute("ALTER TYPE alertchannel ADD VALUE IF NOT EXISTS 'web'")
+            db.commit()
+            logger.info("Added 'web' to alertchannel enum")
+        else:
+            logger.info("alertchannel enum already has 'web' value")
+    except Exception as e:
+        logger.error(f"Error ensuring alertchannel enum: {e}")
+        db.rollback()
+    finally:
+        db.close()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Create all DB tables on startup
@@ -31,10 +56,11 @@ async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
     logger.info("Database tables ready")
 
+    # Ensure alertchannel enum has 'web' value
+    logger.info("Ensuring alertchannel enum has 'web' value...")
+    ensure_alertchannel_enum()
+
     # Seed default super admin if no users exist
-    from app.database import SessionLocal
-    from app.models import User, UserRole
-    from app.core.security import hash_password
     db = SessionLocal()
     try:
         if db.query(User).count() == 0:
