@@ -127,6 +127,7 @@ class LocationUpdate(BaseModel):
     city: Optional[str] = None
     state: Optional[str] = None
     zip_code: Optional[str] = None
+    country: Optional[str] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     geofence_radius_miles: Optional[float] = None
