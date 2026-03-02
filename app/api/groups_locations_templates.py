@@ -92,9 +92,34 @@ def update_group(
     group = db.query(Group).filter(Group.id == group_id).first()
     if not group:
         raise HTTPException(status_code=404, detail="Group not found")
-    # Use exclude_unset=True to allow clearing fields to None
-    for field, value in data.model_dump(exclude_unset=True).items():
+    
+    # Handle member_ids separately (M2M relationship can't be set via setattr)
+    member_ids = data.member_ids
+    update_data = data.model_dump(exclude_unset=True, exclude={'member_ids'})
+    
+    # Update regular fields
+    for field, value in update_data.items():
         setattr(group, field, value)
+    
+    # Update members if provided (replace entire member list)
+    if member_ids is not None:
+        # Validate all user IDs exist
+        valid_users = db.query(User).filter(
+            User.id.in_(member_ids),
+            User.deleted_at == None
+        ).all()
+        valid_ids = {u.id for u in valid_users}
+        invalid_ids = set(member_ids) - valid_ids
+        
+        if invalid_ids:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid user IDs: {list(invalid_ids)}. Users must exist and not be deleted."
+            )
+        
+        # Replace members list
+        group.members = valid_users
+    
     db.commit()
     db.refresh(group)
     return GroupResponse(

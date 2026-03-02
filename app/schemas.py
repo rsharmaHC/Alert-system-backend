@@ -170,6 +170,7 @@ class GroupUpdate(BaseModel):
     location_id: Optional[int] = None
     dynamic_filter: Optional[dict] = None
     is_active: Optional[bool] = None
+    member_ids: Optional[List[int]] = None  # Replace entire member list if provided
 
 
 class GroupMemberAdd(BaseModel):
