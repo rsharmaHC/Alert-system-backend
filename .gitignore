@@ -55,5 +55,11 @@ htmlcov/
 .dmypy.json
 dmypy.json
 
-
-FIXES_SUMMARY.md
+# Temporary documentation files (not needed in repo)
+*_SUMMARY.md
+*_GUIDE.md
+*_STRATEGY.md
+*_TROUBLESHOOTING.md
+*_STATUS.md
+*_PRODUCTION.md
+QUICKSTART_*.md
