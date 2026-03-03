@@ -8,6 +8,7 @@ from app.config import settings
 from app.database import engine, Base, SessionLocal
 from app.models import User, UserRole, AlertChannel
 from app.core.security import hash_password
+from app.core.location_cache import init_location_cache, close_location_cache
 from app.api.auth import router as auth_router
 from app.api.users import router as users_router
 from app.api.groups_locations_templates import (
@@ -18,6 +19,7 @@ from app.api.notifications import (
 )
 from app.api.webhooks import router as webhooks_router
 from app.api.dashboard import router as dashboard_router
+from app.api.location_v2 import router as location_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,6 +51,14 @@ def ensure_alertchannel_enum():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Initialize Redis cache for location autocomplete
+    logger.info("Initializing location cache...")
+    try:
+        await init_location_cache(settings.REDIS_URL)
+        logger.info("Location cache initialized")
+    except Exception as e:
+        logger.error(f"Failed to initialize location cache: {e}")
+    
     # Create all DB tables on startup
     logger.info("Creating database tables...")
     Base.metadata.create_all(bind=engine)
@@ -77,6 +87,10 @@ async def lifespan(app: FastAPI):
         db.close()
 
     yield
+    
+    # Cleanup: close Redis cache connection
+    logger.info("Closing location cache...")
+    await close_location_cache()
     logger.info("Shutting down TM Alert")
 
 
@@ -122,6 +136,7 @@ app.include_router(incidents_router, prefix=API_PREFIX)
 app.include_router(notifications_router, prefix=API_PREFIX)
 app.include_router(webhooks_router, prefix=API_PREFIX)
 app.include_router(dashboard_router, prefix=API_PREFIX)
+app.include_router(location_router, prefix=API_PREFIX)
 
 
 # ─── HEALTH CHECK ─────────────────────────────────────────────────────────────
