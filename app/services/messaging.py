@@ -43,6 +43,7 @@ class TwilioService:
         try:
             # Use full absolute URL for the Gather action (Twilio requirement)
             voice_webhook_url = f"{settings.BACKEND_URL}/api/v1/webhooks/voice/response"
+            status_callback_url = f"{settings.BACKEND_URL}/api/v1/webhooks/voice/status"
             twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say voice="alice" loop="2">{message}</Say>
@@ -55,7 +56,9 @@ class TwilioService:
             call = self.client.calls.create(
                 twiml=twiml,
                 from_=settings.TWILIO_FROM_NUMBER,
-                to=to
+                to=to,
+                status_callback=status_callback_url,
+                status_callback_method="POST"
             )
             return {"sid": call.sid, "status": call.status}
         except Exception as e:
