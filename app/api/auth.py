@@ -3,8 +3,9 @@ import time
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, status, Request
 from sqlalchemy.orm import Session
+from sqlalchemy import desc, func
 from app.database import get_db
-from app.models import User, RefreshToken, AuditLog, UserRole
+from app.models import User, RefreshToken, AuditLog, UserRole, LoginAttempt
 from app.schemas import (
     LoginRequest, TokenResponse, RefreshRequest, UserResponse,
     PasswordResetRequest, PasswordResetConfirm, ChangePasswordRequest
@@ -27,6 +28,32 @@ PASSWORD_RESET_RATE_LIMIT_SECONDS = 30  # 30 seconds between requests per email
 
 @router.post("/login", response_model=TokenResponse)
 def login(request: LoginRequest, req: Request, db: Session = Depends(get_db)):
+    client_ip = req.client.host if req.client else None
+    
+    # Check for lockout due to too many failed attempts
+    window_start = datetime.now(timezone.utc) - timedelta(minutes=FAILED_WINDOW_MINUTES)
+    failed_count = db.query(LoginAttempt).filter(
+        LoginAttempt.email == request.email.lower(),
+        LoginAttempt.attempted_at >= window_start,
+        LoginAttempt.success == False
+    ).count()
+    
+    if failed_count >= MAX_FAILED_ATTEMPTS:
+        # Check if still in lockout period
+        last_attempt = db.query(LoginAttempt).filter(
+            LoginAttempt.email == request.email.lower(),
+            LoginAttempt.attempted_at >= window_start
+        ).order_by(desc(LoginAttempt.attempted_at)).first()
+        
+        if last_attempt:
+            time_since_last = datetime.now(timezone.utc) - last_attempt.attempted_at
+            if time_since_last < timedelta(minutes=LOCKOUT_DURATION_MINUTES):
+                remaining = int(LOCKOUT_DURATION_MINUTES - time_since_last.total_seconds() / 60)
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail=f"Too many failed login attempts. Please try again in {remaining} minutes."
+                )
+    
     user = db.query(User).filter(
         User.email == request.email,
         User.deleted_at == None
@@ -34,6 +61,13 @@ def login(request: LoginRequest, req: Request, db: Session = Depends(get_db)):
 
     # Check if user exists
     if not user:
+        # Log failed attempt (don't reveal user doesn't exist)
+        db.add(LoginAttempt(
+            email=request.email.lower(),
+            ip_address=client_ip,
+            success=False
+        ))
+        db.commit()
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="No account found with this email address"
@@ -48,10 +82,29 @@ def login(request: LoginRequest, req: Request, db: Session = Depends(get_db)):
 
     # Check password
     if not verify_password(request.password, user.hashed_password):
+        # Log failed attempt
+        db.add(LoginAttempt(
+            email=request.email.lower(),
+            ip_address=client_ip,
+            success=False
+        ))
+        db.commit()
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect password"
         )
+
+    # Clear failed attempts on successful login
+    db.query(LoginAttempt).filter(
+        LoginAttempt.email == request.email.lower()
+    ).delete()
+    
+    # Log successful attempt
+    db.add(LoginAttempt(
+        email=request.email.lower(),
+        ip_address=client_ip,
+        success=True
+    ))
 
     access_token = create_access_token({"sub": str(user.id), "role": user.role})
     refresh_token_str = create_refresh_token({"sub": str(user.id)})
@@ -100,7 +153,12 @@ def refresh_token(request: RefreshRequest, db: Session = Depends(get_db)):
     if not rt or rt.expires_at < datetime.now(timezone.utc):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token expired")
 
-    user = db.query(User).filter(User.id == rt.user_id, User.is_active == True).first()
+    # Check if user exists, is active, AND is not soft-deleted
+    user = db.query(User).filter(
+        User.id == rt.user_id,
+        User.is_active == True,
+        User.deleted_at == None
+    ).first()
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
 
@@ -200,6 +258,13 @@ def reset_password(request: PasswordResetConfirm, db: Session = Depends(get_db))
     user.hashed_password = hash_password(request.new_password)
     user.password_reset_token = None
     user.password_reset_expires = None
+    
+    # Revoke all refresh tokens to force re-authentication with new password
+    db.query(RefreshToken).filter(
+        RefreshToken.user_id == user.id,
+        RefreshToken.revoked == False
+    ).update({"revoked": True})
+    
     db.commit()
     return {"message": "Password reset successfully"}
 
@@ -214,6 +279,14 @@ def change_password(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Current password is incorrect")
 
     current_user.hashed_password = hash_password(request.new_password)
+    
+    # Revoke all refresh tokens to force re-authentication with new password
+    # This invalidates all other sessions for security
+    db.query(RefreshToken).filter(
+        RefreshToken.user_id == current_user.id,
+        RefreshToken.revoked == False
+    ).update({"revoked": True})
+    
     db.commit()
     return {"message": "Password changed successfully"}
 
@@ -221,3 +294,26 @@ def change_password(
 @router.get("/me", response_model=UserResponse)
 def get_me(current_user: User = Depends(get_current_user)):
     return current_user
+
+
+@router.get("/login-attempts")
+def get_login_attempts(
+    limit: int = 50,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """View recent login attempts (for security monitoring)."""
+    attempts = db.query(LoginAttempt).order_by(
+        desc(LoginAttempt.attempted_at)
+    ).limit(limit).all()
+    
+    return [
+        {
+            "id": a.id,
+            "email": a.email,
+            "ip_address": a.ip_address,
+            "success": a.success,
+            "attempted_at": a.attempted_at
+        }
+        for a in attempts
+    ]

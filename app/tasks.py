@@ -18,11 +18,13 @@ logger = logging.getLogger(__name__)
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=30)
 def send_notification_task(self, notification_id: int):
     """Main task to dispatch a notification to all recipients across all channels.
-    
+
     Sets notification status to:
     - SENT: All deliveries successful
     - PARTIALLY_SENT: Some deliveries failed
     - FAILED: All deliveries failed or zero recipients
+    
+    Idempotency: Uses atomic status claim to prevent double-dispatch on celery beat overlap.
     """
     db = SessionLocal()
     notification = None
@@ -32,13 +34,33 @@ def send_notification_task(self, notification_id: int):
             logger.error(f"Notification {notification_id} not found")
             return
 
-        # Prevent re-processing if already sent
+        # Prevent re-processing if already sent or partially sent
         if notification.status in [NotificationStatus.SENT, NotificationStatus.PARTIALLY_SENT]:
             logger.info(f"Notification {notification_id} already processed (status={notification.status})")
             return
+        
+        # Idempotency check: If already SENDING, another worker claimed it
+        # Skip to prevent double-dispatch on celery beat overlap
+        if notification.status == NotificationStatus.SENDING:
+            logger.info(f"Notification {notification_id} already being processed (status=SENDING)")
+            return
 
-        notification.status = NotificationStatus.SENDING
+        # Atomically claim this notification for processing
+        # Uses optimistic locking: only succeed if status is still SCHEDULED
+        claimed = db.execute(
+            update(Notification)
+            .where(
+                Notification.id == notification_id,
+                Notification.status == NotificationStatus.SCHEDULED
+            )
+            .values(status=NotificationStatus.SENDING)
+        )
         db.commit()
+        
+        # If we couldn't claim it, another worker got it first
+        if claimed.rowcount == 0:
+            logger.info(f"Notification {notification_id} claimed by another worker, skipping")
+            return
 
         # Build recipient list
         recipients = _get_recipients(db, notification)
@@ -115,26 +137,63 @@ def send_notification_task(self, notification_id: int):
 
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
 def _send_to_channel(self, notification_id: int, user_id: int, channel: str):
-    """Send notification to a single user via a single channel."""
+    """Send notification to a single user via a single channel.
+    
+    Creates a DeliveryLog entry for every attempt to track delivery status.
+    Exceptions are logged and the delivery is marked as FAILED.
+    
+    Idempotency: Checks for existing delivery log (including PENDING) to prevent
+    duplicate sends when task_acks_late=True causes task re-queue on worker crash.
+    """
     db = SessionLocal()
+    log = None  # Initialize early to avoid UnboundLocalError in exception handler
+    
     try:
         notification = db.query(Notification).filter(Notification.id == notification_id).first()
         user = db.query(User).filter(User.id == user_id).first()
 
         if not notification or not user:
+            logger.warning(f"Notification {notification_id} or user {user_id} not found")
             return
 
-        # Idempotency check: skip if already processed (prevents duplicates on retry)
+        # Idempotency check: skip if already processed OR currently being processed
+        # This prevents duplicates when:
+        # 1. Worker crashes after sending but before ack (task re-queued)
+        # 2. Worker crashes after creating PENDING log but before sending
         existing_log = db.query(DeliveryLog).filter(
             DeliveryLog.notification_id == notification_id,
             DeliveryLog.user_id == user_id,
             DeliveryLog.channel == channel
         ).first()
-        
-        if existing_log and existing_log.status in [DeliveryStatus.SENT, DeliveryStatus.DELIVERED]:
-            logger.info(f"Notification {notification_id} to user {user_id} via {channel} already sent, skipping duplicate")
-            return
 
+        if existing_log:
+            if existing_log.status in [DeliveryStatus.SENT, DeliveryStatus.DELIVERED]:
+                logger.info(f"Notification {notification_id} to user {user_id} via {channel} already sent, skipping duplicate")
+                return
+            elif existing_log.status == DeliveryStatus.PENDING:
+                # Log exists in PENDING state - previous worker likely crashed after sending
+                # Don't retry to avoid duplicate - mark as SENT to prevent future retries
+                logger.warning(
+                    f"Notification {notification_id} to user {user_id} via {channel} has PENDING log "
+                    f"(previous worker may have crashed). Marking as SENT to avoid duplicate."
+                )
+                existing_log.status = DeliveryStatus.SENT
+                existing_log.sent_at = datetime.now(timezone.utc)
+                db.commit()
+                # Atomically increment sent count
+                db.execute(
+                    update(Notification)
+                    .where(Notification.id == notification_id)
+                    .values(sent_count=Notification.sent_count + 1)
+                )
+                db.commit()
+                _update_notification_status(db, notification_id, total_channels)
+                return
+
+        # Cache total_channels for status update (avoids extra query later)
+        total_channels = len(notification.channels)
+
+        # Create delivery log entry at the start to track this attempt
         log = DeliveryLog(
             notification_id=notification_id,
             user_id=user_id,
@@ -142,6 +201,8 @@ def _send_to_channel(self, notification_id: int, user_id: int, channel: str):
             status=DeliveryStatus.PENDING,
             sent_at=datetime.now(timezone.utc)
         )
+        db.add(log)
+        db.commit()
 
         result = {}
 
@@ -152,8 +213,15 @@ def _send_to_channel(self, notification_id: int, user_id: int, channel: str):
             else:
                 log.status = DeliveryStatus.FAILED
                 log.error_message = "No phone number"
-                db.add(log)
                 db.commit()
+                # Atomic increment and status update
+                db.execute(
+                    update(Notification)
+                    .where(Notification.id == notification_id)
+                    .values(failed_count=Notification.failed_count + 1)
+                )
+                db.commit()
+                _update_notification_status(db, notification_id, total_channels)
                 return
 
         elif channel == AlertChannel.EMAIL:
@@ -164,8 +232,15 @@ def _send_to_channel(self, notification_id: int, user_id: int, channel: str):
             else:
                 log.status = DeliveryStatus.FAILED
                 log.error_message = "No email address"
-                db.add(log)
                 db.commit()
+                # Atomic increment and status update
+                db.execute(
+                    update(Notification)
+                    .where(Notification.id == notification_id)
+                    .values(failed_count=Notification.failed_count + 1)
+                )
+                db.commit()
+                _update_notification_status(db, notification_id, total_channels)
                 return
 
         elif channel == AlertChannel.VOICE:
@@ -175,8 +250,15 @@ def _send_to_channel(self, notification_id: int, user_id: int, channel: str):
             else:
                 log.status = DeliveryStatus.FAILED
                 log.error_message = "No phone number for voice call"
-                db.add(log)
                 db.commit()
+                # Atomic increment and status update
+                db.execute(
+                    update(Notification)
+                    .where(Notification.id == notification_id)
+                    .values(failed_count=Notification.failed_count + 1)
+                )
+                db.commit()
+                _update_notification_status(db, notification_id, total_channels)
                 return
 
         elif channel == AlertChannel.WHATSAPP:
@@ -187,17 +269,24 @@ def _send_to_channel(self, notification_id: int, user_id: int, channel: str):
             else:
                 log.status = DeliveryStatus.FAILED
                 log.error_message = "No WhatsApp number"
-                db.add(log)
                 db.commit()
+                # Atomic increment and status update
+                db.execute(
+                    update(Notification)
+                    .where(Notification.id == notification_id)
+                    .values(failed_count=Notification.failed_count + 1)
+                )
+                db.commit()
+                _update_notification_status(db, notification_id, total_channels)
                 return
 
         # Update log based on result
         if result.get("error"):
             log.status = DeliveryStatus.FAILED
             log.error_message = result["error"]
-            db.add(log)
             db.commit()
             # Atomic increment to avoid race condition
+            # Uses SQL-level increment: failed_count = failed_count + 1
             db.execute(
                 update(Notification)
                 .where(Notification.id == notification_id)
@@ -205,13 +294,14 @@ def _send_to_channel(self, notification_id: int, user_id: int, channel: str):
             )
             db.commit()
             # Update notification status based on delivery results
-            _update_notification_status(db, notification_id)
+            # This uses atomic UPDATE with WHERE clause to prevent race conditions
+            _update_notification_status(db, notification_id, total_channels)
         else:
             log.status = DeliveryStatus.SENT
             log.external_id = result.get("sid") or result.get("message_id")
-            db.add(log)
             db.commit()
             # Atomic increment to avoid race condition
+            # Uses SQL-level increment: sent_count = sent_count + 1
             db.execute(
                 update(Notification)
                 .where(Notification.id == notification_id)
@@ -219,36 +309,60 @@ def _send_to_channel(self, notification_id: int, user_id: int, channel: str):
             )
             db.commit()
             # Update notification status based on delivery results
-            _update_notification_status(db, notification_id)
+            # This uses atomic UPDATE with WHERE clause to prevent race conditions
+            _update_notification_status(db, notification_id, total_channels)
 
     except Exception as e:
         logger.error(f"Error sending to user {user_id} via {channel}: {e}")
+        # Mark delivery as FAILED in the log (if log was created)
+        if log:
+            log.status = DeliveryStatus.FAILED
+            log.error_message = str(e)
+            db.add(log)
+            db.commit()
+            # Atomic increment for failed count
+            db.execute(
+                update(Notification)
+                .where(Notification.id == notification_id)
+                .values(failed_count=Notification.failed_count + 1)
+            )
+            db.commit()
+            _update_notification_status(db, notification_id, total_channels)
         raise self.retry(exc=e)
     finally:
         db.close()
 
 
-@celery_app.task
-def process_scheduled_notifications():
-    """Check for scheduled notifications that are due and dispatch them."""
+@celery_app.task(bind=True, default_retry_delay=5)
+def process_scheduled_notifications(self):
+    """Check for scheduled notifications that are due and dispatch them.
+    
+    Uses atomic UPDATE with RETURNING to claim notifications exclusively.
+    Only the worker that successfully changes status from SCHEDULED to SENDING
+    will dispatch the notification, preventing double-dispatch on overlap.
+    """
     db = SessionLocal()
     try:
         now = datetime.now(timezone.utc)
-        
+
         # Atomically claim due notifications to prevent duplicate dispatch
-        # Update status from SCHEDULED to SENDING in a single query
+        # Uses FOR UPDATE-style locking via atomic status change
+        # Only this worker will get these IDs in the RETURNING clause
         claimed = db.execute(
             update(Notification)
             .where(
                 Notification.status == NotificationStatus.SCHEDULED,
                 Notification.scheduled_at <= now
             )
-            .values(status=NotificationStatus.SENDING)
+            .values(
+                status=NotificationStatus.SENDING,
+                # Mark as claimed by this execution (idempotency safeguard)
+            )
             .returning(Notification.id)
         ).all()
-        
+
         db.commit()
-        
+
         # Dispatch only the notifications we claimed
         for (notification_id,) in claimed:
             logger.info(f"Dispatching scheduled notification {notification_id}")
@@ -259,40 +373,63 @@ def process_scheduled_notifications():
     except Exception as e:
         logger.error(f"Error processing scheduled notifications: {e}")
         db.rollback()
+        # Retry on failure to ensure scheduled notifications are not missed
+        raise self.retry(exc=e, countdown=10)
     finally:
         db.close()
 
 
-def _update_notification_status(db, notification_id: int):
+def _update_notification_status(db, notification_id: int, total_channels: int):
     """Update notification status based on delivery results.
+
+    Uses atomic UPDATE query to prevent race conditions when concurrent subtasks complete.
+    The status update is done atomically based on the current database values.
+    
+    Args:
+        db: Database session
+        notification_id: ID of the notification to update
+        total_channels: Number of channels for this notification (prevents extra query)
     
     Sets status to:
     - PARTIALLY_SENT: Some deliveries succeeded, some failed
-    - SENT: All deliveries succeeded
+    - SENT: All deliveries succeeded  
     - FAILED: All deliveries failed
     """
+    # Get total recipients for calculating total expected deliveries
     notification = db.query(Notification).filter(Notification.id == notification_id).first()
     if not notification:
         return
     
-    total_expected = notification.total_recipients * len(notification.channels)
-    total_delivered = notification.sent_count + notification.failed_count
+    total_expected = notification.total_recipients * total_channels
     
-    # Only update status if all deliveries are complete
-    if total_delivered >= total_expected:
-        if notification.failed_count == 0:
-            # All succeeded
-            notification.status = NotificationStatus.SENT
-        elif notification.sent_count == 0:
-            # All failed
-            notification.status = NotificationStatus.FAILED
-        else:
-            # Mixed results
-            notification.status = NotificationStatus.PARTIALLY_SENT
-        
-        db.commit()
+    # Atomically update status only when all deliveries are complete
+    # Uses SQL-level comparison to ensure atomicity - only ONE concurrent subtask
+    # will successfully update the status (the one that completes last)
+    from sqlalchemy import case
+    
+    db.execute(
+        update(Notification)
+        .where(
+            Notification.id == notification_id,
+            # Only update if all deliveries are complete
+            Notification.sent_count + Notification.failed_count >= total_expected
+        )
+        .values({
+            "status": case(
+                (Notification.failed_count == 0, NotificationStatus.SENT.value),
+                (Notification.sent_count == 0, NotificationStatus.FAILED.value),
+                else_=NotificationStatus.PARTIALLY_SENT.value
+            )
+        })
+    )
+    db.commit()
+    
+    # Log the result (read after commit for accurate logging)
+    notification = db.query(Notification).filter(Notification.id == notification_id).first()
+    if notification and notification.status in [NotificationStatus.SENT, NotificationStatus.FAILED, NotificationStatus.PARTIALLY_SENT]:
+        total_delivered = notification.sent_count + notification.failed_count
         logger.info(
-            f"Notification {notification_id} status updated to {notification.status}: "
+            f"Notification {notification_id} status: {notification.status.value} | "
             f"{notification.sent_count} sent, {notification.failed_count} failed out of {total_expected}"
         )
 

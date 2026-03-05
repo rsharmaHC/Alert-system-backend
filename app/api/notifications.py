@@ -1,12 +1,12 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
-from sqlalchemy import desc
+from sqlalchemy import desc, update
 from typing import Optional, List
 from datetime import datetime, timezone
 from app.database import get_db
 from app.models import (
-    Notification, NotificationStatus, Incident, IncidentStatus,
-    User, Group, DeliveryLog, NotificationResponse as NRModel,
+    Notification, NotificationStatus, Incident, IncidentStatus, IncidentSeverity,
+    User, Group, DeliveryLog, DeliveryStatus, NotificationResponse as NRModel,
     AuditLog, AlertChannel
 )
 from app.schemas import (
@@ -16,6 +16,35 @@ from app.schemas import (
 )
 from app.core.deps import get_current_user, require_admin, require_manager
 from app.tasks import send_notification_task
+from app.services.messaging import _is_safe_url
+
+# ─── INCIDENT STATUS TRANSITIONS ──────────────────────────────────────────────
+
+# Define valid status transitions for incidents
+# Key = current status, Value = list of allowed next statuses
+VALID_INCIDENT_STATUS_TRANSITIONS = {
+    IncidentStatus.ACTIVE: [IncidentStatus.RESOLVED, IncidentStatus.CANCELLED],
+    IncidentStatus.RESOLVED: [],  # Terminal state - no transitions allowed
+    IncidentStatus.CANCELLED: [],  # Terminal state - no transitions allowed
+}
+
+
+def _validate_incident_status_transition(
+    current_status: IncidentStatus,
+    new_status: IncidentStatus
+) -> bool:
+    """Validate if a status transition is allowed.
+    
+    Args:
+        current_status: Current incident status
+        new_status: Desired new status
+        
+    Returns:
+        True if transition is valid, False otherwise
+    """
+    allowed_transitions = VALID_INCIDENT_STATUS_TRANSITIONS.get(current_status, [])
+    return new_status in allowed_transitions
+
 
 # ─── INCIDENTS ────────────────────────────────────────────────────────────────
 
@@ -25,11 +54,18 @@ incidents_router = APIRouter(prefix="/incidents", tags=["Incidents"])
 @incidents_router.get("", response_model=List[IncidentResponse])
 def list_incidents(
     status: Optional[IncidentStatus] = None,
-    severity: Optional[str] = None,
-    limit: int = Query(20, ge=1, le=100),
+    severity: Optional[IncidentSeverity] = None,
+    limit: int = Query(1, ge=1, le=100),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
+    """List incidents with optional filtering by status and severity.
+    
+    Args:
+        status: Filter by incident status (active, resolved, cancelled)
+        severity: Filter by incident severity (low, medium, high, critical)
+        limit: Maximum number of results (1-100, default 20)
+    """
     query = db.query(Incident)
     if status:
         query = query.filter(Incident.status == status)
@@ -68,13 +104,23 @@ def update_incident(
     if not incident:
         raise HTTPException(status_code=404, detail="Incident not found")
 
+    # Validate status transition if status is being changed
+    if data.status is not None and data.status != incident.status:
+        if not _validate_incident_status_transition(incident.status, data.status):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid status transition from '{incident.status.value}' to '{data.status.value}'. "
+                       f"Allowed transitions: {[s.value for s in VALID_INCIDENT_STATUS_TRANSITIONS.get(incident.status, [])]}"
+            )
+        
+        # Set resolution metadata if transitioning to RESOLVED
+        if data.status == IncidentStatus.RESOLVED:
+            incident.resolved_at = datetime.now(timezone.utc)
+            incident.resolved_by_id = current_user.id
+
     # Use exclude_unset=True to allow clearing fields to None
     for field, value in data.model_dump(exclude_unset=True).items():
         setattr(incident, field, value)
-
-    if data.status == IncidentStatus.RESOLVED:
-        incident.resolved_at = datetime.now(timezone.utc)
-        incident.resolved_by_id = current_user.id
 
     db.commit()
     db.refresh(incident)
@@ -124,6 +170,18 @@ def create_notification(
     # Validate at least one recipient method
     if not data.target_all and not data.target_group_ids and not data.target_user_ids:
         raise HTTPException(status_code=400, detail="Must specify recipients: target_all, groups, or users")
+
+    # Validate webhook URLs to prevent SSRF attacks
+    if data.slack_webhook_url and not _is_safe_url(data.slack_webhook_url):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid Slack webhook URL. URLs must use HTTP/HTTPS and cannot point to internal/private addresses"
+        )
+    if data.teams_webhook_url and not _is_safe_url(data.teams_webhook_url):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid Teams webhook URL. URLs must use HTTP/HTTPS and cannot point to internal/private addresses"
+        )
 
     notification = Notification(
         incident_id=data.incident_id,
@@ -227,10 +285,17 @@ def get_notification(
 def get_delivery_logs(
     notification_id: int,
     channel: Optional[AlertChannel] = None,
-    status: Optional[str] = None,
+    status: Optional[DeliveryStatus] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
+    """Get delivery logs for a notification with optional filtering.
+    
+    Args:
+        notification_id: ID of the notification
+        channel: Filter by delivery channel (sms, email, voice, whatsapp, web)
+        status: Filter by delivery status (pending, sent, delivered, failed, bounced)
+    """
     query = db.query(DeliveryLog).filter(DeliveryLog.notification_id == notification_id)
     if channel:
         query = query.filter(DeliveryLog.channel == channel)
@@ -290,6 +355,7 @@ def submit_response(
     if not notification:
         raise HTTPException(status_code=404, detail="Notification not found")
 
+    # Create the response record with WEB channel
     response = NRModel(
         notification_id=notification_id,
         user_id=current_user.id,
@@ -300,6 +366,31 @@ def submit_response(
         longitude=data.longitude
     )
     db.add(response)
+
+    # Create delivery log entry to track web delivery (mark as delivered when user responds)
+    # Check if delivery log already exists to avoid duplicates
+    existing_log = db.query(DeliveryLog).filter(
+        DeliveryLog.notification_id == notification_id,
+        DeliveryLog.user_id == current_user.id,
+        DeliveryLog.channel == AlertChannel.WEB
+    ).first()
+
+    if not existing_log:
+        delivery_log = DeliveryLog(
+            notification_id=notification_id,
+            user_id=current_user.id,
+            channel=AlertChannel.WEB,
+            status=DeliveryStatus.DELIVERED,
+            delivered_at=datetime.now(timezone.utc)
+        )
+        db.add(delivery_log)
+        # Atomically increment delivered_count
+        db.execute(
+            update(Notification)
+            .where(Notification.id == notification_id)
+            .values(delivered_count=Notification.delivered_count + 1)
+        )
+
     db.commit()
     return {"message": "Response recorded", "response_type": data.response_type}
 

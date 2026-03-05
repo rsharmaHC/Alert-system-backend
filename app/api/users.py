@@ -15,6 +15,21 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/users", tags=["Users / People"])
 
+# Maximum allowed CSV file size: 5MB
+MAX_CSV_FILE_SIZE = 5 * 1024 * 1024
+
+
+def _prevent_privilege_escalation(current_user: User, target_role: Optional[UserRole]):
+    """Prevent ADMIN users from creating or updating SUPER_ADMIN users.
+    
+    Only SUPER_ADMIN can assign SUPER_ADMIN role to other users.
+    """
+    if target_role == UserRole.SUPER_ADMIN and current_user.role != UserRole.SUPER_ADMIN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only SUPER_ADMIN can create or update SUPER_ADMIN users"
+        )
+
 
 @router.get("", response_model=UserListResponse)
 def list_users(
@@ -66,6 +81,9 @@ def create_user(
     if data.employee_id:
         if db.query(User).filter(User.employee_id == data.employee_id, User.deleted_at == None).first():
             raise HTTPException(status_code=400, detail="Employee ID already exists")
+
+    # Prevent privilege escalation: ADMIN cannot create SUPER_ADMIN users
+    _prevent_privilege_escalation(current_user, data.role)
 
     user = User(
         email=data.email,
@@ -123,6 +141,17 @@ def update_user(
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+
+    # Prevent privilege escalation: ADMIN cannot modify SUPER_ADMIN users
+    if user.role == UserRole.SUPER_ADMIN and current_user.role != UserRole.SUPER_ADMIN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only SUPER_ADMIN can modify SUPER_ADMIN users"
+        )
+
+    # Prevent privilege escalation: ADMIN cannot escalate user to SUPER_ADMIN
+    if data.role is not None:
+        _prevent_privilege_escalation(current_user, data.role)
     
     # Auto-restore soft-deleted user
     if user.deleted_at is not None:
@@ -192,6 +221,17 @@ async def import_users_csv(
     if not file.filename.endswith('.csv'):
         raise HTTPException(status_code=400, detail="File must be a CSV")
 
+    # Validate file size to prevent DoS attacks (max 5MB)
+    file.seek(0, 2)  # Seek to end of file
+    file_size = file.tell()
+    file.seek(0)  # Reset to beginning
+    
+    if file_size > MAX_CSV_FILE_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File size exceeds maximum allowed size of {MAX_CSV_FILE_SIZE // (1024 * 1024)}MB"
+        )
+
     content = await file.read()
     reader = csv.DictReader(io.StringIO(content.decode('utf-8-sig')))
 
@@ -199,6 +239,7 @@ async def import_users_csv(
     errors = []
     created_users = []  # Track new users for email sending
     email_failures = []
+    valid_users = []  # Track successfully processed users for batch commit
 
     for i, row in enumerate(reader, start=2):
         try:
@@ -225,14 +266,27 @@ async def import_users_csv(
             except ValueError:
                 role = UserRole.VIEWER
 
+            # Prevent privilege escalation: ADMIN cannot create/update SUPER_ADMIN via CSV
+            if role == UserRole.SUPER_ADMIN and current_user.role != UserRole.SUPER_ADMIN:
+                errors.append(f"Row {i}: Only SUPER_ADMIN can assign SUPER_ADMIN role")
+                failed += 1
+                continue
+
             if existing:
+                # Prevent privilege escalation: ADMIN cannot modify SUPER_ADMIN users via CSV
+                if existing.role == UserRole.SUPER_ADMIN and current_user.role != UserRole.SUPER_ADMIN:
+                    errors.append(f"Row {i}: Only SUPER_ADMIN can modify SUPER_ADMIN user ({email})")
+                    failed += 1
+                    continue
+
                 # Restore soft-deleted user
                 if existing.deleted_at is not None:
                     existing.deleted_at = None
                     existing.is_active = True
                     is_restored = True
+                    logger.info(f"Restoring soft-deleted user: {email}")
 
-                # Update user fields
+                # Update user fields (changes are persisted on commit below)
                 existing.first_name = first_name
                 existing.last_name = last_name
                 existing.phone = row.get('phone', '').strip() or existing.phone
@@ -241,7 +295,10 @@ async def import_users_csv(
                 existing.employee_id = row.get('employee_id', '').strip() or existing.employee_id
                 updated += 1
                 if is_restored:
-                    logger.info(f"Restored soft-deleted user: {email}")
+                    logger.info(f"Successfully restored soft-deleted user: {email}")
+                
+                # Track for batch commit
+                valid_users.append(("updated", existing))
             else:
                 import secrets
                 default_password = secrets.token_urlsafe(12)
@@ -266,20 +323,52 @@ async def import_users_csv(
                     "first_name": first_name,
                     "last_name": last_name
                 })
+                # Track for batch commit
+                valid_users.append(("created", user))
 
         except Exception as e:
             errors.append(f"Row {i}: {str(e)}")
             failed += 1
+            # Continue processing remaining rows - don't fail entire upload
+            logger.warning(f"CSV import row {i} failed: {e}")
+            continue
 
-    # Commit all users to database first
-    db.add(AuditLog(
-        user_id=current_user.id,
-        action="import_users_csv",
-        resource_type="user",
-        details={"created": created, "updated": updated, "failed": failed}
-    ))
-    db.commit()
+    # Commit all valid rows in a single transaction
+    # Invalid rows are skipped but don't affect valid rows
+    if valid_users:
+        db.add(AuditLog(
+            user_id=current_user.id,
+            action="import_users_csv",
+            resource_type="user",
+            details={
+                "created": created,
+                "updated": updated,
+                "failed": failed,
+                "valid_rows": len(valid_users),
+                "total_rows": created + updated + failed
+            }
+        ))
+        db.commit()
+        logger.info(f"CSV import committed: {created} created, {updated} updated, {failed} failed")
+    else:
+        # No valid rows to commit - still log the failed import attempt
+        db.add(AuditLog(
+            user_id=current_user.id,
+            action="import_users_csv_failed",
+            resource_type="user",
+            details={
+                "failed": failed,
+                "total_rows": failed,
+                "errors": errors[:10]  # Include first 10 errors in audit log
+            }
+        ))
+        db.commit()
+        logger.warning(f"CSV import had no valid rows to commit, {failed} rows failed")
 
+    # Track email sending results for audit log
+    emails_sent = 0
+    emails_failed = 0
+    
     # Send welcome emails to newly created users (after commit)
     from app.services.messaging import email_service
     for user_data in created_users:
@@ -291,23 +380,47 @@ async def import_users_csv(
                 password=user_data['password']
             )
             if result.get('status') == 'failed':
+                emails_failed += 1
                 email_failures.append(f"Email to {user_data['email']} failed: {result.get('error', 'Unknown error')}")
                 logger.error(f"Welcome email failed for {user_data['email']}: {result.get('error')}")
             else:
+                emails_sent += 1
                 logger.info(f"Welcome email sent to {user_data['email']}")
         except Exception as e:
+            emails_failed += 1
             email_failures.append(f"Email to {user_data['email']} error: {str(e)}")
             logger.error(f"Exception sending welcome email to {user_data['email']}: {e}")
 
+    # Add secondary audit log for email results if there were newly created users
+    if created_users and (emails_sent > 0 or emails_failed > 0):
+        db.add(AuditLog(
+            user_id=current_user.id,
+            action="import_users_csv_emails",
+            resource_type="user",
+            details={
+                "emails_sent": emails_sent,
+                "emails_failed": emails_failed,
+                "total_created": len(created_users)
+            }
+        ))
+        db.commit()
+
     # Add errors to response if any
     all_errors = errors + email_failures
+
+    # Return created users WITHOUT passwords for security
+    # Passwords are only sent via email to the users
+    created_users_public = [
+        {"email": u["email"], "first_name": u["first_name"], "last_name": u["last_name"]}
+        for u in created_users
+    ]
 
     return CSVImportResponse(
         created=created,
         updated=updated,
         failed=failed,
         errors=all_errors[:20],  # Return first 20 errors
-        created_users=created_users
+        created_users=created_users_public
     )
 
 

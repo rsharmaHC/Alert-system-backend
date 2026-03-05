@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import func, desc
 from datetime import datetime, timedelta, timezone
@@ -11,6 +11,9 @@ from app.schemas import DashboardStats
 from app.core.deps import get_current_user
 
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
+
+# Dashboard query limits
+MAX_ACTIVITY_DAYS = 365  # Maximum days for activity queries
 
 
 @router.get("/stats")
@@ -28,9 +31,15 @@ def get_dashboard_stats(
     active_incidents = db.query(Incident).filter(Incident.status == IncidentStatus.ACTIVE).count()
 
     # Count notifications that were actually dispatched today
-    # Include: SENT (completed), SENDING (in progress), FAILED (attempted but failed, e.g., zero recipients)
+    # Include: SENT (completed), PARTIALLY_SENT (mixed results), 
+    #          SENDING (in progress), FAILED (attempted but failed)
     # Exclude: DRAFT (never sent), SCHEDULED (not yet sent)
-    dispatched_statuses = [NotificationStatus.SENT, NotificationStatus.SENDING, NotificationStatus.FAILED]
+    dispatched_statuses = [
+        NotificationStatus.SENT,
+        NotificationStatus.PARTIALLY_SENT,
+        NotificationStatus.SENDING,
+        NotificationStatus.FAILED
+    ]
     
     notifications_today = db.query(Notification).filter(
         Notification.created_at >= today_start,
@@ -111,7 +120,23 @@ def get_notification_activity(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """Daily notification counts for the last N days."""
+    """Daily notification counts for the last N days.
+    
+    Args:
+        days: Number of days to query (1-365, default 7)
+    """
+    # Validate days parameter to prevent unbounded queries (DoS protection)
+    if days < 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Days parameter must be at least 1"
+        )
+    if days > MAX_ACTIVITY_DAYS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Days parameter cannot exceed {MAX_ACTIVITY_DAYS}"
+        )
+    
     from sqlalchemy import cast, Date
     start = datetime.now(timezone.utc) - timedelta(days=days)
 

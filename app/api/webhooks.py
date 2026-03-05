@@ -19,9 +19,45 @@ from app.models import (
 from app.schemas import IncomingMessageResponse
 from datetime import datetime, timezone
 import logging
+from xml.sax.saxutils import escape as xml_escape
+from twilio.request_validator import RequestValidator
 
 router = APIRouter(prefix="/webhooks", tags=["Webhooks"])
 logger = logging.getLogger(__name__)
+
+
+def validate_twilio_request(request: Request, body: bytes) -> bool:
+    """Validate Twilio request signature to prevent unauthorized access.
+    
+    Args:
+        request: The incoming FastAPI request
+        body: Raw request body bytes
+        
+    Returns:
+        True if signature is valid, False otherwise
+    """
+    if not settings.TWILIO_AUTH_TOKEN:
+        logger.error("TWILIO_AUTH_TOKEN not configured - cannot validate Twilio requests")
+        return False
+    
+    validator = RequestValidator(settings.TWILIO_AUTH_TOKEN)
+    
+    # Get the signature from headers
+    signature = request.headers.get("X-Twilio-Signature", "")
+    if not signature:
+        logger.warning("Missing X-Twilio-Signature header")
+        return False
+    
+    # Reconstruct the URL (Twilio signs the full URL including query params)
+    url = str(request.url)
+    
+    # Validate the signature
+    is_valid = validator.validate(url, body, signature)
+    
+    if not is_valid:
+        logger.warning(f"Invalid Twilio signature for URL: {url}")
+    
+    return is_valid
 
 
 def _find_user_by_phone(db: Session, phone_number: str) -> Optional[User]:
@@ -29,15 +65,21 @@ def _find_user_by_phone(db: Session, phone_number: str) -> Optional[User]:
 
     Handles various phone formats: +1234567890, 1234567890, (123) 456-7890
     Returns None if phone number is empty, invalid, or ambiguous (multiple matches).
+    
+    Security: Prevents matching all users when phone number is empty or missing.
     """
+    # Reject empty, whitespace-only, or None phone numbers immediately
+    # This prevents matching all users with NULL/empty phone fields
     if not phone_number or not phone_number.strip():
+        logger.warning("Empty phone number provided - cannot lookup user")
         return None
 
-    # Clean and extract digits
+    # Clean and extract digits only
     phone_clean = "".join(c for c in phone_number if c.isdigit())
 
+    # Require at least 10 digits for a valid phone number
     if len(phone_clean) < 10:
-        logger.warning(f"Invalid phone number format: {phone_number}")
+        logger.warning(f"Invalid phone number format (too short): '{phone_number}' (cleaned: '{phone_clean}')")
         return None
 
     # Get last 10 digits for matching (handles country codes)
@@ -86,6 +128,11 @@ async def sms_inbound(
     db: Session = Depends(get_db),
 ):
     """Handle inbound SMS from Twilio - employees replying SAFE/HELP/1/2"""
+    # Validate Twilio signature
+    body_bytes = await request.body()
+    if not validate_twilio_request(request, body_bytes):
+        raise HTTPException(status_code=401, detail="Invalid Twilio signature")
+    
     logger.info(f"Inbound SMS from {From}: {Body}")
 
     body_clean = Body.strip().upper()
@@ -150,9 +197,11 @@ async def sms_inbound(
     else:
         reply = "Message received. Reply SAFE (1) if you are okay, or HELP (2) if you need assistance."
 
+    # Escape reply to prevent XSS in TwiML (even for hardcoded messages - defense in depth)
+    safe_reply = xml_escape(reply)
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Message>{reply}</Message>
+    <Message>{safe_reply}</Message>
 </Response>"""
     return Response(content=twiml, media_type="text/xml")
 
@@ -166,6 +215,11 @@ async def sms_status_callback(
     db: Session = Depends(get_db),
 ):
     """Twilio delivery status callback for outbound SMS."""
+    # Validate Twilio signature
+    body_bytes = await request.body()
+    if not validate_twilio_request(request, body_bytes):
+        raise HTTPException(status_code=401, detail="Invalid Twilio signature")
+    
     logger.info(f"SMS status update: {MessageSid} -> {MessageStatus}")
 
     if MessageSid:
@@ -206,6 +260,11 @@ async def voice_status_callback(
     db: Session = Depends(get_db),
 ):
     """Twilio call status callback for outbound voice calls."""
+    # Validate Twilio signature
+    body_bytes = await request.body()
+    if not validate_twilio_request(request, body_bytes):
+        raise HTTPException(status_code=401, detail="Invalid Twilio signature")
+    
     logger.info(f"Voice status: {CallSid} -> {CallStatus}, Duration: {Duration}s")
 
     if CallSid:
@@ -253,9 +312,14 @@ async def voice_response(
     db: Session = Depends(get_db),
 ):
     """Handle keypress response from voice calls - 1=Safe, 2=Help."""
+    # Validate Twilio signature
+    body_bytes = await request.body()
+    if not validate_twilio_request(request, body_bytes):
+        raise HTTPException(status_code=401, detail="Invalid Twilio signature")
+    
     logger.info(f"=== VOICE WEBHOOK CALLED ===")
     logger.info(f"From: {From}, Digits: '{Digits}', CallSid: {CallSid}")
-    
+
     try:
         # Parse form data explicitly
         form_data = await request.form()
@@ -333,9 +397,11 @@ async def voice_response(
         else:
             message = "Response recorded. Thank you."
 
+        # Escape message to prevent XSS in TwiML
+        safe_message = xml_escape(message)
         twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Say voice="alice">{message}</Say>
+    <Say voice="alice">{safe_message}</Say>
 </Response>"""
         return Response(content=twiml, media_type="text/xml")
 
