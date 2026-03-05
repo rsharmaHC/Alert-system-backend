@@ -23,9 +23,9 @@ from app.services.messaging import _is_safe_url
 # Define valid status transitions for incidents
 # Key = current status, Value = list of allowed next statuses
 VALID_INCIDENT_STATUS_TRANSITIONS = {
-    IncidentStatus.ACTIVE: [IncidentStatus.RESOLVED, IncidentStatus.CANCELLED],
+    IncidentStatus.ACTIVE: [IncidentStatus.RESOLVED, IncidentStatus.MONITORING],
+    IncidentStatus.MONITORING: [IncidentStatus.ACTIVE, IncidentStatus.RESOLVED],
     IncidentStatus.RESOLVED: [],  # Terminal state - no transitions allowed
-    IncidentStatus.CANCELLED: [],  # Terminal state - no transitions allowed
 }
 
 

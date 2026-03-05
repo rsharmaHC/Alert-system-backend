@@ -6,7 +6,6 @@ import logging
 
 from sqlalchemy import text
 from app.config import settings
-from sqlalchemy import text
 from app.database import engine, Base, SessionLocal
 from app.models import User, UserRole
 from app.core.security import hash_password
@@ -144,31 +143,32 @@ app = FastAPI(
 # This would expose users to CSRF attacks and credential theft
 
 # Build allowed origins list from config with validation
-allowed_origins = [
+_allowed_origins = [
     "http://localhost:3000",
     "http://localhost:5173",
     "https://alert-system-frontend-jq7u.vercel.app",
+    "https://alert-system-frontend-jq7u.vercel.app/",
 ]
 
 # Add production FRONTEND_URL if configured and not a wildcard
 if settings.FRONTEND_URL:
     # Reject wildcard origins - security risk
     if settings.FRONTEND_URL == "*" or settings.FRONTEND_URL == "null":
-        logger.error(
+        print(
             f"CORS SECURITY ERROR: FRONTEND_URL='{settings.FRONTEND_URL}' is not allowed. "
             "Wildcard origins are prohibited when allow_credentials=True."
         )
     else:
         # Add if not already in list
-        if settings.FRONTEND_URL not in allowed_origins:
-            allowed_origins.append(settings.FRONTEND_URL)
-            logger.info(f"Added FRONTEND_URL to CORS allowed origins: {settings.FRONTEND_URL}")
+        if settings.FRONTEND_URL not in _allowed_origins:
+            _allowed_origins.append(settings.FRONTEND_URL)
+            print(f"Added FRONTEND_URL to CORS allowed origins: {settings.FRONTEND_URL}")
 
-logger.info(f"CORS allowed origins: {allowed_origins}")
+print(f"CORS allowed origins: {_allowed_origins}")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
+    allow_origins=_allowed_origins,
     allow_credentials=True,
     # Only allow necessary HTTP methods
     allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],

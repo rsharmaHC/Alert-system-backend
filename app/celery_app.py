@@ -27,6 +27,11 @@ celery_app.conf.update(
     task_track_started=True,
     task_acks_late=True,
     worker_prefetch_multiplier=1,
+    # Fix Celery 6.0 deprecation warning - explicitly set retry behavior
+    broker_connection_retry_on_startup=True,
+    broker_connection_retry=True,
+    broker_connection_max_retries=5,
+    broker_connection_retry_delay=2,
     broker_use_ssl=ssl_opts if ssl_opts else None,
     redis_backend_use_ssl=ssl_opts if ssl_opts else None,
     beat_schedule={
