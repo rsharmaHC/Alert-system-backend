@@ -19,9 +19,44 @@ from app.models import (
 from app.schemas import IncomingMessageResponse
 from datetime import datetime, timezone
 import logging
+from twilio.request_validator import RequestValidator
 
 router = APIRouter(prefix="/webhooks", tags=["Webhooks"])
 logger = logging.getLogger(__name__)
+
+
+def validate_twilio_request(request: Request, body: bytes) -> bool:
+    """Validate Twilio request signature to prevent unauthorized access.
+    
+    Args:
+        request: The incoming FastAPI request
+        body: Raw request body bytes
+        
+    Returns:
+        True if signature is valid, False otherwise
+    """
+    if not settings.TWILIO_AUTH_TOKEN:
+        logger.error("TWILIO_AUTH_TOKEN not configured - cannot validate Twilio requests")
+        return False
+    
+    validator = RequestValidator(settings.TWILIO_AUTH_TOKEN)
+    
+    # Get the signature from headers
+    signature = request.headers.get("X-Twilio-Signature", "")
+    if not signature:
+        logger.warning("Missing X-Twilio-Signature header")
+        return False
+    
+    # Reconstruct the URL (Twilio signs the full URL including query params)
+    url = str(request.url)
+    
+    # Validate the signature
+    is_valid = validator.validate(url, body, signature)
+    
+    if not is_valid:
+        logger.warning(f"Invalid Twilio signature for URL: {url}")
+    
+    return is_valid
 
 
 def _find_user_by_phone(db: Session, phone_number: str) -> Optional[User]:
@@ -86,6 +121,11 @@ async def sms_inbound(
     db: Session = Depends(get_db),
 ):
     """Handle inbound SMS from Twilio - employees replying SAFE/HELP/1/2"""
+    # Validate Twilio signature
+    body_bytes = await request.body()
+    if not validate_twilio_request(request, body_bytes):
+        raise HTTPException(status_code=401, detail="Invalid Twilio signature")
+    
     logger.info(f"Inbound SMS from {From}: {Body}")
 
     body_clean = Body.strip().upper()
@@ -166,6 +206,11 @@ async def sms_status_callback(
     db: Session = Depends(get_db),
 ):
     """Twilio delivery status callback for outbound SMS."""
+    # Validate Twilio signature
+    body_bytes = await request.body()
+    if not validate_twilio_request(request, body_bytes):
+        raise HTTPException(status_code=401, detail="Invalid Twilio signature")
+    
     logger.info(f"SMS status update: {MessageSid} -> {MessageStatus}")
 
     if MessageSid:
@@ -206,6 +251,11 @@ async def voice_status_callback(
     db: Session = Depends(get_db),
 ):
     """Twilio call status callback for outbound voice calls."""
+    # Validate Twilio signature
+    body_bytes = await request.body()
+    if not validate_twilio_request(request, body_bytes):
+        raise HTTPException(status_code=401, detail="Invalid Twilio signature")
+    
     logger.info(f"Voice status: {CallSid} -> {CallStatus}, Duration: {Duration}s")
 
     if CallSid:
@@ -253,9 +303,14 @@ async def voice_response(
     db: Session = Depends(get_db),
 ):
     """Handle keypress response from voice calls - 1=Safe, 2=Help."""
+    # Validate Twilio signature
+    body_bytes = await request.body()
+    if not validate_twilio_request(request, body_bytes):
+        raise HTTPException(status_code=401, detail="Invalid Twilio signature")
+    
     logger.info(f"=== VOICE WEBHOOK CALLED ===")
     logger.info(f"From: {From}, Digits: '{Digits}', CallSid: {CallSid}")
-    
+
     try:
         # Parse form data explicitly
         form_data = await request.form()
