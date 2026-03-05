@@ -65,15 +65,21 @@ def _find_user_by_phone(db: Session, phone_number: str) -> Optional[User]:
 
     Handles various phone formats: +1234567890, 1234567890, (123) 456-7890
     Returns None if phone number is empty, invalid, or ambiguous (multiple matches).
+    
+    Security: Prevents matching all users when phone number is empty or missing.
     """
+    # Reject empty, whitespace-only, or None phone numbers immediately
+    # This prevents matching all users with NULL/empty phone fields
     if not phone_number or not phone_number.strip():
+        logger.warning("Empty phone number provided - cannot lookup user")
         return None
 
-    # Clean and extract digits
+    # Clean and extract digits only
     phone_clean = "".join(c for c in phone_number if c.isdigit())
 
+    # Require at least 10 digits for a valid phone number
     if len(phone_clean) < 10:
-        logger.warning(f"Invalid phone number format: {phone_number}")
+        logger.warning(f"Invalid phone number format (too short): '{phone_number}' (cleaned: '{phone_clean}')")
         return None
 
     # Get last 10 digits for matching (handles country codes)
