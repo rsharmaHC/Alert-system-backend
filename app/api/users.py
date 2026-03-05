@@ -283,8 +283,9 @@ async def import_users_csv(
                     existing.deleted_at = None
                     existing.is_active = True
                     is_restored = True
+                    logger.info(f"Restoring soft-deleted user: {email}")
 
-                # Update user fields
+                # Update user fields (changes are persisted on commit below)
                 existing.first_name = first_name
                 existing.last_name = last_name
                 existing.phone = row.get('phone', '').strip() or existing.phone
@@ -293,7 +294,7 @@ async def import_users_csv(
                 existing.employee_id = row.get('employee_id', '').strip() or existing.employee_id
                 updated += 1
                 if is_restored:
-                    logger.info(f"Restored soft-deleted user: {email}")
+                    logger.info(f"Successfully restored soft-deleted user: {email}")
             else:
                 import secrets
                 default_password = secrets.token_urlsafe(12)
