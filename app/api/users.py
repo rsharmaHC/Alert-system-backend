@@ -354,12 +354,19 @@ async def import_users_csv(
     # Add errors to response if any
     all_errors = errors + email_failures
 
+    # Return created users WITHOUT passwords for security
+    # Passwords are only sent via email to the users
+    created_users_public = [
+        {"email": u["email"], "first_name": u["first_name"], "last_name": u["last_name"]}
+        for u in created_users
+    ]
+
     return CSVImportResponse(
         created=created,
         updated=updated,
         failed=failed,
         errors=all_errors[:20],  # Return first 20 errors
-        created_users=created_users
+        created_users=created_users_public
     )
 
 
