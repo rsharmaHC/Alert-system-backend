@@ -239,6 +239,7 @@ async def import_users_csv(
     errors = []
     created_users = []  # Track new users for email sending
     email_failures = []
+    valid_users = []  # Track successfully processed users for batch commit
 
     for i, row in enumerate(reader, start=2):
         try:
@@ -295,6 +296,9 @@ async def import_users_csv(
                 updated += 1
                 if is_restored:
                     logger.info(f"Successfully restored soft-deleted user: {email}")
+                
+                # Track for batch commit
+                valid_users.append(("updated", existing))
             else:
                 import secrets
                 default_password = secrets.token_urlsafe(12)
@@ -319,19 +323,30 @@ async def import_users_csv(
                     "first_name": first_name,
                     "last_name": last_name
                 })
+                # Track for batch commit
+                valid_users.append(("created", user))
 
         except Exception as e:
             errors.append(f"Row {i}: {str(e)}")
             failed += 1
+            # Continue processing remaining rows - don't fail entire upload
+            logger.warning(f"CSV import row {i} failed: {e}")
+            continue
 
-    # Commit all users to database first
-    db.add(AuditLog(
-        user_id=current_user.id,
-        action="import_users_csv",
-        resource_type="user",
-        details={"created": created, "updated": updated, "failed": failed}
-    ))
-    db.commit()
+    # Commit all valid rows in a single transaction
+    # Invalid rows are skipped but don't affect valid rows
+    if valid_users:
+        db.add(AuditLog(
+            user_id=current_user.id,
+            action="import_users_csv",
+            resource_type="user",
+            details={"created": created, "updated": updated, "failed": failed, "valid_rows": len(valid_users)}
+        ))
+        db.commit()
+        logger.info(f"CSV import committed: {created} created, {updated} updated, {failed} failed")
+    else:
+        # No valid rows to commit
+        logger.warning(f"CSV import had no valid rows to commit")
 
     # Send welcome emails to newly created users (after commit)
     from app.services.messaging import email_service
