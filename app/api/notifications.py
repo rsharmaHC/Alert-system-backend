@@ -18,6 +18,34 @@ from app.core.deps import get_current_user, require_admin, require_manager
 from app.tasks import send_notification_task
 from app.services.messaging import _is_safe_url
 
+# ─── INCIDENT STATUS TRANSITIONS ──────────────────────────────────────────────
+
+# Define valid status transitions for incidents
+# Key = current status, Value = list of allowed next statuses
+VALID_INCIDENT_STATUS_TRANSITIONS = {
+    IncidentStatus.ACTIVE: [IncidentStatus.RESOLVED, IncidentStatus.CANCELLED],
+    IncidentStatus.RESOLVED: [],  # Terminal state - no transitions allowed
+    IncidentStatus.CANCELLED: [],  # Terminal state - no transitions allowed
+}
+
+
+def _validate_incident_status_transition(
+    current_status: IncidentStatus,
+    new_status: IncidentStatus
+) -> bool:
+    """Validate if a status transition is allowed.
+    
+    Args:
+        current_status: Current incident status
+        new_status: Desired new status
+        
+    Returns:
+        True if transition is valid, False otherwise
+    """
+    allowed_transitions = VALID_INCIDENT_STATUS_TRANSITIONS.get(current_status, [])
+    return new_status in allowed_transitions
+
+
 # ─── INCIDENTS ────────────────────────────────────────────────────────────────
 
 incidents_router = APIRouter(prefix="/incidents", tags=["Incidents"])
@@ -76,13 +104,23 @@ def update_incident(
     if not incident:
         raise HTTPException(status_code=404, detail="Incident not found")
 
+    # Validate status transition if status is being changed
+    if data.status is not None and data.status != incident.status:
+        if not _validate_incident_status_transition(incident.status, data.status):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid status transition from '{incident.status.value}' to '{data.status.value}'. "
+                       f"Allowed transitions: {[s.value for s in VALID_INCIDENT_STATUS_TRANSITIONS.get(incident.status, [])]}"
+            )
+        
+        # Set resolution metadata if transitioning to RESOLVED
+        if data.status == IncidentStatus.RESOLVED:
+            incident.resolved_at = datetime.now(timezone.utc)
+            incident.resolved_by_id = current_user.id
+
     # Use exclude_unset=True to allow clearing fields to None
     for field, value in data.model_dump(exclude_unset=True).items():
         setattr(incident, field, value)
-
-    if data.status == IncidentStatus.RESOLVED:
-        incident.resolved_at = datetime.now(timezone.utc)
-        incident.resolved_by_id = current_user.id
 
     db.commit()
     db.refresh(incident)
