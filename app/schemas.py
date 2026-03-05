@@ -53,7 +53,7 @@ class UserCreate(BaseModel):
     employee_id: Optional[str] = None
     role: UserRole = UserRole.VIEWER
     location_id: Optional[int] = None
-    preferred_channels: List[str] = ["sms", "email"]
+    preferred_channels: List[AlertChannel] = [AlertChannel.SMS, AlertChannel.EMAIL]
 
 
 class UserUpdate(BaseModel):
@@ -67,7 +67,7 @@ class UserUpdate(BaseModel):
     role: Optional[UserRole] = None
     location_id: Optional[int] = None
     is_active: Optional[bool] = None
-    preferred_channels: Optional[List[str]] = None
+    preferred_channels: Optional[List[AlertChannel]] = None
 
 
 class UserResponse(BaseModel):

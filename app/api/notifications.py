@@ -5,7 +5,7 @@ from typing import Optional, List
 from datetime import datetime, timezone
 from app.database import get_db
 from app.models import (
-    Notification, NotificationStatus, Incident, IncidentStatus,
+    Notification, NotificationStatus, Incident, IncidentStatus, IncidentSeverity,
     User, Group, DeliveryLog, DeliveryStatus, NotificationResponse as NRModel,
     AuditLog, AlertChannel
 )
@@ -26,11 +26,18 @@ incidents_router = APIRouter(prefix="/incidents", tags=["Incidents"])
 @incidents_router.get("", response_model=List[IncidentResponse])
 def list_incidents(
     status: Optional[IncidentStatus] = None,
-    severity: Optional[str] = None,
-    limit: int = Query(20, ge=1, le=100),
+    severity: Optional[IncidentSeverity] = None,
+    limit: int = Query(1, ge=1, le=100),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
+    """List incidents with optional filtering by status and severity.
+    
+    Args:
+        status: Filter by incident status (active, resolved, cancelled)
+        severity: Filter by incident severity (low, medium, high, critical)
+        limit: Maximum number of results (1-100, default 20)
+    """
     query = db.query(Incident)
     if status:
         query = query.filter(Incident.status == status)
@@ -240,10 +247,17 @@ def get_notification(
 def get_delivery_logs(
     notification_id: int,
     channel: Optional[AlertChannel] = None,
-    status: Optional[str] = None,
+    status: Optional[DeliveryStatus] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
+    """Get delivery logs for a notification with optional filtering.
+    
+    Args:
+        notification_id: ID of the notification
+        channel: Filter by delivery channel (sms, email, voice, whatsapp, web)
+        status: Filter by delivery status (pending, sent, delivered, failed, bounced)
+    """
     query = db.query(DeliveryLog).filter(DeliveryLog.notification_id == notification_id)
     if channel:
         query = query.filter(DeliveryLog.channel == channel)
