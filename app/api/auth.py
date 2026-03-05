@@ -172,6 +172,13 @@ def reset_password(request: PasswordResetConfirm, db: Session = Depends(get_db))
     user.hashed_password = hash_password(request.new_password)
     user.password_reset_token = None
     user.password_reset_expires = None
+    
+    # Revoke all refresh tokens to force re-authentication with new password
+    db.query(RefreshToken).filter(
+        RefreshToken.user_id == user.id,
+        RefreshToken.revoked == False
+    ).update({"revoked": True})
+    
     db.commit()
     return {"message": "Password reset successfully"}
 
@@ -186,6 +193,14 @@ def change_password(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Current password is incorrect")
 
     current_user.hashed_password = hash_password(request.new_password)
+    
+    # Revoke all refresh tokens to force re-authentication with new password
+    # This invalidates all other sessions for security
+    db.query(RefreshToken).filter(
+        RefreshToken.user_id == current_user.id,
+        RefreshToken.revoked == False
+    ).update({"revoked": True})
+    
     db.commit()
     return {"message": "Password changed successfully"}
 
