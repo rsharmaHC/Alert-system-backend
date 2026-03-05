@@ -45,6 +45,11 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
 # Cancel in-progress runs for PRs
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
