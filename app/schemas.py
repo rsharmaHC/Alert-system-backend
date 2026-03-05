@@ -336,7 +336,11 @@ class DeliveryLogResponse(BaseModel):
 class NotificationResponseCreate(BaseModel):
     """Schema for submitting a safety response to a notification.
     
-    Note: notification_id is provided via URL path parameter, not in request body.
+    Note: notification_id is provided via URL path parameter (/notifications/{id}/respond),
+    not in the request body. This follows RESTful design patterns.
+    
+    Example request: POST /notifications/123/respond
+    Body: {"response_type": "safe", "latitude": 40.7128, "longitude": -74.0060}
     """
     response_type: ResponseType
     message: Optional[str] = None
