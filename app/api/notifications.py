@@ -16,6 +16,7 @@ from app.schemas import (
 )
 from app.core.deps import get_current_user, require_admin, require_manager
 from app.tasks import send_notification_task
+from app.services.messaging import _is_safe_url
 
 # ─── INCIDENTS ────────────────────────────────────────────────────────────────
 
@@ -124,6 +125,18 @@ def create_notification(
     # Validate at least one recipient method
     if not data.target_all and not data.target_group_ids and not data.target_user_ids:
         raise HTTPException(status_code=400, detail="Must specify recipients: target_all, groups, or users")
+
+    # Validate webhook URLs to prevent SSRF attacks
+    if data.slack_webhook_url and not _is_safe_url(data.slack_webhook_url):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid Slack webhook URL. URLs must use HTTP/HTTPS and cannot point to internal/private addresses"
+        )
+    if data.teams_webhook_url and not _is_safe_url(data.teams_webhook_url):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid Teams webhook URL. URLs must use HTTP/HTTPS and cannot point to internal/private addresses"
+        )
 
     notification = Notification(
         incident_id=data.incident_id,

@@ -240,6 +240,86 @@ Taylor Morrison"""
 
 # ─── WEBHOOK SERVICE (Slack / Teams) ─────────────────────────────────────────
 
+import ipaddress
+import socket
+from urllib.parse import urlparse
+from urllib3.util import parse_url as urllib3_parse_url
+
+
+def _is_safe_url(url: str) -> bool:
+    """Validate webhook URL to prevent SSRF attacks.
+    
+    Blocks:
+    - Non-HTTP/HTTPS schemes
+    - Private IP addresses (10.x.x.x, 172.16-31.x.x, 192.168.x.x)
+    - Localhost (127.x.x.x, ::1)
+    - Link-local addresses (169.254.x.x)
+    - AWS metadata endpoint (169.254.169.254)
+    - Internal hostnames (localhost, internal, etc.)
+    
+    Args:
+        url: The webhook URL to validate
+        
+    Returns:
+        True if URL is safe, False otherwise
+    """
+    if not url:
+        return False
+    
+    try:
+        parsed = urlparse(url)
+        
+        # Only allow HTTP and HTTPS schemes
+        if parsed.scheme not in ('http', 'https'):
+            logger.warning(f"Webhook URL blocked: invalid scheme '{parsed.scheme}'")
+            return False
+        
+        hostname = parsed.hostname
+        if not hostname:
+            logger.warning("Webhook URL blocked: missing hostname")
+            return False
+        
+        # Block localhost and common internal hostnames
+        blocked_hostnames = ['localhost', 'internal', 'metadata', '169.254.169.254']
+        if hostname.lower() in blocked_hostnames or hostname.endswith('.internal'):
+            logger.warning(f"Webhook URL blocked: internal hostname '{hostname}'")
+            return False
+        
+        # Check if hostname is an IP address
+        try:
+            # Handle IPv4
+            ip = ipaddress.ip_address(hostname)
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+                logger.warning(f"Webhook URL blocked: private/internal IP '{hostname}'")
+                return False
+            return True  # Valid public IP
+        except ValueError:
+            pass  # Not an IP address, continue to DNS resolution check
+        
+        # Resolve hostname and check IP addresses
+        # Use getaddrinfo to handle both IPv4 and IPv6
+        addr_info = socket.getaddrinfo(hostname, None, socket.AF_INET, socket.SOCK_STREAM)
+        
+        for info in addr_info:
+            ip_str = info[4][0]
+            try:
+                ip = ipaddress.ip_address(ip_str)
+                if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+                    logger.warning(f"Webhook URL blocked: hostname resolves to private IP '{ip_str}'")
+                    return False
+            except ValueError:
+                continue
+        
+        return True  # All resolved IPs are public
+        
+    except socket.gaierror:
+        logger.warning(f"Webhook URL blocked: DNS resolution failed for '{url}'")
+        return False
+    except Exception as e:
+        logger.warning(f"Webhook URL blocked: validation error '{url}' - {e}")
+        return False
+
+
 class WebhookService:
     def send_slack(self, webhook_url: str, message: str, title: str = "") -> dict:
         if not webhook_url:
@@ -247,6 +327,12 @@ class WebhookService:
         if not webhook_url:
             logger.warning(f"[MOCK SLACK] Title: {title} | Message: {message[:50]}...")
             return {"status": "mock"}
+        
+        # Validate URL to prevent SSRF attacks
+        if not _is_safe_url(webhook_url):
+            logger.error(f"Slack webhook blocked: SSRF protection triggered for URL")
+            return {"status": "blocked", "error": "Invalid webhook URL"}
+        
         try:
             import httpx
             payload = {
@@ -267,6 +353,12 @@ class WebhookService:
         if not webhook_url:
             logger.warning(f"[MOCK TEAMS] Title: {title} | Message: {message[:50]}...")
             return {"status": "mock"}
+        
+        # Validate URL to prevent SSRF attacks
+        if not _is_safe_url(webhook_url):
+            logger.error(f"Teams webhook blocked: SSRF protection triggered for URL")
+            return {"status": "blocked", "error": "Invalid webhook URL"}
+        
         try:
             import httpx
             payload = {
