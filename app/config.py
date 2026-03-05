@@ -5,7 +5,7 @@ from typing import Optional
 class Settings(BaseSettings):
     APP_NAME: str = "TM Alert"
     APP_ENV: str = "development"
-    SECRET_KEY: str = "change-this-secret-key-in-production-32chars"
+    SECRET_KEY: str = ""
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
     FRONTEND_URL: str = "http://localhost:3000"
