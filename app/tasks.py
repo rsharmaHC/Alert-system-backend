@@ -135,13 +135,20 @@ def send_notification_task(self, notification_id: int):
 
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
 def _send_to_channel(self, notification_id: int, user_id: int, channel: str):
-    """Send notification to a single user via a single channel."""
+    """Send notification to a single user via a single channel.
+    
+    Creates a DeliveryLog entry for every attempt to track delivery status.
+    Exceptions are logged and the delivery is marked as FAILED.
+    """
     db = SessionLocal()
+    log = None  # Initialize early to avoid UnboundLocalError in exception handler
+    
     try:
         notification = db.query(Notification).filter(Notification.id == notification_id).first()
         user = db.query(User).filter(User.id == user_id).first()
 
         if not notification or not user:
+            logger.warning(f"Notification {notification_id} or user {user_id} not found")
             return
 
         # Idempotency check: skip if already processed (prevents duplicates on retry)
@@ -158,6 +165,7 @@ def _send_to_channel(self, notification_id: int, user_id: int, channel: str):
         # Cache total_channels for status update (avoids extra query later)
         total_channels = len(notification.channels)
 
+        # Create delivery log entry at the start to track this attempt
         log = DeliveryLog(
             notification_id=notification_id,
             user_id=user_id,
@@ -165,6 +173,8 @@ def _send_to_channel(self, notification_id: int, user_id: int, channel: str):
             status=DeliveryStatus.PENDING,
             sent_at=datetime.now(timezone.utc)
         )
+        db.add(log)
+        db.commit()
 
         result = {}
 
@@ -175,7 +185,6 @@ def _send_to_channel(self, notification_id: int, user_id: int, channel: str):
             else:
                 log.status = DeliveryStatus.FAILED
                 log.error_message = "No phone number"
-                db.add(log)
                 db.commit()
                 # Atomic increment and status update
                 db.execute(
@@ -195,7 +204,6 @@ def _send_to_channel(self, notification_id: int, user_id: int, channel: str):
             else:
                 log.status = DeliveryStatus.FAILED
                 log.error_message = "No email address"
-                db.add(log)
                 db.commit()
                 # Atomic increment and status update
                 db.execute(
@@ -214,7 +222,6 @@ def _send_to_channel(self, notification_id: int, user_id: int, channel: str):
             else:
                 log.status = DeliveryStatus.FAILED
                 log.error_message = "No phone number for voice call"
-                db.add(log)
                 db.commit()
                 # Atomic increment and status update
                 db.execute(
@@ -234,7 +241,6 @@ def _send_to_channel(self, notification_id: int, user_id: int, channel: str):
             else:
                 log.status = DeliveryStatus.FAILED
                 log.error_message = "No WhatsApp number"
-                db.add(log)
                 db.commit()
                 # Atomic increment and status update
                 db.execute(
@@ -250,7 +256,6 @@ def _send_to_channel(self, notification_id: int, user_id: int, channel: str):
         if result.get("error"):
             log.status = DeliveryStatus.FAILED
             log.error_message = result["error"]
-            db.add(log)
             db.commit()
             # Atomic increment to avoid race condition
             # Uses SQL-level increment: failed_count = failed_count + 1
@@ -266,7 +271,6 @@ def _send_to_channel(self, notification_id: int, user_id: int, channel: str):
         else:
             log.status = DeliveryStatus.SENT
             log.external_id = result.get("sid") or result.get("message_id")
-            db.add(log)
             db.commit()
             # Atomic increment to avoid race condition
             # Uses SQL-level increment: sent_count = sent_count + 1
@@ -282,6 +286,20 @@ def _send_to_channel(self, notification_id: int, user_id: int, channel: str):
 
     except Exception as e:
         logger.error(f"Error sending to user {user_id} via {channel}: {e}")
+        # Mark delivery as FAILED in the log (if log was created)
+        if log:
+            log.status = DeliveryStatus.FAILED
+            log.error_message = str(e)
+            db.add(log)
+            db.commit()
+            # Atomic increment for failed count
+            db.execute(
+                update(Notification)
+                .where(Notification.id == notification_id)
+                .values(failed_count=Notification.failed_count + 1)
+            )
+            db.commit()
+            _update_notification_status(db, notification_id, total_channels)
         raise self.retry(exc=e)
     finally:
         db.close()
