@@ -139,6 +139,9 @@ def _send_to_channel(self, notification_id: int, user_id: int, channel: str):
     
     Creates a DeliveryLog entry for every attempt to track delivery status.
     Exceptions are logged and the delivery is marked as FAILED.
+    
+    Idempotency: Checks for existing delivery log (including PENDING) to prevent
+    duplicate sends when task_acks_late=True causes task re-queue on worker crash.
     """
     db = SessionLocal()
     log = None  # Initialize early to avoid UnboundLocalError in exception handler
@@ -151,16 +154,39 @@ def _send_to_channel(self, notification_id: int, user_id: int, channel: str):
             logger.warning(f"Notification {notification_id} or user {user_id} not found")
             return
 
-        # Idempotency check: skip if already processed (prevents duplicates on retry)
+        # Idempotency check: skip if already processed OR currently being processed
+        # This prevents duplicates when:
+        # 1. Worker crashes after sending but before ack (task re-queued)
+        # 2. Worker crashes after creating PENDING log but before sending
         existing_log = db.query(DeliveryLog).filter(
             DeliveryLog.notification_id == notification_id,
             DeliveryLog.user_id == user_id,
             DeliveryLog.channel == channel
         ).first()
 
-        if existing_log and existing_log.status in [DeliveryStatus.SENT, DeliveryStatus.DELIVERED]:
-            logger.info(f"Notification {notification_id} to user {user_id} via {channel} already sent, skipping duplicate")
-            return
+        if existing_log:
+            if existing_log.status in [DeliveryStatus.SENT, DeliveryStatus.DELIVERED]:
+                logger.info(f"Notification {notification_id} to user {user_id} via {channel} already sent, skipping duplicate")
+                return
+            elif existing_log.status == DeliveryStatus.PENDING:
+                # Log exists in PENDING state - previous worker likely crashed after sending
+                # Don't retry to avoid duplicate - mark as SENT to prevent future retries
+                logger.warning(
+                    f"Notification {notification_id} to user {user_id} via {channel} has PENDING log "
+                    f"(previous worker may have crashed). Marking as SENT to avoid duplicate."
+                )
+                existing_log.status = DeliveryStatus.SENT
+                existing_log.sent_at = datetime.now(timezone.utc)
+                db.commit()
+                # Atomically increment sent count
+                db.execute(
+                    update(Notification)
+                    .where(Notification.id == notification_id)
+                    .values(sent_count=Notification.sent_count + 1)
+                )
+                db.commit()
+                _update_notification_status(db, notification_id, total_channels)
+                return
 
         # Cache total_channels for status update (avoids extra query later)
         total_channels = len(notification.channels)
