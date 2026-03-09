@@ -253,9 +253,10 @@ def login(request: LoginRequest, req: Request, db: Session = Depends(get_db)):
             headers={"Retry-After": str(ip_retry_after)}
         )
 
-    # STEP 2: Look up user by normalized email
+    # STEP 2: Look up user by email (case-insensitive)
+    # Use func.lower for case-insensitive comparison to match normalized_email
     user = db.query(User).filter(
-        User.email == normalized_email,
+        func.lower(User.email) == normalized_email,
         User.deleted_at.is_(None)
     ).first()
     
