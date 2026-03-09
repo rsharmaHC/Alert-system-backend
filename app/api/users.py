@@ -41,7 +41,7 @@ def list_users(
     role: Optional[UserRole] = None,
     is_active: Optional[bool] = None,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_manager)
+    current_user: User = Depends(get_current_user)
 ):
     query = db.query(User)
 
@@ -91,7 +91,6 @@ def create_user(
         first_name=data.first_name,
         last_name=data.last_name,
         phone=data.phone,
-        whatsapp_number=data.whatsapp_number,
         department=data.department,
         title=data.title,
         employee_id=data.employee_id or None,
