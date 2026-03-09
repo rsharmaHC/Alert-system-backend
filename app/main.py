@@ -136,6 +136,26 @@ def _ensure_audit_log_user_email():
         db.close()
 
 
+def _ensure_incoming_messages_user_email():
+    """Add user_email column to incoming_messages table if it doesn't exist."""
+    db = SessionLocal()
+    try:
+        result = db.execute(
+            text("SELECT column_name FROM information_schema.columns WHERE table_name='incoming_messages' AND column_name='user_email'")
+        ).fetchone()
+        if not result:
+            db.execute(text("ALTER TABLE incoming_messages ADD COLUMN user_email VARCHAR(255)"))
+            db.commit()
+            logger.info("Added user_email column to incoming_messages table")
+        else:
+            logger.info("incoming_messages table already has user_email column")
+    except Exception as e:
+        logger.error(f"Error adding incoming_messages user_email column: {e}")
+        db.rollback()
+    finally:
+        db.close()
+
+
 def _ensure_delivery_log_user_email():
     """Add user_email column to delivery_logs and notification_responses tables if they don't exist."""
     db = SessionLocal()
@@ -212,6 +232,13 @@ async def lifespan(app: FastAPI):
         _ensure_delivery_log_user_email()
     except Exception as e:
         logger.error(f"Failed to ensure delivery_logs/notification_responses user_email column: {e}")
+
+    # Ensure incoming_messages table has user_email column
+    logger.info("Ensuring incoming_messages table has user_email column...")
+    try:
+        _ensure_incoming_messages_user_email()
+    except Exception as e:
+        logger.error(f"Failed to ensure incoming_messages user_email column: {e}")
 
     # Seed default super admin if no users exist
     try:
