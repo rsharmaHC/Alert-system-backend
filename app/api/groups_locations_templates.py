@@ -80,7 +80,11 @@ def get_group(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_manager)
 ):
-    group = db.query(Group).filter(Group.id == group_id).first()
+    # Check both existence AND active status (prevent access to soft-deleted groups)
+    group = db.query(Group).filter(
+        Group.id == group_id,
+        Group.is_active == True
+    ).first()
     if not group:
         raise HTTPException(status_code=404, detail="Group not found")
     return group
@@ -93,7 +97,11 @@ def update_group(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin)
 ):
-    group = db.query(Group).filter(Group.id == group_id).first()
+    # Check both existence AND active status (prevent modifying soft-deleted groups)
+    group = db.query(Group).filter(
+        Group.id == group_id,
+        Group.is_active == True
+    ).first()
     if not group:
         raise HTTPException(status_code=404, detail="Group not found")
     
@@ -114,11 +122,11 @@ def update_group(
         ).all()
         valid_ids = {u.id for u in valid_users}
         invalid_ids = set(member_ids) - valid_ids
-        
+
         if invalid_ids:
             raise HTTPException(
                 status_code=400,
-                detail=f"Invalid user IDs: {list(invalid_ids)}. Users must exist and not be deleted."
+                detail=f"Invalid user IDs: {list(invalid_ids)}."
             )
         
         # Replace members list
@@ -140,7 +148,11 @@ def delete_group(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin)
 ):
-    group = db.query(Group).filter(Group.id == group_id).first()
+    # Check both existence AND active status (can't delete what's already deleted)
+    group = db.query(Group).filter(
+        Group.id == group_id,
+        Group.is_active == True
+    ).first()
     if not group:
         raise HTTPException(status_code=404, detail="Group not found")
     group.is_active = False
@@ -174,7 +186,11 @@ def remove_member(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin)
 ):
-    group = db.query(Group).filter(Group.id == group_id).first()
+    # Check both existence AND active status (prevent modifying soft-deleted groups)
+    group = db.query(Group).filter(
+        Group.id == group_id,
+        Group.is_active == True
+    ).first()
     if not group:
         raise HTTPException(status_code=404, detail="Group not found")
     user = db.query(User).filter(User.id == user_id).first()
@@ -314,6 +330,11 @@ def update_location(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin)
 ):
+    # Check both existence AND active status (prevent modifying soft-deleted locations)
+    location = db.query(Location).filter(
+        Location.id == location_id,
+        Location.is_active == True
+    ).first()
     """
     Update location with validation and Redis sync.
     
@@ -419,7 +440,11 @@ def delete_location(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin)
 ):
-    location = db.query(Location).filter(Location.id == location_id).first()
+    # Check both existence AND active status (can't delete what's already deleted)
+    location = db.query(Location).filter(
+        Location.id == location_id,
+        Location.is_active == True
+    ).first()
     if not location:
         raise HTTPException(status_code=404, detail="Location not found")
     location.is_active = False
@@ -457,6 +482,18 @@ def create_template(
     return template
 
 
+# IMPORTANT: /categories must be defined BEFORE /{template_id} to avoid route shadowing
+# FastAPI matches routes in order, and /{template_id} would match "categories" as an ID
+@templates_router.get("/categories")
+def get_categories(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Get all unique template categories."""
+    results = db.query(NotificationTemplate.category).filter(
+        NotificationTemplate.category != None,
+        NotificationTemplate.is_active == True
+    ).distinct().all()
+    return [r[0] for r in results if r[0]]
+
+
 @templates_router.put("/{template_id}", response_model=TemplateResponse)
 def update_template(
     template_id: int,
@@ -464,7 +501,11 @@ def update_template(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin)
 ):
-    template = db.query(NotificationTemplate).filter(NotificationTemplate.id == template_id).first()
+    # Check both existence AND active status (prevent modifying soft-deleted templates)
+    template = db.query(NotificationTemplate).filter(
+        NotificationTemplate.id == template_id,
+        NotificationTemplate.is_active == True
+    ).first()
     if not template:
         raise HTTPException(status_code=404, detail="Template not found")
     # Use exclude_unset=True to allow clearing fields to None
@@ -481,7 +522,11 @@ def delete_template(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin)
 ):
-    template = db.query(NotificationTemplate).filter(NotificationTemplate.id == template_id).first()
+    # Check both existence AND active status (can't delete what's already deleted)
+    template = db.query(NotificationTemplate).filter(
+        NotificationTemplate.id == template_id,
+        NotificationTemplate.is_active == True
+    ).first()
     if not template:
         raise HTTPException(status_code=404, detail="Template not found")
     template.is_active = False

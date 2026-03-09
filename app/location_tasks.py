@@ -542,8 +542,7 @@ def periodic_geofence_check() -> Dict[str, Any]:
         users_with_location = db.query(User).filter(
             User.is_active.is_(True),
             User.latitude.isnot(None),
-            User.longitude.isnot(None),
-            User.deleted_at.is_(None)
+            User.longitude.isnot(None)
         ).all()
 
         if not users_with_location:

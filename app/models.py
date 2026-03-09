@@ -68,6 +68,7 @@ class IncidentStatus(str, enum.Enum):
     ACTIVE = "active"
     MONITORING = "monitoring"
     RESOLVED = "resolved"
+    CANCELLED = "cancelled"
 
 
 # ─── ASSOCIATION TABLES ───────────────────────────────────────────────────────
@@ -124,7 +125,6 @@ class User(Base):
     password_reset_expires = Column(DateTime(timezone=True))
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
-    deleted_at = Column(DateTime(timezone=True))
 
     location = relationship("Location", back_populates="users")
     groups = relationship("Group", secondary=group_members, back_populates="members")
@@ -340,6 +340,15 @@ class RefreshToken(Base):
     user = relationship("User")
 
 
+class LoginAttempt(Base):
+    """Track failed login attempts for brute force protection."""
+    __tablename__ = "login_attempts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String(255), nullable=False, index=True)  # Track by email
+    ip_address = Column(String(45))  # Track by IP
+    attempted_at = Column(DateTime(timezone=True), server_default=func.now())
+    success = Column(Boolean, default=False)
 # ─── LOCATION AUDIENCE MANAGEMENT ─────────────────────────────────────────────
 
 class UserLocationAssignmentType(str, enum.Enum):

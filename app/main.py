@@ -4,6 +4,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from contextlib import asynccontextmanager
 import logging
 
+from sqlalchemy import text
 from app.config import settings
 from sqlalchemy import text
 from app.database import engine, Base, SessionLocal
@@ -31,9 +32,28 @@ logger = logging.getLogger(__name__)
 
 
 def ensure_alertchannel_enum():
-    """Ensure 'web' value exists in alertchannel enum (PostgreSQL)."""
-    db = SessionLocal()
+    """Ensure 'web' value exists in alertchannel enum (PostgreSQL).
+    
+    Uses engine.begin() for DDL operations as required by SQLAlchemy 2.x.
+    """
     try:
+        with engine.begin() as conn:
+            # Check if 'web' enum value exists
+            result = conn.execute(
+                text(
+                    "SELECT EXISTS("
+                    "SELECT 1 FROM pg_enum "
+                    "WHERE enumlabel = 'web' "
+                    "AND enumtypid = (SELECT oid FROM pg_type WHERE typname = 'alertchannel')"
+                    ")"
+                )
+            ).scalar()
+
+            if not result:
+                conn.execute(text("ALTER TYPE alertchannel ADD VALUE IF NOT EXISTS 'web'"))
+                logger.info("Added 'web' to alertchannel enum")
+            else:
+                logger.info("alertchannel enum already has 'web' value")
         result = db.execute(
             text("SELECT EXISTS(SELECT 1 FROM pg_enum WHERE enumlabel = 'web' AND enumtypid = (SELECT oid FROM pg_type WHERE typname = 'alertchannel'))")
         ).scalar()
@@ -46,9 +66,6 @@ def ensure_alertchannel_enum():
             logger.info("alertchannel enum already has 'web' value")
     except Exception as e:
         logger.error(f"Error ensuring alertchannel enum: {e}")
-        db.rollback()
-    finally:
-        db.close()
 
 
 def _ensure_user_location_columns():
@@ -132,20 +149,41 @@ app = FastAPI(
 
 # ─── MIDDLEWARE ───────────────────────────────────────────────────────────────
 
-# Allow production frontend + localhost + Vercel preview URLs
+# CORS Configuration - Explicitly define allowed origins
+# SECURITY: Never use "*" for allow_origins when allow_credentials=True
+# This would expose users to CSRF attacks and credential theft
+
+# Build allowed origins list from config with validation
 allowed_origins = [
-    settings.FRONTEND_URL or "http://localhost:3000",
     "http://localhost:3000",
     "http://localhost:5173",
     "https://alert-system-frontend-jq7u.vercel.app",
 ]
 
+# Add production FRONTEND_URL if configured and not a wildcard
+if settings.FRONTEND_URL:
+    # Reject wildcard origins - security risk
+    if settings.FRONTEND_URL == "*" or settings.FRONTEND_URL == "null":
+        logger.error(
+            f"CORS SECURITY ERROR: FRONTEND_URL='{settings.FRONTEND_URL}' is not allowed. "
+            "Wildcard origins are prohibited when allow_credentials=True."
+        )
+    else:
+        # Add if not already in list
+        if settings.FRONTEND_URL not in allowed_origins:
+            allowed_origins.append(settings.FRONTEND_URL)
+            logger.info(f"Added FRONTEND_URL to CORS allowed origins: {settings.FRONTEND_URL}")
+
+logger.info(f"CORS allowed origins: {allowed_origins}")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    # Only allow necessary HTTP methods
+    allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    # Only allow necessary headers
+    allow_headers=["Authorization", "Content-Type", "Accept"],
 )
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
