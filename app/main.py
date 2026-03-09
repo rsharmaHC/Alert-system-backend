@@ -3,6 +3,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from contextlib import asynccontextmanager
 import logging
+import os
+import re
 
 from sqlalchemy import text
 from app.config import settings
@@ -307,7 +309,29 @@ if settings.FRONTEND_URL:
             allowed_origins.append(settings.FRONTEND_URL)
             logger.info(f"Added FRONTEND_URL to CORS allowed origins: {settings.FRONTEND_URL}")
 
+# Add all Railway dynamic domains based on deployment
+railway_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN")
+if railway_domain:
+    railway_url = f"https://{railway_domain}"
+    if railway_url not in allowed_origins:
+        allowed_origins.append(railway_url)
+        logger.info(f"Added Railway domain to CORS allowed origins: {railway_url}")
+
+# Custom origin checker to allow Railway subdomains
+def allow_origin_func(origin: str) -> bool:
+    """Check if origin is allowed (supports Railway dynamic domains)."""
+    # Check exact matches
+    if origin in allowed_origins:
+        return True
+    
+    # Allow Railway subdomains (railway.app and railway.com)
+    if re.match(r'^https://[a-zA-Z0-9-]+\.railway\.(app|com)$', origin):
+        return True
+    
+    return False
+
 logger.info(f"CORS allowed origins: {allowed_origins}")
+logger.info(f"CORS origin regex: Railway subdomains allowed")
 
 # Security headers — MUST be registered first (outermost layer)
 # Wraps all other middleware to ensure headers on every response
@@ -316,6 +340,7 @@ app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
+    allow_origin_regex=r'^https://[a-zA-Z0-9-]+\.railway\.(app|com)$',  # Allow Railway subdomains
     allow_credentials=True,
     # Only allow necessary HTTP methods
     allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
