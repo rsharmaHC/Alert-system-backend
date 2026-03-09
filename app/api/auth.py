@@ -278,13 +278,13 @@ def login(request: LoginRequest, req: Request, db: Session = Depends(get_db)):
         func.lower(User.email) == normalized_email,
         User.deleted_at.is_(None)
     ).first()
-    
+
     # STEP 3: If user exists, check account lockout
     # If user doesn't exist, skip account lockout but IP limit still applies
     if user:
         account_allowed, account_retry_after = check_account_lockout(user.id)
         if not account_allowed:
-            # Record this attempt for IP tracking
+            # Record this failed attempt for IP tracking
             record_ip_attempt(client_ip)
             logger.warning(f"Account lockout for user {user.id}, retry_after={account_retry_after}s")
             raise HTTPException(
@@ -292,7 +292,7 @@ def login(request: LoginRequest, req: Request, db: Session = Depends(get_db)):
                 detail=f"Account temporarily locked. Try again in {format_lockout_time(account_retry_after)}.",
                 headers={"Retry-After": str(account_retry_after)}
             )
-    
+
     # STEP 4: Validate credentials
     # If user doesn't exist, treat as invalid credentials (don't reveal)
     if not user:
@@ -321,9 +321,10 @@ def login(request: LoginRequest, req: Request, db: Session = Depends(get_db)):
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid credentials"
         )
-    
+
     # STEP 5: Successful login - reset account lockout
     reset_account_lockout(user.id)
+    # Note: Do NOT record IP attempt on success - only failures count toward rate limit
     
     # Log successful attempt in database (for audit)
     db.add(LoginAttempt(
