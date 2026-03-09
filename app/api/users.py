@@ -102,6 +102,7 @@ def create_user(
     db.add(user)
     db.add(AuditLog(
         user_id=current_user.id,
+        user_email=current_user.email,
         action="create_user",
         resource_type="user",
         details={"email": data.email}
@@ -174,6 +175,7 @@ def update_user(
 
     db.add(AuditLog(
         user_id=current_user.id,
+        user_email=current_user.email,
         action="update_user",
         resource_type="user",
         resource_id=user_id
@@ -199,6 +201,7 @@ def delete_user(
     db.delete(user)
     db.add(AuditLog(
         user_id=current_user.id,
+        user_email=current_user.email,
         action="delete_user",
         resource_type="user",
         resource_id=user_id,
@@ -240,6 +243,7 @@ def bulk_delete_users(
         # Log the deletion action
         db.add(AuditLog(
             user_id=current_user.id,
+            user_email=current_user.email,
             action="delete_user",
             resource_type="user",
             resource_id=user.id,
@@ -375,6 +379,7 @@ async def import_users_csv(
     if valid_users:
         db.add(AuditLog(
             user_id=current_user.id,
+            user_email=current_user.email,
             action="import_users_csv",
             resource_type="user",
             details={
@@ -391,6 +396,7 @@ async def import_users_csv(
         # No valid rows to commit - still log the failed import attempt
         db.add(AuditLog(
             user_id=current_user.id,
+            user_email=current_user.email,
             action="import_users_csv_failed",
             resource_type="user",
             details={
@@ -432,6 +438,7 @@ async def import_users_csv(
     if created_users and (emails_sent > 0 or emails_failed > 0):
         db.add(AuditLog(
             user_id=current_user.id,
+            user_email=current_user.email,
             action="import_users_csv_emails",
             resource_type="user",
             details={
