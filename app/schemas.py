@@ -13,6 +13,8 @@ from app.models import (
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str
+    device_fingerprint: Optional[str] = None  # Browser-generated device hash for attack detection
+    # Note: CAPTCHA verification intentionally NOT implemented per security review
 
 
 class TokenResponse(BaseModel):
