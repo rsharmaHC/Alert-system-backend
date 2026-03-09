@@ -25,6 +25,13 @@ class Settings(BaseSettings):
     SES_FROM_EMAIL: str = "noreply@tmalert.com"
     SES_FROM_NAME: str = "TM Alert"
 
+    # SMTP settings for async email notifications
+    EMAIL_FROM: str = "security@tmalert.com"
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 587
+    SMTP_USER: str = ""
+    SMTP_PASSWORD: str = ""
+
     GOOGLE_MAPS_API_KEY: str = ""
     LOCATIONIQ_API_KEY: str = ""
 

@@ -17,7 +17,14 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.add_column('audit_logs', sa.Column('user_email', sa.String(255), nullable=True))
+    conn = op.get_bind()
+    inspector = sa.inspect(conn)
+    
+    # Check if user_email column exists in audit_logs
+    columns = [col['name'] for col in inspector.get_columns('audit_logs')]
+    
+    if 'user_email' not in columns:
+        op.add_column('audit_logs', sa.Column('user_email', sa.String(255), nullable=True))
 
 
 def downgrade() -> None:
