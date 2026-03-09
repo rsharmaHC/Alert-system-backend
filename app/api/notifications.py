@@ -84,6 +84,7 @@ def create_incident(
     db.add(incident)
     db.add(AuditLog(
         user_id=current_user.id,
+        user_email=current_user.email,
         action="create_incident",
         resource_type="incident",
         details={"title": data.title, "severity": data.severity}
@@ -212,6 +213,7 @@ def create_notification(
     db.add(notification)
     db.add(AuditLog(
         user_id=current_user.id,
+        user_email=current_user.email,
         action="create_notification",
         resource_type="notification",
         details={"title": data.title, "channels": [c.value for c in data.channels]}
@@ -242,6 +244,7 @@ def send_notification(
     send_notification_task.delay(notification_id)
     db.add(AuditLog(
         user_id=current_user.id,
+        user_email=current_user.email,
         action="send_notification",
         resource_type="notification",
         resource_id=notification_id
