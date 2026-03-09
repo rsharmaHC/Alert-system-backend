@@ -145,7 +145,7 @@ def get_incident(
 notifications_router = APIRouter(prefix="/notifications", tags=["Notifications"])
 
 
-@notifications_router.get("", response_model=List[NotificationResponse])
+@notifications_router.get("", response_model=dict)
 def list_notifications(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
@@ -159,7 +159,14 @@ def list_notifications(
         query = query.filter(Notification.incident_id == incident_id)
     if status:
         query = query.filter(Notification.status == status)
-    return query.order_by(desc(Notification.created_at)).offset((page - 1) * page_size).limit(page_size).all()
+    
+    # Get total count
+    total = query.count()
+    
+    # Get paginated results
+    items = query.order_by(desc(Notification.created_at)).offset((page - 1) * page_size).limit(page_size).all()
+    
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
 @notifications_router.post("", response_model=NotificationResponse, status_code=201)

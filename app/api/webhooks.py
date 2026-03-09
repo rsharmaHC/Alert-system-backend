@@ -262,11 +262,14 @@ async def voice_status_callback(
     db: Session = Depends(get_db),
 ):
     """Twilio call status callback for outbound voice calls."""
-    # Validate Twilio signature
-    body_bytes = await request.body()
+    # Validate Twilio signature - body already consumed by Form()
+    # Reconstruct body from form data for signature validation
+    form_data = f"CallSid={CallSid}&CallStatus={CallStatus}&To={To}&From={From}&Duration={Duration}"
+    body_bytes = form_data.encode()
+    
     if not validate_twilio_request(request, body_bytes):
         raise HTTPException(status_code=401, detail="Invalid Twilio signature")
-    
+
     logger.info(f"Voice status: {CallSid} -> {CallStatus}, Duration: {Duration}s")
 
     if CallSid:
