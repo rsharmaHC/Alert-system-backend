@@ -66,7 +66,6 @@ class UserCreate(BaseModel):
     first_name: str
     last_name: str
     phone: Optional[str] = None
-    whatsapp_number: Optional[str] = None
     department: Optional[str] = None
     title: Optional[str] = None
     employee_id: Optional[str] = None
@@ -87,13 +86,26 @@ class UserUpdate(BaseModel):
     first_name: Optional[str] = None
     last_name: Optional[str] = None
     phone: Optional[str] = None
-    whatsapp_number: Optional[str] = None
     department: Optional[str] = None
     title: Optional[str] = None
     employee_id: Optional[str] = None
     role: Optional[UserRole] = None
     location_id: Optional[int] = None
     is_active: Optional[bool] = None
+    preferred_channels: Optional[List[AlertChannel]] = None
+
+
+class UserProfileUpdate(BaseModel):
+    """Schema for users to update their own profile.
+    
+    Restricts updating sensitive fields like role, is_active, employee_id.
+    """
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    phone: Optional[str] = None
+    department: Optional[str] = None
+    title: Optional[str] = None
+    location_id: Optional[int] = None
     preferred_channels: Optional[List[AlertChannel]] = None
 
 
@@ -104,7 +116,6 @@ class UserResponse(BaseModel):
     last_name: str
     full_name: str
     phone: Optional[str]
-    whatsapp_number: Optional[str]
     department: Optional[str]
     title: Optional[str]
     employee_id: Optional[str]

@@ -263,25 +263,6 @@ def _send_to_channel(self, notification_id: int, user_id: int, channel: str):
                 _update_notification_status(db, notification_id, total_channels)
                 return
 
-        elif channel == AlertChannel.WHATSAPP:
-            number = user.whatsapp_number or user.phone
-            if number:
-                log.to_address = number
-                result = twilio_service.send_whatsapp(number, notification.message)
-            else:
-                log.status = DeliveryStatus.FAILED
-                log.error_message = "No WhatsApp number"
-                db.commit()
-                # Atomic increment and status update
-                db.execute(
-                    update(Notification)
-                    .where(Notification.id == notification_id)
-                    .values(failed_count=Notification.failed_count + 1)
-                )
-                db.commit()
-                _update_notification_status(db, notification_id, total_channels)
-                return
-
         # Update log based on result
         if result.get("error"):
             log.status = DeliveryStatus.FAILED
@@ -452,6 +433,10 @@ def _get_recipients(db, notification: Notification) -> List[User]:
             f = group.dynamic_filter
             if f.get("department"):
                 query = query.filter(User.department == f["department"])
+            if f.get("title"):
+                query = query.filter(User.title == f["title"])
+            if f.get("role"):
+                query = query.filter(User.role == f["role"])
             if f.get("location_id"):
                 query = query.filter(User.location_id == f["location_id"])
             users = query.all()
