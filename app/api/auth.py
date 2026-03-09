@@ -19,6 +19,17 @@ from app.core.security import (
 )
 from app.core.deps import get_current_user, require_admin
 from app.services.messaging import email_service
+from app.services.rate_limiter import (
+    record_failed_login as redis_record_failed_login,
+    is_account_locked,
+    record_ip_failure,
+    is_ip_locked,
+    clear_account_failures,
+    get_account_failure_count,
+    get_device_failure_count,
+    record_device_failure,
+)
+from app.services.security_notifications import notify_suspicious_login
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -30,10 +41,27 @@ router = APIRouter(prefix="/auth", tags=["Authentication"])
 _password_reset_rate_limit: dict[str, float] = {}
 PASSWORD_RESET_RATE_LIMIT_SECONDS = 30  # 30 seconds between requests per email
 
-# Redis-based login rate limiting constants
+# Redis-based login rate limiting constants (kept for backward compatibility with old functions)
 ACCOUNT_LOCKOUT_THRESHOLD = 5  # Failed attempts before account lockout
 IP_RATE_LIMIT_MAX_ATTEMPTS = 20  # Max attempts per IP across all accounts
 IP_RATE_LIMIT_WINDOW_SECONDS = 600  # 10 minutes
+
+
+def format_lockout_time(seconds: int) -> str:
+    """Format lockout duration in human-readable format."""
+    if seconds < 60:
+        return f"{seconds} seconds"
+    elif seconds < 3600:
+        mins = seconds // 60
+        return f"{mins} minute{'s' if mins > 1 else ''}"
+    elif seconds < 86400:
+        hours = seconds // 3600
+        mins = (seconds % 3600) // 60
+        if mins > 0:
+            return f"{hours} hour{'s' if hours > 1 else ''} {mins} minute{'s' if mins > 1 else ''}"
+        return f"{hours} hour{'s' if hours > 1 else ''}"
+    days = seconds // 86400
+    return f"{days} day{'s' if days > 1 else ''}"
 
 
 def _get_redis_client() -> redis.Redis:
@@ -237,48 +265,45 @@ def reset_account_lockout(user_id: int) -> None:
 
 
 @router.post("/login", response_model=TokenResponse)
-def login(request: LoginRequest, req: Request, db: Session = Depends(get_db)):
+async def login(request: LoginRequest, req: Request, db: Session = Depends(get_db)):
     client_ip = _get_client_ip(req)
-    
+
     # Normalize email to prevent case-based lockout bypass
     # e.g., "Admin@Site.com" vs "admin@site.com" must hit the same lockout counter
     normalized_email = request.email.strip().lower()
-    
+
     # STEP 1: Check IP-based rate limit FIRST (before any user lookup)
     # This prevents enumeration attacks and applies across ALL accounts
-    ip_allowed, ip_retry_after = check_ip_rate_limit(client_ip)
-    if not ip_allowed:
+    if await is_ip_locked(client_ip):
+        logger.warning(f"IP lockout for {client_ip}")
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Invalid credentials",
-            headers={"Retry-After": str(ip_retry_after)}
+            detail="Too many login attempts. Please try again later.",
         )
 
     # STEP 2: Look up user by email (case-insensitive)
     # Use func.lower for case-insensitive comparison to match normalized_email
     user = db.query(User).filter(
-        func.lower(User.email) == normalized_email,
-        User.deleted_at.is_(None)
+        func.lower(User.email) == normalized_email
     ).first()
-    
+
     # STEP 3: If user exists, check account lockout
     # If user doesn't exist, skip account lockout but IP limit still applies
     if user:
-        account_allowed, account_retry_after = check_account_lockout(user.id)
-        if not account_allowed:
-            # Record this attempt for IP tracking
-            record_ip_attempt(client_ip)
+        if await is_account_locked(user.id):
+            # Record this failed attempt for IP tracking
+            await record_ip_failure(client_ip)
+            logger.warning(f"Account lockout for user {user.id}")
             raise HTTPException(
                 status_code=status.HTTP_423_LOCKED,
-                detail="Invalid credentials",
-                headers={"Retry-After": str(account_retry_after)}
+                detail="Account temporarily locked.",
             )
-    
+
     # STEP 4: Validate credentials
     # If user doesn't exist, treat as invalid credentials (don't reveal)
     if not user:
         # Record failed attempt for IP tracking
-        record_ip_attempt(client_ip)
+        await record_ip_failure(client_ip)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid credentials"
@@ -287,25 +312,51 @@ def login(request: LoginRequest, req: Request, db: Session = Depends(get_db)):
     # Check if account is active
     if not user.is_active:
         # Record failed attempt for IP tracking
-        record_ip_attempt(client_ip)
+        await record_ip_failure(client_ip)
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid credentials"
         )
 
-    # Check password
+    # STEP 5: Device fingerprint tracking (if provided)
+    # Track failures per device to detect automated attacks
+    if request.device_fingerprint:
+        device_count = await get_device_failure_count(request.device_fingerprint)
+        if device_count >= 50:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Too many attempts from this device."
+            )
+
+    # STEP 6: Verify password
     if not verify_password(request.password, user.hashed_password):
         # Record failed attempt for account lockout escalation and IP tracking
-        record_failed_login(user.id)
-        record_ip_attempt(client_ip)
+        count = await redis_record_failed_login(user.id)
+        await record_ip_failure(client_ip)
+
+        # Track device failures if fingerprint provided
+        if request.device_fingerprint:
+            await record_device_failure(request.device_fingerprint)
+
+        # Send security notification email at first lockout threshold (5 failures)
+        # Only send once at count == 5 to avoid spamming user's inbox
+        if count == 5:
+            await notify_suspicious_login(
+                email=user.email,
+                attempt_count=count,
+                ip_address=client_ip,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+            )
+
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid credentials"
         )
-    
-    # STEP 5: Successful login - reset account lockout
-    reset_account_lockout(user.id)
-    
+
+    # STEP 7: Successful login - reset account lockout
+    await clear_account_failures(user.id)
+    # Note: Do NOT record IP attempt on success - only failures count toward rate limit
+
     # Log successful attempt in database (for audit)
     db.add(LoginAttempt(
         email=normalized_email,
@@ -347,7 +398,7 @@ def login(request: LoginRequest, req: Request, db: Session = Depends(get_db)):
 
 @router.post("/refresh", response_model=TokenResponse)
 def refresh_token(request: RefreshRequest, db: Session = Depends(get_db)):
-    payload = decode_token(request.refresh_token)
+    payload = decode_token(request.refresh_token, token_type="refresh")
 
     if not payload or payload.get("type") != "refresh":
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
@@ -538,7 +589,7 @@ def get_login_attempts(
     current_user: User = Depends(require_admin)
 ):
     """View recent login attempts (for security monitoring).
-    
+
     SECURITY: Restricted to ADMIN role only (CWE-639 IDOR remediation).
     """
     attempts = db.query(LoginAttempt).order_by(
@@ -555,3 +606,23 @@ def get_login_attempts(
         }
         for a in attempts
     ]
+
+
+@router.post("/debug/reset-rate-limits")
+def reset_rate_limits(
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin)
+):
+    """Debug endpoint to reset all rate limits. ADMIN only.
+
+    Remove in production or restrict to super_admin only.
+    """
+    r = _get_redis_client()
+    
+    # Delete all lockout keys
+    keys = r.keys("lockout:*")
+    if keys:
+        r.delete(*keys)
+    
+    return {"message": f"Deleted {len(keys)} rate limit keys"}

@@ -6,6 +6,7 @@ class Settings(BaseSettings):
     APP_NAME: str = "TM Alert"
     APP_ENV: str = "development"
     SECRET_KEY: str = ""
+    REFRESH_SECRET_KEY: str = ""
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
     FRONTEND_URL: str = "http://localhost:3000"
@@ -23,6 +24,13 @@ class Settings(BaseSettings):
     AWS_REGION: str = "us-east-1"
     SES_FROM_EMAIL: str = "noreply@tmalert.com"
     SES_FROM_NAME: str = "TM Alert"
+
+    # SMTP settings for async email notifications
+    EMAIL_FROM: str = "security@tmalert.com"
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 587
+    SMTP_USER: str = ""
+    SMTP_PASSWORD: str = ""
 
     GOOGLE_MAPS_API_KEY: str = ""
     LOCATIONIQ_API_KEY: str = ""
