@@ -6,6 +6,7 @@ import logging
 
 from sqlalchemy import text
 from app.config import settings
+from app.middleware.security_headers import SecurityHeadersMiddleware
 from sqlalchemy import text
 from app.database import engine, Base, SessionLocal
 from app.models import User, UserRole, AlertChannel
@@ -189,6 +190,10 @@ if settings.FRONTEND_URL:
             logger.info(f"Added FRONTEND_URL to CORS allowed origins: {settings.FRONTEND_URL}")
 
 logger.info(f"CORS allowed origins: {allowed_origins}")
+
+# Security headers — MUST be registered first (outermost layer)
+# Wraps all other middleware to ensure headers on every response
+app.add_middleware(SecurityHeadersMiddleware)
 
 app.add_middleware(
     CORSMiddleware,
