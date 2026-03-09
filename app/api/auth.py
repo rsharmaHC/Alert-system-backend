@@ -329,6 +329,7 @@ def login(request: LoginRequest, req: Request, db: Session = Depends(get_db)):
     # Audit log
     db.add(AuditLog(
         user_id=user.id,
+        user_email=user.email,
         action="login",
         resource_type="user",
         resource_id=user.id,
