@@ -605,15 +605,17 @@ def fetch_location_autocomplete_task(
             
             logger.info(f"Fetched {len(results)} location results for query: {query}")
             return results
-            
+
     except httpx.TimeoutException as e:
-        logger.error(f"LocationIQ timeout: {e}")
+        logger.error(f"LocationIQ timeout for query: {query}")
         raise self.retry(exc=e)
     except httpx.HTTPStatusError as e:
-        logger.error(f"LocationIQ HTTP error {e.response.status_code}: {e}")
+        logger.error(f"LocationIQ HTTP error {e.response.status_code} for query: {query}")
         if e.response.status_code >= 500:
             raise self.retry(exc=e)
         return None
     except Exception as e:
-        logger.error(f"LocationIQ fetch error: {e}")
+        # Scrub API key from error message to prevent credential leakage in logs
+        error_msg = str(e).replace(settings.LOCATIONIQ_API_KEY, "[REDACTED]") if settings.LOCATIONIQ_API_KEY else str(e)
+        logger.error(f"LocationIQ fetch error: {error_msg}")
         raise self.retry(exc=e)

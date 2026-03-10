@@ -13,11 +13,21 @@ if db_url.startswith("postgres://"):
 elif db_url.startswith("postgresql://"):
     db_url = db_url.replace("postgresql://", "postgresql+psycopg2://", 1)
 
+# Enforce TLS for database connections in production.
+# - "require": connection fails if SSL is unavailable (no silent plaintext fallback)
+# - Skipped in development where local PostgreSQL typically has no SSL cert
+# - Railway PostgreSQL supports SSL, so this works out of the box there
+_connect_args = {}
+if settings.APP_ENV != "development":
+    _connect_args["sslmode"] = "require"
+    logger.info("Database SSL enforced (sslmode=require)")
+
 engine = create_engine(
     db_url,
     pool_pre_ping=True,
     pool_size=10,
-    max_overflow=20
+    max_overflow=20,
+    connect_args=_connect_args,
 )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

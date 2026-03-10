@@ -25,6 +25,7 @@ from time import time as current_time
 from app.database import get_db
 from app.models import User, Location, UserLocation, UserLocationHistory, AuditLog, UserLocationStatus, UserLocationAssignmentType
 from app.utils.audit import create_audit_log
+from app.utils.search import escape_like
 from app.schemas import (
     UserLocationAssign, UserLocationRemove, UserLocationGeofenceUpdate,
     UserLocationResponse, UserLocationHistoryResponse,
@@ -566,7 +567,8 @@ def get_location_history(
     )
     
     if action_filter:
-        query = query.filter(UserLocationHistory.action.ilike(f"%{action_filter}%"))
+        safe_action = escape_like(action_filter)
+        query = query.filter(UserLocationHistory.action.ilike(f"%{safe_action}%"))
     
     total = query.count()
     history = query.order_by(

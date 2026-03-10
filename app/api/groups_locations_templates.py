@@ -6,6 +6,7 @@ from typing import Optional, List
 from app.database import get_db
 from app.models import Group, GroupType, Location, NotificationTemplate, User, AuditLog, UserLocation, UserLocationStatus, UserRole
 from app.utils.audit import create_audit_log
+from app.utils.search import escape_like
 from app.schemas import (
     GroupCreate, GroupUpdate, GroupResponse, GroupDetailResponse, GroupMemberAdd,
     LocationCreate, LocationUpdate, LocationResponse,
@@ -37,7 +38,8 @@ def list_groups(
         query = query.join(Group.members).filter(User.id == current_user.id)
     
     if search:
-        query = query.filter(Group.name.ilike(f"%{search}%"))
+        safe_search = escape_like(search)
+        query = query.filter(Group.name.ilike(f"%{safe_search}%"))
     if type:
         query = query.filter(Group.type == type)
     groups = query.order_by(Group.name).all()

@@ -7,6 +7,8 @@ from sqlalchemy import or_, func
 from typing import Optional, List
 from app.database import get_db
 from app.models import User, UserRole, AuditLog
+from app.utils.search import escape_like
+from app.utils.audit import create_audit_log
 from app.schemas import UserCreate, UserUpdate, UserResponse, UserListResponse, CSVImportResponse, UserBulkDeleteResponse, AdminMFAStatusResponse, AdminMFAResetRequest, AdminMFAResetResponse
 from app.core.security import hash_password
 from app.core.deps import get_current_user, require_admin, require_manager
@@ -76,13 +78,14 @@ def list_users(
     query = db.query(User)
 
     if search:
+        safe_search = escape_like(search)
         query = query.filter(or_(
-            User.first_name.ilike(f"%{search}%"),
-            User.last_name.ilike(f"%{search}%"),
-            User.email.ilike(f"%{search}%"),
-            User.phone.ilike(f"%{search}%"),
-            User.department.ilike(f"%{search}%"),
-            User.employee_id.ilike(f"%{search}%"),
+            User.first_name.ilike(f"%{safe_search}%"),
+            User.last_name.ilike(f"%{safe_search}%"),
+            User.email.ilike(f"%{safe_search}%"),
+            User.phone.ilike(f"%{safe_search}%"),
+            User.department.ilike(f"%{safe_search}%"),
+            User.employee_id.ilike(f"%{safe_search}%"),
         ))
     if department:
         query = query.filter(User.department == department)

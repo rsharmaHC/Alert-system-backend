@@ -692,6 +692,9 @@ def reset_password(request: PasswordResetConfirm, db: Session = Depends(get_db))
     user.password_reset_token = None
     user.password_reset_expires = None
 
+    # Invalidate all existing access tokens
+    user.token_valid_after = datetime.now(timezone.utc)
+
     # Revoke all refresh tokens to force re-authentication with new password
     db.query(RefreshToken).filter(
         RefreshToken.user_id == user.id,
@@ -712,6 +715,10 @@ def change_password(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Current password is incorrect")
 
     current_user.hashed_password = hash_password(request.new_password)
+
+    # Invalidate all existing access tokens by setting token_valid_after
+    # Any JWT with iat < this timestamp will be rejected by get_current_user
+    current_user.token_valid_after = datetime.now(timezone.utc)
 
     # Revoke all refresh tokens to force re-authentication with new password
     # This invalidates all other sessions for security

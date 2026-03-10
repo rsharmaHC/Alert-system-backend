@@ -13,7 +13,7 @@ MAX_JSON_SIZE = 1 * 1024 * 1024  # 1 MB max JSON payload
 from sqlalchemy import text
 from app.config import settings
 from app.middleware.security_headers import SecurityHeadersMiddleware
-from app.middleware.request_id import RequestIDMiddleware, RequestIDLogFilter
+from app.middleware.request_id import RequestIDMiddleware
 from sqlalchemy import text
 from app.database import engine, Base, SessionLocal, ensure_column_exists
 from app.models import (
@@ -24,6 +24,7 @@ from app.models import (
 from app.core.security import hash_password
 from app.core.location_cache import init_location_cache, close_location_cache
 from app.core.deps import require_admin
+from app.logging_config import setup_logging
 from app.api.auth import router as auth_router
 from app.api.users import router as users_router
 from app.api.groups_locations_templates import (
@@ -38,17 +39,8 @@ from app.api.location_v2 import router as location_router
 from app.api.location_audience import router as location_audience_router
 from app.api.docs import router as docs_router
 
-# Configure logging with request ID for per-request correlation.
-# The %(request_id)s field is populated by RequestIDLogFilter.
-# Outside request context (startup, Celery), it's empty string.
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - [%(request_id)s] %(message)s"
-)
-# Attach request ID filter to root logger — ALL loggers inherit it automatically.
-# This means app.api.auth, app.services.messaging, uvicorn.access, etc.
-# all get request_id injected without any code changes in those modules.
-logging.getLogger().addFilter(RequestIDLogFilter())
+# Apply initial logging config (will be re-applied in lifespan after uvicorn's override)
+setup_logging()
 logger = logging.getLogger(__name__)
 
 
@@ -205,6 +197,10 @@ def _ensure_delivery_log_user_email():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Re-apply logging config AFTER uvicorn's dictConfig has run.
+    # Without this, uvicorn overwrites our formatters/handlers on startup.
+    setup_logging()
+    
     # Initialize Redis cache for location autocomplete
     logger.info("Initializing location cache...")
     try:
@@ -233,6 +229,12 @@ async def lifespan(app: FastAPI):
         _ensure_user_location_columns()
     except Exception as e:
         logger.error(f"Failed to ensure user location columns: {e}")
+
+    # Ensure User table has token_valid_after column (session invalidation on password change)
+    try:
+        ensure_column_exists('users', 'token_valid_after', 'TIMESTAMP WITH TIME ZONE', nullable=True)
+    except Exception as e:
+        logger.error(f"Failed to ensure token_valid_after column: {e}")
 
     # Ensure audit_logs table has user_email column
     logger.info("Ensuring audit_logs table has user_email column...")
