@@ -1,8 +1,19 @@
+# Railway Configuration
+# =====================
+# Default configuration - works for all service types
+# For specific service configs, use:
+#   - railway.api.toml (API service with healthcheck)
+#   - railway.worker.toml (Worker service, no healthcheck)
+#   - railway.beat.toml (Beat service, no healthcheck)
+
 [build]
 builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-startCommand = "uvicorn app.main:app --host 0.0.0.0 --port 8000"
-healthcheckPath = "/health"
-healthcheckTimeout = 100
+# Healthcheck disabled by default (works for workers/beat)
+# API service should set healthcheckPath via environment or use railway.api.toml
+healthcheckPath = ""
+healthcheckTimeout = 300
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 5
