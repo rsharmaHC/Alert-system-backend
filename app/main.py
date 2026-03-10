@@ -405,12 +405,7 @@ app.include_router(docs_router, prefix=API_PREFIX)
 
 @app.get("/health", tags=["Health"])
 def health_check():
-    return {
-        "status": "healthy",
-        "app": settings.APP_NAME,
-        "env": settings.APP_ENV,
-        "version": "1.0.0"
-    }
+    return {"status": "healthy"}
 
 
 @app.get("/", tags=["Root"])
