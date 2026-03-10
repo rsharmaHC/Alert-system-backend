@@ -13,6 +13,7 @@ MAX_JSON_SIZE = 1 * 1024 * 1024  # 1 MB max JSON payload
 from sqlalchemy import text
 from app.config import settings
 from app.middleware.security_headers import SecurityHeadersMiddleware
+from app.middleware.request_id import RequestIDMiddleware, RequestIDLogFilter
 from sqlalchemy import text
 from app.database import engine, Base, SessionLocal, ensure_column_exists
 from app.models import (
@@ -37,10 +38,17 @@ from app.api.location_v2 import router as location_router
 from app.api.location_audience import router as location_audience_router
 from app.api.docs import router as docs_router
 
+# Configure logging with request ID for per-request correlation.
+# The %(request_id)s field is populated by RequestIDLogFilter.
+# Outside request context (startup, Celery), it's empty string.
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    format="%(asctime)s - %(name)s - %(levelname)s - [%(request_id)s] %(message)s"
 )
+# Attach request ID filter to root logger — ALL loggers inherit it automatically.
+# This means app.api.auth, app.services.messaging, uvicorn.access, etc.
+# all get request_id injected without any code changes in those modules.
+logging.getLogger().addFilter(RequestIDLogFilter())
 logger = logging.getLogger(__name__)
 
 
@@ -342,6 +350,10 @@ logger.info(f"CORS origin regex: Railway subdomains allowed")
 # Wraps all other middleware to ensure headers on every response
 app.add_middleware(SecurityHeadersMiddleware)
 
+# Request ID — generates UUID per request for log correlation
+# Registered second-outermost so the ID is available to all inner middleware
+app.add_middleware(RequestIDMiddleware)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
@@ -352,7 +364,7 @@ app.add_middleware(
     # Only allow necessary headers
     allow_headers=["Authorization", "Content-Type", "Accept"],
     # Expose Retry-After header for rate limiting countdown timer
-    expose_headers=["Retry-After"],
+    expose_headers=["Retry-After", "X-Request-ID"],
 )
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
