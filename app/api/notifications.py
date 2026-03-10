@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi import APIRouter, Depends, HTTPException, status, Query, Response
 from sqlalchemy.orm import Session
 from sqlalchemy import desc, update
 from typing import Optional, List
@@ -17,6 +17,11 @@ from app.schemas import (
 from app.core.deps import get_current_user, require_admin, require_manager
 from app.tasks import send_notification_task
 from app.services.messaging import _is_safe_url
+from app.services.rate_limiter import (
+    check_notification_rate_limit,
+    record_notification_dispatch,
+    NOTIFICATION_RATE_LIMIT_MAX,
+)
 
 # ─── INCIDENT STATUS TRANSITIONS ──────────────────────────────────────────────
 
@@ -213,11 +218,20 @@ def list_notifications(
 
 
 @notifications_router.post("", response_model=NotificationResponse, status_code=201)
-def create_notification(
+async def create_notification(
     data: NotificationCreate,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_manager)
 ):
+    # Rate limiting: Check if user has exceeded notification dispatch limit
+    is_allowed, retry_after = await check_notification_rate_limit(current_user.id)
+    if not is_allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Rate limit exceeded. Maximum {NOTIFICATION_RATE_LIMIT_MAX} notifications per minute.",
+            headers={"Retry-After": str(retry_after)}
+        )
+
     # Validate at least one recipient method
     if not data.target_all and not data.target_group_ids and not data.target_user_ids:
         raise HTTPException(status_code=400, detail="Must specify recipients: target_all, groups, or users")
@@ -271,6 +285,9 @@ def create_notification(
     db.commit()
     db.refresh(notification)
 
+    # Record this dispatch for rate limiting
+    await record_notification_dispatch(current_user.id)
+
     # Send immediately if not scheduled (task will change status to SENT when complete)
     if not data.scheduled_at:
         send_notification_task.delay(notification.id)
@@ -279,12 +296,24 @@ def create_notification(
 
 
 @notifications_router.post("/{notification_id}/send", response_model=NotificationResponse)
-def send_notification(
+async def send_notification(
     notification_id: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_manager)
 ):
-    """Manually trigger a draft notification."""
+    """Manually trigger a draft notification.
+    
+    Rate Limit: Maximum 10 notifications per minute per user.
+    """
+    # Rate limiting: Check if user has exceeded notification dispatch limit
+    is_allowed, retry_after = await check_notification_rate_limit(current_user.id)
+    if not is_allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Rate limit exceeded. Maximum {NOTIFICATION_RATE_LIMIT_MAX} notifications per minute.",
+            headers={"Retry-After": str(retry_after)}
+        )
+
     notification = db.query(Notification).filter(Notification.id == notification_id).first()
     if not notification:
         raise HTTPException(status_code=404, detail="Notification not found")
@@ -292,6 +321,10 @@ def send_notification(
         raise HTTPException(status_code=400, detail=f"Cannot send notification in {notification.status} state")
 
     send_notification_task.delay(notification_id)
+    
+    # Record this dispatch for rate limiting
+    await record_notification_dispatch(current_user.id)
+    
     db.add(AuditLog(
         user_id=current_user.id,
         user_email=current_user.email,
