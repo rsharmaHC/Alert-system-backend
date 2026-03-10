@@ -450,6 +450,7 @@ def get_incoming_messages(
                 "body": msg.body,
                 "channel": msg.channel,
                 "user_id": msg.user_id,
+                "user_email": msg.user.email if msg.user else msg.user_email,
                 "user_name": msg.user.full_name if msg.user else None,
                 "notification_id": msg.notification_id,
                 "is_processed": msg.is_processed,
