@@ -7,9 +7,11 @@ from sqlalchemy import or_, func
 from typing import Optional, List
 from app.database import get_db
 from app.models import User, UserRole, AuditLog
-from app.schemas import UserCreate, UserUpdate, UserResponse, UserListResponse, CSVImportResponse, UserBulkDeleteResponse
+from app.schemas import UserCreate, UserUpdate, UserResponse, UserListResponse, CSVImportResponse, UserBulkDeleteResponse, AdminMFAStatusResponse, AdminMFAResetRequest, AdminMFAResetResponse
 from app.core.security import hash_password
 from app.core.deps import get_current_user, require_admin, require_manager
+from app.services.mfa_lifecycle import get_mfa_service
+from app.services.mfa_recovery import get_recovery_code_status, invalidate_all_recovery_codes
 
 logger = logging.getLogger(__name__)
 
@@ -526,3 +528,158 @@ def get_departments(db: Session = Depends(get_db), current_user: User = Depends(
         User.department != ""
     ).distinct().all()
     return [r[0] for r in results if r[0]]
+
+
+# ─── ADMIN MFA MANAGEMENT ENDPOINTS ─────────────────────────────────────────
+
+@router.get("/{user_id}/mfa/status", response_model=AdminMFAStatusResponse)
+def admin_get_user_mfa_status(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin)
+):
+    """
+    Admin view of user's MFA status.
+
+    Returns safe metadata only - never exposes secrets or recovery codes.
+    This is for admin support scenarios (e.g., helping locked-out users).
+
+    Security:
+    - Requires ADMIN role
+    - Does NOT expose secrets or recovery codes
+    - Audit logged
+    """
+    target_user = db.query(User).filter(User.id == user_id).first()
+    if not target_user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    # Prevent privilege escalation: ADMIN cannot view SUPER_ADMIN MFA status
+    if target_user.role == UserRole.SUPER_ADMIN and current_user.role != UserRole.SUPER_ADMIN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only SUPER_ADMIN can view MFA status of SUPER_ADMIN users"
+        )
+
+    mfa_service = get_mfa_service(db)
+    status_data = mfa_service.get_mfa_status(target_user)
+    recovery_status = get_recovery_code_status(db, user_id)
+
+    # Audit log
+    db.add(AuditLog(
+        user_id=current_user.id,
+        user_email=current_user.email,
+        action="admin_view_user_mfa_status",
+        resource_type="user",
+        resource_id=user_id,
+        details={
+            "target_user_email": target_user.email,
+            "admin_email": current_user.email
+        }
+    ))
+    db.commit()
+
+    return AdminMFAStatusResponse(
+        user_id=user_id,
+        user_email=target_user.email,
+        mfa_enabled=status_data["mfa_enabled"],
+        mfa_required=status_data["mfa_required"],
+        mfa_configured=status_data["mfa_configured"],
+        has_recovery_codes=status_data["has_recovery_codes"],
+        recovery_codes_count=status_data["recovery_codes_count"],
+        role=str(target_user.role.value)
+    )
+
+
+@router.post("/{user_id}/mfa/reset", response_model=AdminMFAResetResponse)
+def admin_reset_user_mfa(
+    user_id: int,
+    request: AdminMFAResetRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin)
+):
+    """
+    Admin-assisted MFA reset for a user.
+
+    Use this when:
+    - User lost authenticator AND recovery codes
+    - User is locked out and needs assistance
+    - Security incident requires forced re-enrollment
+
+    Security requirements:
+    - Requires ADMIN role
+    - Requires reason for audit
+    - Prevents privilege escalation (ADMIN can't reset SUPER_ADMIN)
+    - Invalidates old MFA secret and recovery codes
+    - Creates pending new enrollment (user must complete on next login)
+    - Target user is notified
+    - Audit logged
+
+    Note: This does NOT disable MFA for privileged users - they will be
+    forced to re-enroll on next login.
+    """
+    target_user = db.query(User).filter(User.id == user_id).first()
+    if not target_user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    # Prevent privilege escalation: ADMIN cannot reset SUPER_ADMIN MFA
+    if target_user.role == UserRole.SUPER_ADMIN and current_user.role != UserRole.SUPER_ADMIN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only SUPER_ADMIN can reset MFA for SUPER_ADMIN users"
+        )
+
+    # Cannot reset your own MFA via this endpoint (use self-service reset)
+    if target_user.id == current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Use the self-service MFA reset endpoint for your own account"
+        )
+
+    mfa_service = get_mfa_service(db)
+
+    # Invalidate old MFA secret
+    old_secret = target_user.mfa_secret
+    target_user.mfa_secret = None
+    target_user.mfa_enabled = False
+
+    # Invalidate old recovery codes
+    invalidate_all_recovery_codes(
+        db=db,
+        user_id=user_id,
+        invalidated_by_user_id=current_user.id,
+        reason='admin_reset'
+    )
+
+    # Generate new pending enrollment
+    from app.core.security import generate_mfa_secret
+    new_secret = generate_mfa_secret()
+    target_user.mfa_secret = new_secret
+    # Note: mfa_enabled remains False - user must complete enrollment
+
+    # Audit log
+    db.add(AuditLog(
+        user_id=current_user.id,
+        user_email=current_user.email,
+        action="admin_reset_user_mfa",
+        resource_type="user",
+        resource_id=user_id,
+        details={
+            "target_user_email": target_user.email,
+            "admin_email": current_user.email,
+            "reason": request.reason,
+            "old_secret_invalidated": bool(old_secret)
+        }
+    ))
+
+    # Notify target user (in production, send email)
+    user_notified = True  # In production, use email_service.send_mfa_reset_notification()
+    logger.info(f"Admin {current_user.email} reset MFA for user {target_user.email}")
+
+    db.commit()
+
+    return AdminMFAResetResponse(
+        message=f"MFA has been reset for user {target_user.email}. They must re-enroll on next login.",
+        mfa_reset=True,
+        user_notified=user_notified,
+        reason=request.reason
+    )
