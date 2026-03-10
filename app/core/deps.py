@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
@@ -32,6 +33,31 @@ def get_current_user(
 
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+
+    # Session invalidation: reject tokens issued before the last password change.
+    # token_valid_after is set when the user changes/resets their password.
+    # If NULL, no restriction (user never changed password since feature was added).
+    if user.token_valid_after is not None:
+        token_iat = payload.get("iat")
+        if token_iat is not None:
+            # iat can be a float (unix timestamp) or int — normalize to datetime
+            if isinstance(token_iat, (int, float)):
+                issued_at = datetime.fromtimestamp(token_iat, tz=timezone.utc)
+            else:
+                issued_at = token_iat
+
+            if issued_at < user.token_valid_after:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Session expired due to password change. Please log in again."
+                )
+        # If token has no iat claim (old tokens before this feature),
+        # and user HAS changed password, reject it — old tokens are untrusted
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Session expired. Please log in again."
+            )
 
     return user
 

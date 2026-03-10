@@ -1,17 +1,20 @@
 import io
 import csv
 import logging
-from fastapi import APIRouter, Depends, HTTPException, status, Query, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, status, Query, UploadFile, File, Request
 from sqlalchemy.orm import Session
 from sqlalchemy import or_, func
 from typing import Optional, List
 from app.database import get_db
 from app.models import User, UserRole, AuditLog
+from app.utils.search import escape_like
+from app.utils.audit import create_audit_log
 from app.schemas import UserCreate, UserUpdate, UserResponse, UserListResponse, CSVImportResponse, UserBulkDeleteResponse, AdminMFAStatusResponse, AdminMFAResetRequest, AdminMFAResetResponse
 from app.core.security import hash_password
 from app.core.deps import get_current_user, require_admin, require_manager
 from app.services.mfa_lifecycle import get_mfa_service
 from app.services.mfa_recovery import get_recovery_code_status, invalidate_all_recovery_codes
+from app.utils.audit import create_audit_log
 
 logger = logging.getLogger(__name__)
 
@@ -75,13 +78,14 @@ def list_users(
     query = db.query(User)
 
     if search:
+        safe_search = escape_like(search)
         query = query.filter(or_(
-            User.first_name.ilike(f"%{search}%"),
-            User.last_name.ilike(f"%{search}%"),
-            User.email.ilike(f"%{search}%"),
-            User.phone.ilike(f"%{search}%"),
-            User.department.ilike(f"%{search}%"),
-            User.employee_id.ilike(f"%{search}%"),
+            User.first_name.ilike(f"%{safe_search}%"),
+            User.last_name.ilike(f"%{safe_search}%"),
+            User.email.ilike(f"%{safe_search}%"),
+            User.phone.ilike(f"%{safe_search}%"),
+            User.department.ilike(f"%{safe_search}%"),
+            User.employee_id.ilike(f"%{safe_search}%"),
         ))
     if department:
         query = query.filter(User.department == department)
@@ -102,7 +106,8 @@ def list_users(
 def create_user(
     data: UserCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin)
+    current_user: User = Depends(require_admin),
+    request: Request = None,
 ):
     if db.query(User).filter(User.email == data.email).first():
         raise HTTPException(status_code=400, detail="Email already registered")
@@ -129,12 +134,13 @@ def create_user(
         is_active=True
     )
     db.add(user)
-    db.add(AuditLog(
+    db.add(create_audit_log(
         user_id=current_user.id,
         user_email=current_user.email,
         action="create_user",
         resource_type="user",
-        details={"email": data.email}
+        details={"email": data.email},
+        request=request,
     ))
     try:
         db.commit()
@@ -164,7 +170,8 @@ def update_user(
     user_id: int,
     data: UserUpdate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin)
+    current_user: User = Depends(require_admin),
+    request: Request = None,
 ):
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
@@ -202,12 +209,13 @@ def update_user(
             value = None
         setattr(user, field, value)
 
-    db.add(AuditLog(
+    db.add(create_audit_log(
         user_id=current_user.id,
         user_email=current_user.email,
         action="update_user",
         resource_type="user",
-        resource_id=user_id
+        resource_id=user_id,
+        request=request,
     ))
     db.commit()
     db.refresh(user)
@@ -218,7 +226,8 @@ def update_user(
 def delete_user(
     user_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin)
+    current_user: User = Depends(require_admin),
+    request: Request = None,
 ):
     """Permanently delete a user (hard delete). Only ADMIN and SUPER_ADMIN can delete."""
     user = db.query(User).filter(User.id == user_id).first()
@@ -228,13 +237,14 @@ def delete_user(
         raise HTTPException(status_code=400, detail="Cannot delete yourself")
 
     db.delete(user)
-    db.add(AuditLog(
+    db.add(create_audit_log(
         user_id=current_user.id,
         user_email=current_user.email,
         action="delete_user",
         resource_type="user",
         resource_id=user_id,
-        details={"deleted_email": user.email, "deleted_name": user.full_name}
+        details={"deleted_email": user.email, "deleted_name": user.full_name},
+        request=request,
     ))
     db.commit()
     return {"message": "User permanently deleted"}
@@ -244,25 +254,26 @@ def delete_user(
 def bulk_delete_users(
     user_ids: List[int],
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin)
+    current_user: User = Depends(require_admin),
+    request: Request = None,
 ):
     """
     Permanently delete multiple users at once (hard delete).
     Only ADMIN and SUPER_ADMIN can perform bulk deletion.
-    
+
     - Prevents deleting yourself
     - Returns summary of deleted and failed user IDs
     """
     if not user_ids:
         raise HTTPException(status_code=400, detail="No user IDs provided")
-    
+
     if current_user.id in user_ids:
         raise HTTPException(status_code=400, detail="Cannot delete yourself")
-    
+
     # Fetch all users to delete
     users = db.query(User).filter(User.id.in_(user_ids)).all()
     found_ids = {u.id for u in users}
-    
+
     # Check for non-existent users
     not_found_ids = set(user_ids) - found_ids
 
@@ -270,19 +281,20 @@ def bulk_delete_users(
     deleted_count = 0
     for user in users:
         # Log the deletion action
-        db.add(AuditLog(
+        db.add(create_audit_log(
             user_id=current_user.id,
             user_email=current_user.email,
             action="delete_user",
             resource_type="user",
             resource_id=user.id,
-            details={"deleted_email": user.email, "deleted_name": user.full_name}
+            details={"deleted_email": user.email, "deleted_name": user.full_name},
+            request=request,
         ))
         db.delete(user)
         deleted_count += 1
 
     db.commit()
-    
+
     return UserBulkDeleteResponse(
         deleted=deleted_count,
         failed=len(not_found_ids),
@@ -295,7 +307,8 @@ def bulk_delete_users(
 async def import_users_csv(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin)
+    current_user: User = Depends(require_admin),
+    request: Request = None,
 ):
     """
     Import users from CSV. Expected columns:
@@ -429,7 +442,7 @@ async def import_users_csv(
     # Commit all valid rows in a single transaction
     # Invalid rows are skipped but don't affect valid rows
     if valid_users:
-        db.add(AuditLog(
+        db.add(create_audit_log(
             user_id=current_user.id,
             user_email=current_user.email,
             action="import_users_csv",
@@ -440,13 +453,14 @@ async def import_users_csv(
                 "failed": failed,
                 "valid_rows": len(valid_users),
                 "total_rows": created + updated + failed
-            }
+            },
+            request=request,
         ))
         db.commit()
         logger.info(f"CSV import committed: {created} created, {updated} updated, {failed} failed")
     else:
         # No valid rows to commit - still log the failed import attempt
-        db.add(AuditLog(
+        db.add(create_audit_log(
             user_id=current_user.id,
             user_email=current_user.email,
             action="import_users_csv_failed",
@@ -455,7 +469,8 @@ async def import_users_csv(
                 "failed": failed,
                 "total_rows": failed,
                 "errors": errors[:10]  # Include first 10 errors in audit log
-            }
+            },
+            request=request,
         ))
         db.commit()
         logger.warning(f"CSV import had no valid rows to commit, {failed} rows failed")
@@ -488,7 +503,7 @@ async def import_users_csv(
 
     # Add secondary audit log for email results if there were newly created users
     if created_users and (emails_sent > 0 or emails_failed > 0):
-        db.add(AuditLog(
+        db.add(create_audit_log(
             user_id=current_user.id,
             user_email=current_user.email,
             action="import_users_csv_emails",
@@ -497,7 +512,8 @@ async def import_users_csv(
                 "emails_sent": emails_sent,
                 "emails_failed": emails_failed,
                 "total_created": len(created_users)
-            }
+            },
+            request=request,
         ))
         db.commit()
 
@@ -536,7 +552,8 @@ def get_departments(db: Session = Depends(get_db), current_user: User = Depends(
 def admin_get_user_mfa_status(
     user_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin)
+    current_user: User = Depends(require_admin),
+    request: Request = None,
 ):
     """
     Admin view of user's MFA status.
@@ -565,7 +582,7 @@ def admin_get_user_mfa_status(
     recovery_status = get_recovery_code_status(db, user_id)
 
     # Audit log
-    db.add(AuditLog(
+    db.add(create_audit_log(
         user_id=current_user.id,
         user_email=current_user.email,
         action="admin_view_user_mfa_status",
@@ -574,7 +591,8 @@ def admin_get_user_mfa_status(
         details={
             "target_user_email": target_user.email,
             "admin_email": current_user.email
-        }
+        },
+        request=request,
     ))
     db.commit()
 
@@ -593,9 +611,10 @@ def admin_get_user_mfa_status(
 @router.post("/{user_id}/mfa/reset", response_model=AdminMFAResetResponse)
 def admin_reset_user_mfa(
     user_id: int,
-    request: AdminMFAResetRequest,
+    request_data: AdminMFAResetRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin)
+    current_user: User = Depends(require_admin),
+    request: Request = None,
 ):
     """
     Admin-assisted MFA reset for a user.
@@ -651,13 +670,14 @@ def admin_reset_user_mfa(
     )
 
     # Generate new pending enrollment
-    from app.core.security import generate_mfa_secret
+    from app.core.security import generate_mfa_secret, encrypt_mfa_secret
     new_secret = generate_mfa_secret()
-    target_user.mfa_secret = new_secret
+    encrypted_secret = encrypt_mfa_secret(new_secret)
+    target_user.mfa_secret = encrypted_secret
     # Note: mfa_enabled remains False - user must complete enrollment
 
     # Audit log
-    db.add(AuditLog(
+    db.add(create_audit_log(
         user_id=current_user.id,
         user_email=current_user.email,
         action="admin_reset_user_mfa",
@@ -666,9 +686,10 @@ def admin_reset_user_mfa(
         details={
             "target_user_email": target_user.email,
             "admin_email": current_user.email,
-            "reason": request.reason,
+            "reason": request_data.reason,
             "old_secret_invalidated": bool(old_secret)
-        }
+        },
+        request=request,
     ))
 
     # Notify target user (in production, send email)
@@ -681,5 +702,5 @@ def admin_reset_user_mfa(
         message=f"MFA has been reset for user {target_user.email}. They must re-enroll on next login.",
         mfa_reset=True,
         user_notified=user_notified,
-        reason=request.reason
+        reason=request_data.reason
     )

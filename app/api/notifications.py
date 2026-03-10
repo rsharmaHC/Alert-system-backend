@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, status, Query, Request
 from sqlalchemy.orm import Session
 from sqlalchemy import desc, update
 from typing import Optional, List
@@ -9,6 +9,7 @@ from app.models import (
     User, Group, DeliveryLog, DeliveryStatus, NotificationResponse as NRModel,
     AuditLog, AlertChannel, UserRole
 )
+from app.utils.audit import create_audit_log
 from app.schemas import (
     NotificationCreate, NotificationResponse, NotificationDetailResponse,
     DeliveryLogResponse, NotificationResponseCreate, NotificationResponseOut,
@@ -83,16 +84,18 @@ def list_incidents(
 def create_incident(
     data: IncidentCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_manager)
+    current_user: User = Depends(require_manager),
+    request: Request = None,
 ):
     incident = Incident(**data.model_dump(), created_by_id=current_user.id)
     db.add(incident)
-    db.add(AuditLog(
+    db.add(create_audit_log(
         user_id=current_user.id,
         user_email=current_user.email,
         action="create_incident",
         resource_type="incident",
-        details={"title": data.title, "severity": data.severity}
+        details={"title": data.title, "severity": data.severity},
+        request=request,
     ))
     db.commit()
     db.refresh(incident)
@@ -221,7 +224,8 @@ def list_notifications(
 async def create_notification(
     data: NotificationCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_manager)
+    current_user: User = Depends(require_manager),
+    request: Request = None,
 ):
     # Rate limiting: Check if user has exceeded notification dispatch limit
     is_allowed, retry_after = await check_notification_rate_limit(current_user.id)
@@ -275,12 +279,13 @@ async def create_notification(
         notification.target_users = users
 
     db.add(notification)
-    db.add(AuditLog(
+    db.add(create_audit_log(
         user_id=current_user.id,
         user_email=current_user.email,
         action="create_notification",
         resource_type="notification",
-        details={"title": data.title, "channels": [c.value for c in data.channels]}
+        details={"title": data.title, "channels": [c.value for c in data.channels]},
+        request=request,
     ))
     db.commit()
     db.refresh(notification)
@@ -290,7 +295,11 @@ async def create_notification(
 
     # Send immediately if not scheduled (task will change status to SENT when complete)
     if not data.scheduled_at:
-        send_notification_task.delay(notification.id)
+        send_notification_task.delay(
+            notification.id,
+            triggered_by_user_id=current_user.id,
+            triggered_by_email=current_user.email,
+        )
 
     return notification
 
@@ -299,7 +308,8 @@ async def create_notification(
 async def send_notification(
     notification_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_manager)
+    current_user: User = Depends(require_manager),
+    request: Request = None,
 ):
     """Manually trigger a draft notification.
     
@@ -320,17 +330,23 @@ async def send_notification(
     if notification.status not in [NotificationStatus.DRAFT, NotificationStatus.SCHEDULED]:
         raise HTTPException(status_code=400, detail=f"Cannot send notification in {notification.status} state")
 
-    send_notification_task.delay(notification_id)
-    
+    # Pass auth context to Celery task for audit trail
+    send_notification_task.delay(
+        notification_id,
+        triggered_by_user_id=current_user.id,
+        triggered_by_email=current_user.email,
+    )
+
     # Record this dispatch for rate limiting
     await record_notification_dispatch(current_user.id)
-    
-    db.add(AuditLog(
+
+    db.add(create_audit_log(
         user_id=current_user.id,
         user_email=current_user.email,
         action="send_notification",
         resource_type="notification",
-        resource_id=notification_id
+        resource_id=notification_id,
+        request=request,
     ))
     db.commit()
     db.refresh(notification)

@@ -13,6 +13,7 @@ MAX_JSON_SIZE = 1 * 1024 * 1024  # 1 MB max JSON payload
 from sqlalchemy import text
 from app.config import settings
 from app.middleware.security_headers import SecurityHeadersMiddleware
+from app.middleware.request_id import RequestIDMiddleware
 from sqlalchemy import text
 from app.database import engine, Base, SessionLocal, ensure_column_exists
 from app.models import (
@@ -23,6 +24,7 @@ from app.models import (
 from app.core.security import hash_password
 from app.core.location_cache import init_location_cache, close_location_cache
 from app.core.deps import require_admin
+from app.logging_config import setup_logging
 from app.api.auth import router as auth_router
 from app.api.users import router as users_router
 from app.api.groups_locations_templates import (
@@ -37,10 +39,8 @@ from app.api.location_v2 import router as location_router
 from app.api.location_audience import router as location_audience_router
 from app.api.docs import router as docs_router
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
+# Apply initial logging config (will be re-applied in lifespan after uvicorn's override)
+setup_logging()
 logger = logging.getLogger(__name__)
 
 
@@ -197,6 +197,10 @@ def _ensure_delivery_log_user_email():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Re-apply logging config AFTER uvicorn's dictConfig has run.
+    # Without this, uvicorn overwrites our formatters/handlers on startup.
+    setup_logging()
+    
     # Initialize Redis cache for location autocomplete
     logger.info("Initializing location cache...")
     try:
@@ -225,6 +229,12 @@ async def lifespan(app: FastAPI):
         _ensure_user_location_columns()
     except Exception as e:
         logger.error(f"Failed to ensure user location columns: {e}")
+
+    # Ensure User table has token_valid_after column (session invalidation on password change)
+    try:
+        ensure_column_exists('users', 'token_valid_after', 'TIMESTAMP WITH TIME ZONE', nullable=True)
+    except Exception as e:
+        logger.error(f"Failed to ensure token_valid_after column: {e}")
 
     # Ensure audit_logs table has user_email column
     logger.info("Ensuring audit_logs table has user_email column...")
@@ -342,6 +352,10 @@ logger.info(f"CORS origin regex: Railway subdomains allowed")
 # Wraps all other middleware to ensure headers on every response
 app.add_middleware(SecurityHeadersMiddleware)
 
+# Request ID — generates UUID per request for log correlation
+# Registered second-outermost so the ID is available to all inner middleware
+app.add_middleware(RequestIDMiddleware)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
@@ -352,7 +366,7 @@ app.add_middleware(
     # Only allow necessary headers
     allow_headers=["Authorization", "Content-Type", "Accept"],
     # Expose Retry-After header for rate limiting countdown timer
-    expose_headers=["Retry-After"],
+    expose_headers=["Retry-After", "X-Request-ID"],
 )
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
@@ -410,6 +424,72 @@ async def limit_request_size(request: Request, call_next):
     request._receive = counting_receive
 
     return await call_next(request)
+
+
+# Response size limit middleware
+@app.middleware("http")
+async def limit_response_size(request: Request, call_next):
+    """
+    Middleware to limit response body size.
+
+    Prevents DoS attacks via oversized responses and protects against
+    malicious admins creating scenarios that return very large responses
+    (e.g., requesting all delivery logs for a mass notification).
+
+    Returns 500 Internal Server Error if response exceeds limits.
+
+    Handles:
+    - Regular responses (checked after generation)
+    - Streaming responses (checked during streaming)
+    """
+    from fastapi.responses import JSONResponse, StreamingResponse
+
+    MAX_RESPONSE_SIZE = 5 * 1024 * 1024  # 5MB max response body size
+
+    response = await call_next(request)
+
+    # For regular responses, check Content-Length if available
+    content_length = response.headers.get("content-length")
+    if content_length:
+        try:
+            size = int(content_length)
+            if size > MAX_RESPONSE_SIZE:
+                logger.warning(
+                    f"Response size {size} bytes exceeds limit {MAX_RESPONSE_SIZE} bytes "
+                    f"for {request.method} {request.url.path}"
+                )
+                return JSONResponse(
+                    status_code=500,
+                    content={
+                        "detail": "Response too large. Please use pagination or filters to reduce the response size."
+                    }
+                )
+        except (ValueError, TypeError):
+            pass
+
+    # For streaming responses, wrap the body iterator to count bytes
+    if isinstance(response, StreamingResponse):
+        original_body = response.body_iterator
+        sent_bytes = 0
+
+        async def counting_iterator():
+            nonlocal sent_bytes
+            async for chunk in original_body:
+                sent_bytes += len(chunk)
+                if sent_bytes > MAX_RESPONSE_SIZE:
+                    logger.warning(
+                        f"Streaming response size {sent_bytes} bytes exceeds limit "
+                        f"{MAX_RESPONSE_SIZE} bytes for {request.method} {request.url.path}"
+                    )
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Response too large. Please use pagination or filters to reduce the response size."
+                    )
+                yield chunk
+
+        response.body_iterator = counting_iterator()
+
+    return response
 
 # ─── ROUTES ───────────────────────────────────────────────────────────────────
 
