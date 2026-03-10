@@ -47,6 +47,7 @@ from app.services.rate_limiter import (
 )
 from app.services.security_notifications import notify_suspicious_login, notify_recovery_codes_regenerated
 from app.config import settings
+from app.utils.audit import create_audit_log
 
 logger = logging.getLogger(__name__)
 
@@ -553,13 +554,13 @@ async def login(request: LoginRequest, req: Request, db: Session = Depends(get_d
     user.last_login = datetime.now(timezone.utc)
 
     # Audit log
-    db.add(AuditLog(
+    db.add(create_audit_log(
         user_id=user.id,
         user_email=user.email,
         action="login",
         resource_type="user",
         resource_id=user.id,
-        ip_address=req.client.host if req.client else None
+        request=req,
     ))
     db.commit()
 
@@ -732,10 +733,11 @@ def get_me(current_user: User = Depends(get_current_user)):
 def update_my_profile(
     data: UserProfileUpdate,
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    req: Request = None,
 ):
     """Update your own profile.
-    
+
     Users can update their personal information but cannot modify:
     - role (cannot escalate privileges)
     - is_active (cannot reactivate deactivated accounts)
@@ -745,12 +747,13 @@ def update_my_profile(
     for field, value in data.model_dump(exclude_unset=True).items():
         setattr(current_user, field, value)
 
-    db.add(AuditLog(
+    db.add(create_audit_log(
         user_id=current_user.id,
         action="update_own_profile",
         resource_type="user",
         resource_id=current_user.id,
-        details={"updated_fields": list(data.model_dump(exclude_unset=True).keys())}
+        details={"updated_fields": list(data.model_dump(exclude_unset=True).keys())},
+        request=req,
     ))
     db.commit()
     db.refresh(current_user)
@@ -1331,13 +1334,13 @@ async def verify_mfa_and_complete_login(
     user.last_login = datetime.now(timezone.utc)
 
     # Audit log
-    db.add(AuditLog(
+    db.add(create_audit_log(
         user_id=user.id,
         user_email=user.email,
         action="mfa_verified_login",
         resource_type="user",
         resource_id=user.id,
-        ip_address=req.client.host if req.client else None
+        request=req,
     ))
     db.commit()
 
@@ -1481,17 +1484,17 @@ async def verify_recovery_code_and_login(
     db.add(rt)
     
     user.last_login = datetime.now(timezone.utc)
-    
-    db.add(AuditLog(
+
+    db.add(create_audit_log(
         user_id=user.id,
         user_email=user.email,
         action="recovery_code_login_success",
         resource_type="user",
         resource_id=user.id,
-        ip_address=req.client.host if req.client else None
+        request=req,
     ))
     db.commit()
-    
+
     logger.info(f"Recovery code login successful for user {user_id}")
     
     return LoginSuccessResponse(

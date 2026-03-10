@@ -16,18 +16,26 @@ logger = logging.getLogger(__name__)
 
 
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=30)
-def send_notification_task(self, notification_id: int):
+def send_notification_task(self, notification_id: int, triggered_by_user_id: int = None, triggered_by_email: str = None):
     """Main task to dispatch a notification to all recipients across all channels.
 
     Sets notification status to:
     - SENT: All deliveries successful
     - PARTIALLY_SENT: Some deliveries failed
     - FAILED: All deliveries failed or zero recipients
-    
+
     Idempotency: Uses atomic status claim to prevent double-dispatch on celery beat overlap.
     """
     db = SessionLocal()
     notification = None
+    
+    # Log who triggered this task for forensic traceability
+    if triggered_by_user_id:
+        logger.info(
+            f"Notification {notification_id} task started — "
+            f"triggered by user {triggered_by_user_id} ({triggered_by_email})"
+        )
+    
     try:
         notification = db.query(Notification).filter(Notification.id == notification_id).first()
         if not notification:
@@ -101,7 +109,10 @@ def send_notification_task(self, notification_id: int):
                     )
                     db.add(log)
                     # Dispatch task for this recipient/channel
-                    _send_to_channel.delay(notification_id, user.id, channel)
+                    _send_to_channel.delay(
+                        notification_id, user.id, channel,
+                        triggered_by_user_id=triggered_by_user_id,
+                    )
                     dispatched_count += 1
 
         # Commit all delivery logs at once
@@ -154,18 +165,18 @@ def send_notification_task(self, notification_id: int):
 
 
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
-def _send_to_channel(self, notification_id: int, user_id: int, channel: str):
+def _send_to_channel(self, notification_id: int, user_id: int, channel: str, triggered_by_user_id: int = None):
     """Send notification to a single user via a single channel.
-    
+
     Creates a DeliveryLog entry for every attempt to track delivery status.
     Exceptions are logged and the delivery is marked as FAILED.
-    
+
     Idempotency: Checks for existing delivery log (including PENDING) to prevent
     duplicate sends when task_acks_late=True causes task re-queue on worker crash.
     """
     db = SessionLocal()
     log = None  # Initialize early to avoid UnboundLocalError in exception handler
-    
+
     try:
         notification = db.query(Notification).filter(Notification.id == notification_id).first()
         user = db.query(User).filter(User.id == user_id).first()

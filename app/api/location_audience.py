@@ -24,6 +24,7 @@ from time import time as current_time
 
 from app.database import get_db
 from app.models import User, Location, UserLocation, UserLocationHistory, AuditLog, UserLocationStatus, UserLocationAssignmentType
+from app.utils.audit import create_audit_log
 from app.schemas import (
     UserLocationAssign, UserLocationRemove, UserLocationGeofenceUpdate,
     UserLocationResponse, UserLocationHistoryResponse,
@@ -179,7 +180,7 @@ def assign_user_to_location(
     db.add(history)
 
     # Audit log
-    db.add(AuditLog(
+    db.add(create_audit_log(
         user_id=current_user.id,
         user_email=current_user.email,
         action="assign_user_to_location",
@@ -190,8 +191,7 @@ def assign_user_to_location(
             "location_id": data.location_id,
             "notes": data.notes
         },
-        ip_address=request.client.host,
-        user_agent=request.headers.get("user-agent")
+        request=request,
     ))
     
     db.commit()
@@ -278,7 +278,7 @@ def remove_user_from_location(
     db.add(history)
 
     # Audit log
-    db.add(AuditLog(
+    db.add(create_audit_log(
         user_id=current_user.id,
         user_email=current_user.email,
         action="remove_user_from_location",
@@ -289,8 +289,7 @@ def remove_user_from_location(
             "location_id": location_id,
             "reason": data.reason
         },
-        ip_address=request.client.host,
-        user_agent=request.headers.get("user-agent")
+        request=request,
     ))
     
     db.commit()

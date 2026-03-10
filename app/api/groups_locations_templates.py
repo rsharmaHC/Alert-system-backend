@@ -5,6 +5,7 @@ from sqlalchemy import or_
 from typing import Optional, List
 from app.database import get_db
 from app.models import Group, GroupType, Location, NotificationTemplate, User, AuditLog, UserLocation, UserLocationStatus, UserRole
+from app.utils.audit import create_audit_log
 from app.schemas import (
     GroupCreate, GroupUpdate, GroupResponse, GroupDetailResponse, GroupMemberAdd,
     LocationCreate, LocationUpdate, LocationResponse,
@@ -56,7 +57,8 @@ def list_groups(
 def create_group(
     data: GroupCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin)
+    current_user: User = Depends(require_admin),
+    request: Request = None,
 ):
     group = Group(
         name=data.name,
@@ -66,7 +68,7 @@ def create_group(
         dynamic_filter=data.dynamic_filter,
         created_by_id=current_user.id
     )
-    
+
     # For dynamic groups, auto-populate members based on dynamic_filter
     if data.type == GroupType.DYNAMIC and data.dynamic_filter:
         query = db.query(User).filter(User.is_active == True)
@@ -85,9 +87,9 @@ def create_group(
         # For static groups, use provided member_ids
         members = db.query(User).filter(User.id.in_(data.member_ids)).all()
         group.members = members
-    
+
     db.add(group)
-    db.add(AuditLog(
+    db.add(create_audit_log(
         user_id=current_user.id,
         user_email=current_user.email,
         action="create_group",
@@ -96,7 +98,8 @@ def create_group(
             "group_name": group.name,
             "group_type": data.type.value,
             "member_count": len(group.members)
-        }
+        },
+        request=request,
     ))
     db.commit()
     db.refresh(group)
@@ -449,7 +452,7 @@ def create_location(
     db.add(location)
 
     # Audit log
-    db.add(AuditLog(
+    db.add(create_audit_log(
         user_id=current_user.id,
         user_email=current_user.email,
         action="create_location",
@@ -461,8 +464,7 @@ def create_location(
             "geofence_radius_miles": location.geofence_radius_miles,
             "overlaps": len(overlaps)
         },
-        ip_address=request.client.host if request.client else None,
-        user_agent=request.headers.get("user-agent") if request else None
+        request=request,
     ))
     
     db.commit()
@@ -554,9 +556,9 @@ def update_location(
     update_data = data.model_dump(exclude_unset=True)
     for field, value in update_data.items():
         setattr(location, field, value)
-    
+
     # Audit log
-    db.add(AuditLog(
+    db.add(create_audit_log(
         user_id=current_user.id,
         user_email=current_user.email,
         action="update_location",
@@ -568,8 +570,7 @@ def update_location(
             "longitude": location.longitude,
             "geofence_radius_miles": location.geofence_radius_miles
         },
-        ip_address=request.client.host if request.client else None,
-        user_agent=request.headers.get("user-agent") if request else None
+        request=request,
     ))
     
     db.commit()
