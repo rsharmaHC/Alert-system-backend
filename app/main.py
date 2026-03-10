@@ -15,7 +15,7 @@ from app.config import settings
 from app.middleware.security_headers import SecurityHeadersMiddleware
 from app.middleware.request_id import RequestIDMiddleware
 from sqlalchemy import text
-from app.database import engine, Base, SessionLocal, ensure_column_exists
+from app.database import engine, Base, SessionLocal, ensure_column_exists, ensure_mfa_secret_column_expanded
 from app.models import (
     User, UserRole, AlertChannel, Location, Group, NotificationTemplate,
     Incident, Notification, DeliveryLog, NotificationResponse, IncomingMessage,
@@ -229,6 +229,18 @@ async def lifespan(app: FastAPI):
         _ensure_user_location_columns()
     except Exception as e:
         logger.error(f"Failed to ensure user location columns: {e}")
+
+    # Ensure User table has token_valid_after column (session invalidation on password change)
+    try:
+        ensure_column_exists('users', 'token_valid_after', 'TIMESTAMP WITH TIME ZONE', nullable=True)
+    except Exception as e:
+        logger.error(f"Failed to ensure token_valid_after column: {e}")
+
+    # Ensure mfa_secret column is expanded for Fernet encryption (VARCHAR(32) -> VARCHAR(255))
+    try:
+        ensure_mfa_secret_column_expanded()
+    except Exception as e:
+        logger.error(f"Failed to expand mfa_secret column: {e}")
 
     # Ensure audit_logs table has user_email column
     logger.info("Ensuring audit_logs table has user_email column...")
@@ -507,31 +519,7 @@ app.include_router(docs_router, prefix=API_PREFIX)
 
 @app.get("/health", tags=["Health"])
 def health_check():
-    """Public health check — used by Railway healthcheck probe.
-    
-    Returns minimal response with no environment details.
-    For detailed diagnostics, use GET /health/detail (requires admin auth).
-    """
-    return {"status": "ok"}
-
-
-@app.get("/health/detail", tags=["Health"])
-def health_check_detail(current_user=Depends(require_admin)):
-    """Detailed health check — requires ADMIN or SUPER_ADMIN role.
-    
-    Returns application metadata useful for ops dashboards and debugging.
-    Protected because it reveals environment, version, and infrastructure info
-    that attackers could use for fingerprinting.
-    """
-    import sys
-
-    return {
-        "status": "ok",
-        "app": settings.APP_NAME,
-        "env": settings.APP_ENV,
-        "version": app.version,
-        "python_version": sys.version.split()[0],
-    }
+    return {"status": "healthy"}
 
 
 @app.get("/", tags=["Root"])
