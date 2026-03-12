@@ -66,6 +66,7 @@ class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     user: "UserResponse"
+    refresh_token: Optional[str] = None  # For cross-origin deployments (Vercel + Railway)
 
 
 class RefreshRequest(BaseModel):
@@ -160,6 +161,7 @@ class LoginSuccessResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     user: "UserResponse"
+    refresh_token: Optional[str] = None  # For cross-origin deployments (Vercel + Railway)
     recovery_codes: Optional[List[str]] = None  # Only present on first MFA setup
     recovery_codes_warning: Optional[str] = None  # Security warning
 

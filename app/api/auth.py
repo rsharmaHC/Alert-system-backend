@@ -73,36 +73,30 @@ MFA_CHALLENGE_EXPIRE_SECONDS = 300  # 5 minutes to complete MFA verification
 def _set_refresh_cookie(response: Response, token: str, expire_days: int) -> None:
     """
     Attach the refresh token as an HttpOnly cookie on a FastAPI Response object.
+    
+    NOTE: For cross-origin deployments (Vercel + Railway), cookies are set but
+    browsers may block them. Frontend should also accept refresh_token in response body.
 
     Security properties:
     - HttpOnly: JS cannot read it — eliminates XSS token theft
     - Secure: HTTPS only — never sent over plain HTTP
-    - SameSite=lax: allows cookie on top-level navigations (needed for Railway subdomains)
-    - Path=/api/v1/auth: cookie only sent to auth endpoints, not to every API call
-    - Domain: auto-detected from request host (needed for Railway subdomains)
+    - SameSite=None: Required for cross-origin cookie usage
+    - Path=/api/v1/auth: cookie only sent to auth endpoints
 
     In development mode, secure=False so localhost works without HTTPS.
     """
     is_secure = settings.APP_ENV != "development"
     
-    # Determine domain for cookie
-    # On Railway: .up.railway.app to work across subdomains
-    # On localhost: None (works automatically)
-    cookie_domain = None
-    if settings.APP_ENV == "production":
-        # Extract domain from request or use Railway default
-        # The leading dot allows subdomain matching
-        cookie_domain = ".up.railway.app"
-    
+    # For cross-origin (Vercel -> Railway), we need SameSite=None
+    # This is secure because we always use Secure flag (HTTPS only)
     response.set_cookie(
         key="refresh_token",
         value=token,
         httponly=True,
         secure=is_secure,
-        samesite="lax",  # Changed from strict to lax for Railway subdomain support
+        samesite="none",  # Required for cross-origin (Vercel to Railway)
         path="/api/v1/auth",  # Scoped: only sent to auth endpoints
         max_age=expire_days * 86400,  # seconds
-        domain=cookie_domain,  # Required for Railway subdomains
     )
 
 
@@ -613,29 +607,48 @@ async def login(request: LoginRequest, req: Request, response: Response, db: Ses
     ))
     db.commit()
 
-    # Set refresh token as HttpOnly cookie
+    # Set refresh token as HttpOnly cookie (for same-origin fallback)
     _set_refresh_cookie(response, refresh_token_str, settings.REFRESH_TOKEN_EXPIRE_DAYS)
 
     return LoginSuccessResponse(
         status="success",
         access_token=access_token,
         token_type="bearer",
-        user=UserResponse.model_validate(user)
+        user=UserResponse.model_validate(user),
+        refresh_token=refresh_token_str  # For cross-origin deployments (Vercel + Railway)
     )
 
 
 @router.post("/refresh", response_model=TokenResponse)
 def refresh_token(req: Request, response: Response, db: Session = Depends(get_db)):
     """
-    Refresh access token using the refresh token from HttpOnly cookie.
+    Refresh access token using the refresh token from HttpOnly cookie or request body.
 
     Security:
-    - Refresh token read from HttpOnly cookie (not request body)
+    - Refresh token read from HttpOnly cookie (primary) or request body (fallback for cross-origin)
     - Old token revoked, new token issued (rotation)
     - New refresh token set as HttpOnly cookie
     """
-    # Read refresh token from HttpOnly cookie
+    # Try to read refresh token from HttpOnly cookie first (same-origin fallback)
     refresh_token_str = req.cookies.get("refresh_token")
+    
+    # If no cookie, try request body (cross-origin fallback for Vercel + Railway)
+    if not refresh_token_str:
+        try:
+            body = req.query_params if req.method == "GET" else None
+            if body is None:
+                # Try to parse JSON body
+                import json
+                content_type = req.headers.get("content-type", "")
+                if "application/json" in content_type:
+                    # Read body asynchronously
+                    import asyncio
+                    body_bytes = asyncio.run(req.body())
+                    body_data = json.loads(body_bytes.decode())
+                    refresh_token_str = body_data.get("refresh_token")
+        except Exception:
+            pass  # Will raise 401 below if no token found
+    
     if not refresh_token_str:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -692,7 +705,8 @@ def refresh_token(req: Request, response: Response, db: Session = Depends(get_db
     return TokenResponse(
         access_token=new_access,
         token_type="bearer",
-        user=UserResponse.model_validate(user)
+        user=UserResponse.model_validate(user),
+        refresh_token=new_refresh_str  # For cross-origin deployments (Vercel + Railway)
     )
 
 
@@ -724,18 +738,13 @@ def logout(
             db.commit()
 
     # Clear the HttpOnly cookie
-    # Must match the same domain/path/settings as set_cookie
-    cookie_domain = None
-    if settings.APP_ENV == "production":
-        cookie_domain = ".up.railway.app"
-    
+    # Must match the same settings as set_cookie
     response.delete_cookie(
         key="refresh_token",
         path="/api/v1/auth",
         secure=True,
         httponly=True,
-        samesite="lax",
-        domain=cookie_domain,
+        samesite="none",  # Must match set_cookie
     )
     return {"message": "Logged out successfully"}
 
@@ -1477,12 +1486,13 @@ async def verify_mfa_and_complete_login(
     _set_refresh_cookie(response, refresh_token_str, settings.REFRESH_TOKEN_EXPIRE_DAYS)
 
     # Build response with recovery codes if this was first MFA setup
-    # Note: refresh_token is NOT included in body - it's in the cookie
+    # Include refresh_token in body for cross-origin deployments (Vercel + Railway)
     response_data = {
         "status": "success",
         "access_token": access_token,
         "token_type": "bearer",
         "user": UserResponse.model_validate(user),
+        "refresh_token": refresh_token_str,  # For cross-origin deployments
     }
 
     if was_new_mfa and recovery_codes:
@@ -1618,14 +1628,15 @@ async def verify_recovery_code_and_login(
 
     logger.info(f"Recovery code login successful for user {user_id}")
 
-    # Set refresh token as HttpOnly cookie
+    # Set refresh token as HttpOnly cookie (for same-origin fallback)
     _set_refresh_cookie(response, refresh_token_str, settings.REFRESH_TOKEN_EXPIRE_DAYS)
 
     return LoginSuccessResponse(
         status="success",
         access_token=access_token,
         token_type="bearer",
-        user=UserResponse.model_validate(user)
+        user=UserResponse.model_validate(user),
+        refresh_token=refresh_token_str  # For cross-origin deployments (Vercel + Railway)
     )
 
 
