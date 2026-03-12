@@ -613,29 +613,45 @@ async def login(request: LoginRequest, req: Request, response: Response, db: Ses
     ))
     db.commit()
 
-    # Set refresh token as HttpOnly cookie
+    # Set refresh token as HttpOnly cookie (works for same-origin)
     _set_refresh_cookie(response, refresh_token_str, settings.REFRESH_TOKEN_EXPIRE_DAYS)
 
+    # Also return refresh token in response body for cross-origin support
+    # (e.g., Vercel frontend accessing Railway backend)
+    # Frontend should store this in memory and send it back on refresh
     return LoginSuccessResponse(
         status="success",
         access_token=access_token,
+        refresh_token=refresh_token_str,  # For cross-origin
         token_type="bearer",
         user=UserResponse.model_validate(user)
     )
 
 
 @router.post("/refresh", response_model=TokenResponse)
-def refresh_token(req: Request, response: Response, db: Session = Depends(get_db)):
+async def refresh_token(req: Request, response: Response, db: Session = Depends(get_db)):
     """
-    Refresh access token using the refresh token from HttpOnly cookie.
+    Refresh access token using the refresh token.
+    
+    Supports both:
+    - HttpOnly cookie (same-origin deployments)
+    - Request body (cross-origin deployments like Vercel + Railway)
 
     Security:
-    - Refresh token read from HttpOnly cookie (not request body)
     - Old token revoked, new token issued (rotation)
-    - New refresh token set as HttpOnly cookie
+    - New refresh token set as HttpOnly cookie AND returned in body
     """
-    # Read refresh token from HttpOnly cookie
+    # Try to read refresh token from HttpOnly cookie first
     refresh_token_str = req.cookies.get("refresh_token")
+    
+    # If not in cookie, try request body (for cross-origin)
+    if not refresh_token_str:
+        try:
+            body = await req.json()
+            refresh_token_str = body.get("refresh_token")
+        except:
+            pass
+    
     if not refresh_token_str:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -686,11 +702,13 @@ def refresh_token(req: Request, response: Response, db: Session = Depends(get_db
     db.add(new_rt)
     db.commit()
 
-    # Set new refresh token as HttpOnly cookie
+    # Set new refresh token as HttpOnly cookie (same-origin)
     _set_refresh_cookie(response, new_refresh_str, settings.REFRESH_TOKEN_EXPIRE_DAYS)
 
+    # Also return in body for cross-origin support
     return TokenResponse(
         access_token=new_access,
+        refresh_token=new_refresh_str,  # For cross-origin
         token_type="bearer",
         user=UserResponse.model_validate(user)
     )

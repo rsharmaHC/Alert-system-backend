@@ -64,6 +64,7 @@ class LoginRequest(BaseModel):
 
 class TokenResponse(BaseModel):
     access_token: str
+    refresh_token: Optional[str] = None  # For cross-origin support (Vercel frontend)
     token_type: str = "bearer"
     user: "UserResponse"
 
@@ -158,6 +159,7 @@ class LoginSuccessResponse(BaseModel):
     """Standard login success response with tokens."""
     status: str = "success"
     access_token: str
+    refresh_token: Optional[str] = None  # For cross-origin support (Vercel frontend)
     token_type: str = "bearer"
     user: "UserResponse"
     recovery_codes: Optional[List[str]] = None  # Only present on first MFA setup
