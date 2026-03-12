@@ -3,7 +3,8 @@ import time
 import logging
 import json
 from datetime import datetime, timedelta, timezone
-from fastapi import APIRouter, Depends, HTTPException, status, Request, Query
+from fastapi import APIRouter, Depends, HTTPException, status, Request, Query, Response
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import desc, func
 import redis
@@ -27,7 +28,8 @@ from app.core.security import (
     verify_password, hash_password, create_access_token,
     create_refresh_token, decode_token, user_requires_mfa,
     verify_totp_code, generate_mfa_secret, generate_mfa_qr_code_uri,
-    hash_password_reset_token, verify_password_reset_token
+    hash_password_reset_token, verify_password_reset_token,
+    decrypt_mfa_secret, is_totp_replay,
 )
 from app.services.mfa_recovery import (
     generate_recovery_codes, verify_recovery_code,
@@ -68,6 +70,36 @@ IP_RATE_LIMIT_WINDOW_SECONDS = 600  # 10 minutes
 MFA_CHALLENGE_EXPIRE_SECONDS = 300  # 5 minutes to complete MFA verification
 
 
+def _set_refresh_cookie(response: Response, token: str, expire_days: int) -> None:
+    """
+    Attach the refresh token as an HttpOnly cookie on a FastAPI Response object.
+    
+    NOTE: For cross-origin deployments (Vercel + Railway), cookies are set but
+    browsers may block them. Frontend should also accept refresh_token in response body.
+
+    Security properties:
+    - HttpOnly: JS cannot read it — eliminates XSS token theft
+    - Secure: HTTPS only — never sent over plain HTTP
+    - SameSite=None: Required for cross-origin cookie usage
+    - Path=/api/v1/auth: cookie only sent to auth endpoints
+
+    In development mode, secure=False so localhost works without HTTPS.
+    """
+    is_secure = settings.APP_ENV != "development"
+    
+    # For cross-origin (Vercel -> Railway), we need SameSite=None
+    # This is secure because we always use Secure flag (HTTPS only)
+    response.set_cookie(
+        key="refresh_token",
+        value=token,
+        httponly=True,
+        secure=is_secure,
+        samesite="none",  # Required for cross-origin (Vercel to Railway)
+        path="/api/v1/auth",  # Scoped: only sent to auth endpoints
+        max_age=expire_days * 86400,  # seconds
+    )
+
+
 def format_lockout_time(seconds: int) -> str:
     """Format lockout duration in human-readable format."""
     if seconds < 60:
@@ -85,82 +117,62 @@ def format_lockout_time(seconds: int) -> str:
     return f"{days} day{'s' if days > 1 else ''}"
 
 
-def _generate_challenge_token(user_id: int, mfa_secret: str) -> str:
+def _generate_challenge_token(user_id: int) -> str:
     """
-    Generate a signed challenge token for MFA verification.
-    
-    The token encodes user_id and expiry, signed with the user's mfa_secret
-    to prevent tampering. This allows stateless verification later.
-    
+    Generate a signed JWT challenge token for MFA verification.
+
+    Encodes user_id with a 5-minute expiry, signed with the dedicated
+    MFA_CHALLENGE_SECRET_KEY. The 'type' claim is set to 'mfa_challenge'
+    to prevent this token being accepted anywhere else in the system.
+
     Args:
         user_id: User's database ID
-        mfa_secret: User's MFA secret (used for signing)
-    
+
     Returns:
-        Base64-encoded challenge token
+        Signed HS256 JWT string
     """
-    import base64
-    import hashlib
-    
-    expiry = int(time.time()) + MFA_CHALLENGE_EXPIRE_SECONDS
-    # Create payload: user_id:expiry
-    payload = f"{user_id}:{expiry}"
-    # Sign with HMAC-SHA256 using mfa_secret
-    signature = hashlib.sha256(
-        payload.encode() + mfa_secret.encode()
-    ).hexdigest()[:16]
-    # Encode: payload.signature
-    token = base64.urlsafe_b64encode(
-        f"{payload}.{signature}".encode()
-    ).decode().rstrip('=')
-    
-    return token
+    import jwt as pyjwt
+
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": str(user_id),
+        "type": "mfa_challenge",
+        "iat": now,
+        "exp": now + timedelta(seconds=MFA_CHALLENGE_EXPIRE_SECONDS),
+    }
+    return pyjwt.encode(payload, settings.MFA_CHALLENGE_SECRET_KEY, algorithm="HS256")
 
 
-def _verify_challenge_token(token: str, mfa_secret: str) -> tuple[bool, int]:
+def _verify_challenge_token(token: str) -> tuple[bool, int]:
     """
-    Verify and decode a challenge token.
-    
+    Verify and decode a JWT challenge token.
+
+    PyJWT automatically validates the 'exp' claim — expired tokens raise
+    ExpiredSignatureError (subclass of PyJWTError) and are caught below.
+    The 'type' claim is checked explicitly to prevent access/refresh tokens
+    being accepted here.
+
     Args:
-        token: Challenge token from client
-        mfa_secret: User's MFA secret for verification
-    
+        token: JWT challenge token string from the client
+
     Returns:
         tuple: (is_valid, user_id)
-        Returns (False, 0) if invalid or expired
+        Returns (False, 0) on any failure: invalid signature, expired, wrong type
     """
-    import base64
-    import hashlib
-    
+    import jwt as pyjwt
+    from jwt.exceptions import PyJWTError
+
     try:
-        # Decode token
-        padded = token + '=' * (4 - len(token) % 4)
-        decoded = base64.urlsafe_b64decode(padded).decode()
-        # Split payload.signature
-        parts = decoded.split('.')
-        if len(parts) != 2:
+        payload = pyjwt.decode(
+            token,
+            settings.MFA_CHALLENGE_SECRET_KEY,
+            algorithms=["HS256"]
+        )
+        if payload.get("type") != "mfa_challenge":
             return False, 0
-        
-        payload, provided_sig = parts
-        user_id_str, expiry_str = payload.split(':')
-        user_id = int(user_id_str)
-        expiry = int(expiry_str)
-        
-        # Verify signature
-        expected_sig = hashlib.sha256(
-            payload.encode() + mfa_secret.encode()
-        ).hexdigest()[:16]
-        
-        if not secrets.compare_digest(expected_sig, provided_sig):
-            return False, 0
-        
-        # Check expiry
-        if time.time() > expiry:
-            return False, 0
-        
+        user_id = int(payload["sub"])
         return True, user_id
-        
-    except (ValueError, IndexError, Exception):
+    except (PyJWTError, ValueError, KeyError):
         return False, 0
 
 
@@ -379,7 +391,7 @@ def reset_account_lockout(user_id: int) -> None:
 
 
 @router.post("/login")
-async def login(request: LoginRequest, req: Request, db: Session = Depends(get_db)):
+async def login(request: LoginRequest, req: Request, response: Response, db: Session = Depends(get_db)):
     """
     Authenticate user with email and password.
     
@@ -500,8 +512,7 @@ async def login(request: LoginRequest, req: Request, db: Session = Depends(get_d
             db.commit()
 
             # Generate challenge token for verification
-            # Use plaintext secret for signing (will be decrypted internally)
-            challenge_token = _generate_challenge_token(user.id, temp_secret)
+            challenge_token = _generate_challenge_token(user.id)
 
             logger.info(f"MFA setup initiated for privileged user {user.id} ({user.email})")
 
@@ -519,9 +530,9 @@ async def login(request: LoginRequest, req: Request, db: Session = Depends(get_d
         # MFA is configured and enabled - validate code
         if not request.mfa_code:
             # User has MFA configured but didn't provide code - return challenge response
-            challenge_token = _generate_challenge_token(user.id, user.mfa_secret)
+            challenge_token = _generate_challenge_token(user.id)
             logger.info(f"MFA challenge issued for user {user.id} ({user.email})")
-            
+
             return LoginMFAChallengeResponse(
                 status="mfa_required",
                 mfa_required=True,
@@ -531,7 +542,8 @@ async def login(request: LoginRequest, req: Request, db: Session = Depends(get_d
             )
 
         # Verify the TOTP code
-        if not verify_totp_code(user.mfa_secret, request.mfa_code):
+        _plain_secret_for_totp = decrypt_mfa_secret(user.mfa_secret) or user.mfa_secret
+        if not verify_totp_code(_plain_secret_for_totp, request.mfa_code):
             # Invalid MFA code - record as failed attempt
             count = await redis_record_failed_login(user.id)
             await record_ip_failure(client_ip)
@@ -545,6 +557,19 @@ async def login(request: LoginRequest, req: Request, db: Session = Depends(get_d
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid credentials or MFA code"
             )
+
+        # Replay protection — reject reuse within the same 30-second window
+        if is_totp_replay(user, request.mfa_code):
+            logger.warning(f"TOTP replay attempt detected for user {user.id} ({user.email})")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="TOTP code already used. Please wait for the next code."
+            )
+
+        # Record this code as used — will be committed with the final db.commit()
+        user.last_used_totp_code = request.mfa_code
+        user.last_used_totp_at = datetime.now(timezone.utc)
+        db.add(user)
 
     # STEP 8: Successful authentication - issue tokens
     await clear_account_failures(user.id)
@@ -582,30 +607,73 @@ async def login(request: LoginRequest, req: Request, db: Session = Depends(get_d
     ))
     db.commit()
 
+    # Set refresh token as HttpOnly cookie (for same-origin fallback)
+    _set_refresh_cookie(response, refresh_token_str, settings.REFRESH_TOKEN_EXPIRE_DAYS)
+
     return LoginSuccessResponse(
         status="success",
         access_token=access_token,
-        refresh_token=refresh_token_str,
         token_type="bearer",
-        user=UserResponse.model_validate(user)
+        user=UserResponse.model_validate(user),
+        refresh_token=refresh_token_str  # For cross-origin deployments (Vercel + Railway)
     )
 
 
 @router.post("/refresh", response_model=TokenResponse)
-def refresh_token(request: RefreshRequest, db: Session = Depends(get_db)):
-    payload = decode_token(request.refresh_token, token_type="refresh")
+def refresh_token(req: Request, response: Response, db: Session = Depends(get_db)):
+    """
+    Refresh access token using the refresh token from HttpOnly cookie or request body.
+
+    Security:
+    - Refresh token read from HttpOnly cookie (primary) or request body (fallback for cross-origin)
+    - Old token revoked, new token issued (rotation)
+    - New refresh token set as HttpOnly cookie
+    """
+    # Try to read refresh token from HttpOnly cookie first (same-origin fallback)
+    refresh_token_str = req.cookies.get("refresh_token")
+    
+    # If no cookie, try request body (cross-origin fallback for Vercel + Railway)
+    if not refresh_token_str:
+        try:
+            body = req.query_params if req.method == "GET" else None
+            if body is None:
+                # Try to parse JSON body
+                import json
+                content_type = req.headers.get("content-type", "")
+                if "application/json" in content_type:
+                    # Read body asynchronously
+                    import asyncio
+                    body_bytes = asyncio.run(req.body())
+                    body_data = json.loads(body_bytes.decode())
+                    refresh_token_str = body_data.get("refresh_token")
+        except Exception:
+            pass  # Will raise 401 below if no token found
+    
+    if not refresh_token_str:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="No refresh token"
+        )
+
+    payload = decode_token(refresh_token_str, token_type="refresh")
 
     if not payload or payload.get("type") != "refresh":
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid refresh token"
+        )
 
     # Check token in DB
     rt = db.query(RefreshToken).filter(
-        RefreshToken.token == request.refresh_token,
+        RefreshToken.token == refresh_token_str,
         RefreshToken.revoked == False
     ).first()
 
     if not rt or rt.expires_at < datetime.now(timezone.utc):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token expired")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Refresh token expired"
+        )
 
     # Check if user exists and is active
     user = db.query(User).filter(
@@ -613,7 +681,10 @@ def refresh_token(request: RefreshRequest, db: Session = Depends(get_db)):
         User.is_active == True
     ).first()
     if not user:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User not found"
+        )
 
     # Revoke old token, issue new ones
     rt.revoked = True
@@ -628,26 +699,53 @@ def refresh_token(request: RefreshRequest, db: Session = Depends(get_db)):
     db.add(new_rt)
     db.commit()
 
+    # Set new refresh token as HttpOnly cookie
+    _set_refresh_cookie(response, new_refresh_str, settings.REFRESH_TOKEN_EXPIRE_DAYS)
+
     return TokenResponse(
         access_token=new_access,
-        refresh_token=new_refresh_str,
-        user=UserResponse.model_validate(user)
+        token_type="bearer",
+        user=UserResponse.model_validate(user),
+        refresh_token=new_refresh_str  # For cross-origin deployments (Vercel + Railway)
     )
 
 
 @router.post("/logout")
 def logout(
-    request: RefreshRequest,
+    req: Request,
+    response: Response,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    rt = db.query(RefreshToken).filter(
-        RefreshToken.token == request.refresh_token,
-        RefreshToken.user_id == current_user.id
-    ).first()
-    if rt:
-        rt.revoked = True
-        db.commit()
+    """
+    Logout user by revoking refresh token and clearing cookie.
+
+    Security:
+    - Refresh token read from HttpOnly cookie
+    - Token revoked in database
+    - Cookie cleared from browser
+    """
+    # Read refresh token from HttpOnly cookie
+    refresh_token_str = req.cookies.get("refresh_token")
+
+    if refresh_token_str:
+        rt = db.query(RefreshToken).filter(
+            RefreshToken.token == refresh_token_str,
+            RefreshToken.user_id == current_user.id
+        ).first()
+        if rt:
+            rt.revoked = True
+            db.commit()
+
+    # Clear the HttpOnly cookie
+    # Must match the same settings as set_cookie
+    response.delete_cookie(
+        key="refresh_token",
+        path="/api/v1/auth",
+        secure=True,
+        httponly=True,
+        samesite="none",  # Must match set_cookie
+    )
     return {"message": "Logged out successfully"}
 
 
@@ -1229,6 +1327,7 @@ def get_mfa_status(
 async def verify_mfa_and_complete_login(
     request: MFAVerifyLoginRequest,
     req: Request,
+    response: Response,
     db: Session = Depends(get_db)
 ):
     """
@@ -1247,36 +1346,26 @@ async def verify_mfa_and_complete_login(
     - No tokens issued until both verifications pass
     - Failed attempts counted toward rate limiting
     """
-    import base64
-    
     client_ip = _get_client_ip(req)
-    
-    # Decode challenge token to get user info
-    try:
-        padded = request.challenge_token + '=' * (4 - len(request.challenge_token) % 4)
-        decoded = base64.urlsafe_b64decode(padded).decode()
-        parts = decoded.split('.')
-        if len(parts) != 2:
-            raise ValueError("Invalid token format")
-        payload, _ = parts
-        user_id_str, expiry_str = payload.split(':')
-        user_id = int(user_id_str)
-        expiry = int(expiry_str)
-    except (ValueError, IndexError, Exception) as e:
-        logger.warning(f"Invalid challenge token format: {e}")
+
+    # Check IP-based rate limit FIRST (before processing challenge token)
+    # This prevents brute-force attacks on the TOTP code (6 digits = 1M combinations)
+    if await is_ip_locked(client_ip):
+        logger.warning(f"IP lockout for {client_ip} at MFA verify")
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many failed attempts. Please try again later.",
+        )
+
+    # Verify JWT challenge token — signature, expiry, and type all checked in one call
+    is_valid, user_id = _verify_challenge_token(request.challenge_token)
+    if not is_valid:
+        logger.warning(f"Invalid or expired MFA challenge token from IP {client_ip}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid credentials or MFA code"
         )
-    
-    # Check expiry
-    if time.time() > expiry:
-        logger.warning(f"Expired challenge token for user {user_id}")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials or MFA code"
-        )
-    
+
     # Fetch user from database
     user = db.query(User).filter(User.id == user_id).first()
     if not user or not user.is_active:
@@ -1285,16 +1374,7 @@ async def verify_mfa_and_complete_login(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid credentials or MFA code"
         )
-    
-    # Verify challenge token signature using user's mfa_secret
-    is_valid, _ = _verify_challenge_token(request.challenge_token, user.mfa_secret or "")
-    if not is_valid:
-        logger.warning(f"Invalid challenge token signature for user {user_id}")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials or MFA code"
-        )
-    
+
     # Verify MFA is still required (user might have completed setup in another session)
     if not user_requires_mfa(user):
         logger.warning(f"MFA no longer required for user {user_id}")
@@ -1310,20 +1390,34 @@ async def verify_mfa_and_complete_login(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid credentials or MFA code"
         )
-    
-    if not verify_totp_code(user.mfa_secret, request.code):
+
+    _plain_secret_for_totp_verify = decrypt_mfa_secret(user.mfa_secret) or user.mfa_secret
+    if not verify_totp_code(_plain_secret_for_totp_verify, request.code):
         # Invalid MFA code - record as failed attempt
         try:
             count = await redis_record_failed_login(user.id)
             await record_ip_failure(client_ip)
         except Exception as e:
             logger.error(f"Error recording failed login: {e}")
-        
+
         logger.warning(f"Invalid MFA code for user {user_id}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid credentials or MFA code"
         )
+
+    # Replay protection — reject reuse within the same 30-second window
+    if is_totp_replay(user, request.code):
+        logger.warning(f"TOTP replay attempt detected for user {user_id}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="TOTP code already used. Please wait for the next code."
+        )
+
+    # Record this code as used — will be committed with the final db.commit()
+    user.last_used_totp_code = request.code
+    user.last_used_totp_at = datetime.now(timezone.utc)
+    db.add(user)
     
     # MFA verified successfully - enable MFA if not already enabled
     was_new_mfa = False
@@ -1331,7 +1425,7 @@ async def verify_mfa_and_complete_login(
     if not user.mfa_enabled:
         user.mfa_enabled = True
         was_new_mfa = True
-        
+
         # Generate initial recovery codes for new MFA users
         try:
             plaintext_codes, batch_id = generate_recovery_codes(
@@ -1345,7 +1439,7 @@ async def verify_mfa_and_complete_login(
         except Exception as e:
             logger.error(f"Failed to generate recovery codes: {e}")
             # Don't fail the login, but log the issue
-        
+
         logger.info(f"MFA enabled for user {user_id} during login")
     
     # Issue tokens (same as successful login)
@@ -1388,19 +1482,23 @@ async def verify_mfa_and_complete_login(
 
     logger.info(f"MFA verification complete, login successful for user {user_id}")
 
+    # Set refresh token as HttpOnly cookie
+    _set_refresh_cookie(response, refresh_token_str, settings.REFRESH_TOKEN_EXPIRE_DAYS)
+
     # Build response with recovery codes if this was first MFA setup
+    # Include refresh_token in body for cross-origin deployments (Vercel + Railway)
     response_data = {
         "status": "success",
         "access_token": access_token,
-        "refresh_token": refresh_token_str,
         "token_type": "bearer",
         "user": UserResponse.model_validate(user),
+        "refresh_token": refresh_token_str,  # For cross-origin deployments
     }
-    
+
     if was_new_mfa and recovery_codes:
         response_data["recovery_codes"] = recovery_codes
         response_data["recovery_codes_warning"] = "Store these codes securely. They will not be shown again."
-    
+
     return LoginSuccessResponse(**response_data)
 
 
@@ -1410,6 +1508,7 @@ async def verify_mfa_and_complete_login(
 async def verify_recovery_code_and_login(
     request: MFARecoveryCodeVerifyRequest,
     req: Request,
+    response: Response,
     db: Session = Depends(get_db)
 ):
     """
@@ -1430,36 +1529,26 @@ async def verify_recovery_code_and_login(
     - Audit logged
     - User notified of use
     """
-    import base64
-    
     client_ip = _get_client_ip(req)
-    
-    # Decode challenge token to get user info (same as MFA verify)
-    try:
-        padded = request.challenge_token + '=' * (4 - len(request.challenge_token) % 4)
-        decoded = base64.urlsafe_b64decode(padded).decode()
-        parts = decoded.split('.')
-        if len(parts) != 2:
-            raise ValueError("Invalid token format")
-        payload, _ = parts
-        user_id_str, expiry_str = payload.split(':')
-        user_id = int(user_id_str)
-        expiry = int(expiry_str)
-    except (ValueError, IndexError, Exception) as e:
-        logger.warning(f"Invalid challenge token format: {e}")
+
+    # Check IP-based rate limit FIRST (before processing challenge token)
+    # This prevents brute-force attacks on recovery codes
+    if await is_ip_locked(client_ip):
+        logger.warning(f"IP lockout for {client_ip} at recovery code verify")
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many failed attempts. Please try again later.",
+        )
+
+    # Verify JWT challenge token — signature, expiry, and type all checked in one call
+    is_valid, user_id = _verify_challenge_token(request.challenge_token)
+    if not is_valid:
+        logger.warning(f"Invalid or expired MFA challenge token from IP {client_ip}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid credentials or recovery code"
         )
-    
-    # Check expiry
-    if time.time() > expiry:
-        logger.warning(f"Expired challenge token for user {user_id}")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials or recovery code"
-        )
-    
+
     # Fetch user from database
     user = db.query(User).filter(User.id == user_id).first()
     if not user or not user.is_active:
@@ -1538,13 +1627,16 @@ async def verify_recovery_code_and_login(
     db.commit()
 
     logger.info(f"Recovery code login successful for user {user_id}")
-    
+
+    # Set refresh token as HttpOnly cookie (for same-origin fallback)
+    _set_refresh_cookie(response, refresh_token_str, settings.REFRESH_TOKEN_EXPIRE_DAYS)
+
     return LoginSuccessResponse(
         status="success",
         access_token=access_token,
-        refresh_token=refresh_token_str,
         token_type="bearer",
-        user=UserResponse.model_validate(user)
+        user=UserResponse.model_validate(user),
+        refresh_token=refresh_token_str  # For cross-origin deployments (Vercel + Railway)
     )
 
 
