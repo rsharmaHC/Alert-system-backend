@@ -551,45 +551,6 @@ def mock_all_external_services(
 
 
 # =============================================================================
-# LOCATIONIQ FIXTURES
-# =============================================================================
-
-@pytest.fixture
-def mock_locationiq_response() -> list:
-    """Sample LocationIQ API response."""
-    return [
-        {
-            "place_id": "123456",
-            "display_name": "New York, NY, USA",
-            "lat": "40.7128",
-            "lon": "-74.0060",
-            "type": "city",
-            "importance": 0.9,
-            "address": {
-                "city": "New York",
-                "state": "New York",
-                "country": "United States",
-                "country_code": "us",
-            }
-        },
-        {
-            "place_id": "789012",
-            "display_name": "Newark, NJ, USA",
-            "lat": "40.7357",
-            "lon": "-74.1724",
-            "type": "city",
-            "importance": 0.7,
-            "address": {
-                "city": "Newark",
-                "state": "New Jersey",
-                "country": "United States",
-                "country_code": "us",
-            }
-        }
-    ]
-
-
-# =============================================================================
 # UTILITY FIXTURES
 # =============================================================================
 
