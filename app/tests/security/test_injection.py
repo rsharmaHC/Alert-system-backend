@@ -303,12 +303,6 @@ class TestSSRFPrevention:
                 # If accepted, the webhook service should validate
                 pass
 
-    def test_locationiq_ssrf_prevention(self, client, super_admin_auth_tokens):
-        """LocationIQ integration should not be vulnerable to SSRF."""
-        # The LocationIQ API is hardcoded, not user-controllable
-        # This test documents that SSRF is prevented by design
-        pass
-
 
 # =============================================================================
 # COMMAND INJECTION TESTS
