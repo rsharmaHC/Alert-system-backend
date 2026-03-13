@@ -20,12 +20,18 @@ def upgrade() -> None:
     conn = op.get_bind()
     inspector = sa.inspect(conn)
 
-    # Create enum types if they don't exist (use checkfirst=True)
-    assignment_type = sa.dialects.postgresql.ENUM('MANUAL', 'GEOFENCE', name='userlocationassignmenttype')
-    assignment_type.create(conn, checkfirst=True)
+    # Create enum types if they don't exist
+    # Check if enum types already exist in database
+    enum_types = inspector.get_enums()
+    enum_names = [e['name'] for e in enum_types]
     
-    status_type = sa.dialects.postgresql.ENUM('ACTIVE', 'INACTIVE', name='userlocationstatus')
-    status_type.create(conn, checkfirst=True)
+    if 'userlocationassignmenttype' not in enum_names:
+        assignment_type = sa.dialects.postgresql.ENUM('MANUAL', 'GEOFENCE', name='userlocationassignmenttype')
+        assignment_type.create(conn)
+    
+    if 'userlocationstatus' not in enum_names:
+        status_type = sa.dialects.postgresql.ENUM('ACTIVE', 'INACTIVE', name='userlocationstatus')
+        status_type.create(conn)
 
     # Check if tables already exist
     existing_tables = inspector.get_table_names()
