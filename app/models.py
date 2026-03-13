@@ -124,6 +124,7 @@ class User(Base):
     password_reset_token = Column(String(100))
     password_reset_expires = Column(DateTime(timezone=True))
     token_valid_after = Column(DateTime(timezone=True), nullable=True)
+    force_password_change = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
