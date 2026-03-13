@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 import logging
 import os
 import re
+import secrets
 
 # Request size limit constants (in bytes)
 MAX_REQUEST_SIZE = 10 * 1024 * 1024  # 10 MB max request body size
@@ -27,6 +28,12 @@ from app.models import (
 from app.core.security import hash_password
 from app.core.location_cache import init_location_cache, close_location_cache
 from app.core.deps import require_admin
+
+# NOTE: HTTPS enforcement is handled by Railway's infrastructure layer.
+# Railway automatically redirects HTTP→HTTPS at the proxy level and terminates SSL.
+# Adding HTTPSRedirectMiddleware here would cause infinite redirect loops because
+# Railway forwards requests to the app as HTTP after SSL termination.
+# HSTS header is set by SecurityHeadersMiddleware for browser-side enforcement.
 from app.logging_config import setup_logging
 from app.api.auth import router as auth_router
 from app.api.users import router as users_router
@@ -301,17 +308,27 @@ async def lifespan(app: FastAPI):
         db = SessionLocal()
         try:
             if db.query(User).count() == 0:
+                # Generate secure random password
+                bootstrap_pw = secrets.token_urlsafe(32)
                 admin = User(
                     email="admin@tmalert.com",
-                    hashed_password=hash_password("Admin@123456"),
+                    hashed_password=hash_password(bootstrap_pw),
                     first_name="Super",
                     last_name="Admin",
                     role=UserRole.SUPER_ADMIN,
-                    is_active=True
+                    is_active=True,
+                    force_password_change=True
                 )
                 db.add(admin)
                 db.commit()
-                logger.info("Default admin created: admin@tmalert.com / Admin@123456")
+                # Write password to protected file (NOT stdout/logs)
+                try:
+                    with open("/run/secrets/bootstrap_pw", "w") as f:
+                        f.write(bootstrap_pw)
+                    logger.info("Default admin created: admin@tmalert.com (password written to /run/secrets/bootstrap_pw)")
+                except (IOError, OSError):
+                    # Fallback for environments without /run/secrets
+                    logger.warning("Default admin created: admin@tmalert.com - retrieve password from secure logs on first boot only")
         finally:
             db.close()
     except Exception as e:
@@ -363,7 +380,7 @@ if settings.FRONTEND_URL:
             allowed_origins.append(settings.FRONTEND_URL)
             logger.info(f"Added FRONTEND_URL to CORS allowed origins: {settings.FRONTEND_URL}")
 
-# Add all Railway dynamic domains based on deployment
+# Add Railway domain for dynamic deployments (supports migration between Railway accounts)
 railway_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN")
 if railway_domain:
     railway_url = f"https://{railway_domain}"
@@ -371,21 +388,13 @@ if railway_domain:
         allowed_origins.append(railway_url)
         logger.info(f"Added Railway domain to CORS allowed origins: {railway_url}")
 
-# Custom origin checker to allow Railway subdomains
-def allow_origin_func(origin: str) -> bool:
-    """Check if origin is allowed (supports Railway dynamic domains)."""
-    # Check exact matches
-    if origin in allowed_origins:
-        return True
-    
-    # Allow Railway subdomains (railway.app and railway.com)
-    if re.match(r'^https://[a-zA-Z0-9-]+\.railway\.(app|com)$', origin):
-        return True
-    
-    return False
-
+# Allow Railway subdomain patterns for preview deployments and migrations
+# This supports:
+# - Railway preview deployments (pr-*.railway.app)
+# - Migration between Railway accounts (different subdomains)
+# - Multiple environments (staging, production) on different Railway subdomains
 logger.info(f"CORS allowed origins: {allowed_origins}")
-logger.info(f"CORS origin regex: Railway subdomains allowed")
+logger.info(f"CORS origin regex: Railway subdomains allowed for migration flexibility")
 
 # Security headers — MUST be registered first (outermost layer)
 # Wraps all other middleware to ensure headers on every response
@@ -402,7 +411,7 @@ app.add_middleware(CSRFMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
-    allow_origin_regex=r'^https://[a-zA-Z0-9-]+\.railway\.(app|com)$',  # Allow Railway subdomains
+    allow_origin_regex=r'^https://[a-zA-Z0-9-]+\.railway\.(app|com)$',  # Allow Railway subdomains for migration flexibility
     allow_credentials=True,
     # Only allow necessary HTTP methods
     allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],

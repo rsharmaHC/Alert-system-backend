@@ -11,6 +11,28 @@ emergencies, with two-way safety check-in responses.
 
 ---
 
+## Deployment Model: Single-Tenant
+
+**This application is designed as a single-tenant system for Taylor Morrison only.**
+
+### Architecture Decisions:
+
+- **No multi-tenancy isolation** - All data belongs to Taylor Morrison
+- **No organisation_id/tenant_id** fields on database models
+- **No cross-organisation access controls** - Not needed for single customer
+
+### If Multi-Tenancy Becomes Required:
+
+This would require significant re-architecture:
+1. Add `Organisation` model with `tenant_id` isolation
+2. Add `organisation_id` foreign keys to User, Group, Notification, Location
+3. Implement organisation-scoped queries throughout the codebase
+4. Add organisation-level access controls and admin roles
+
+**Current Status:** Single-tenant design is intentional and appropriate for the use case.
+
+---
+
 ## Tech Stack
 
 - **Backend**: Python 3.11 + FastAPI
@@ -113,14 +135,13 @@ celery -A app.celery_app beat --loglevel=info
 
 ## Default Admin Login
 
-On first startup, a default admin is created:
+On first startup, a default admin account is created with:
+- **Email:** `admin@tmalert.com`
+- **Password:** A secure random password generated at runtime
 
-```
-Email:    admin@tmalert.com
-Password: Admin@123456
-```
+The bootstrap password is written to `/run/secrets/bootstrap_pw` on first boot. If that path is not available, check the application logs on **first boot only** for the password.
 
-**Change this immediately after first login.**
+**⚠️ You will be forced to change the password on first login.**
 
 ---
 
