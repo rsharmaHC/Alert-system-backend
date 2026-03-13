@@ -73,7 +73,7 @@ MFA_CHALLENGE_EXPIRE_SECONDS = 300  # 5 minutes to complete MFA verification
 def _set_refresh_cookie(response: Response, token: str, expire_days: int) -> None:
     """
     Attach the refresh token as an HttpOnly cookie on a FastAPI Response object.
-    
+
     NOTE: For cross-origin deployments (Vercel + Railway), cookies are set but
     browsers may block them. Frontend should also accept refresh_token in response body.
 
@@ -88,10 +88,12 @@ def _set_refresh_cookie(response: Response, token: str, expire_days: int) -> Non
     - Production (HTTPS): secure=True, samesite="none"
     """
     is_secure = settings.APP_ENV != "development"
+
     # SameSite=Lax for local (same-origin via proxy)
     # SameSite=None for production (cross-origin Vercel -> Railway)
+    # Note: SameSite=None REQUIRES Secure flag, so we use "lax" for dev
     samesite_mode = "none" if is_secure else "lax"
-    
+
     response.set_cookie(
         key="refresh_token",
         value=token,
@@ -635,6 +637,10 @@ def refresh_token(req: Request, response: Response, db: Session = Depends(get_db
     # Try to read refresh token from HttpOnly cookie first (same-origin fallback)
     refresh_token_str = req.cookies.get("refresh_token")
 
+    # Debug logging for production troubleshooting
+    # SECURITY: Only log boolean presence, never log actual token values
+    logger.info(f"Refresh endpoint hit - cookie present: {bool(refresh_token_str)}, APP_ENV: {settings.APP_ENV}")
+
     # If no cookie, try request body (cross-origin fallback for Vercel + Railway)
     if not refresh_token_str:
         try:
@@ -649,10 +655,14 @@ def refresh_token(req: Request, response: Response, db: Session = Depends(get_db
                     body_bytes = asyncio.run(req.body())
                     body_data = json.loads(body_bytes.decode())
                     refresh_token_str = body_data.get("refresh_token")
+                    logger.info(f"Refresh token extracted from body: {bool(refresh_token_str)}")
         except Exception:
+            # SECURITY: Don't log exception details - could leak sensitive info
+            logger.warning("Failed to parse refresh token from request body")
             pass  # Will raise 401 below if no token found
 
     if not refresh_token_str:
+        logger.warning("No refresh token found in cookie or body")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="No refresh token"
@@ -661,6 +671,7 @@ def refresh_token(req: Request, response: Response, db: Session = Depends(get_db
     payload = decode_token(refresh_token_str, token_type="refresh")
 
     if not payload or payload.get("type") != "refresh":
+        logger.warning("Invalid or expired refresh token")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid refresh token"
@@ -671,8 +682,10 @@ def refresh_token(req: Request, response: Response, db: Session = Depends(get_db
         RefreshToken.token == refresh_token_str,
         RefreshToken.revoked == False
     ).first()
+    logger.info(f"Refresh token DB lookup: found={bool(rt)}, expired={rt.expires_at < datetime.now(timezone.utc) if rt else 'N/A'}")
 
     if not rt or rt.expires_at < datetime.now(timezone.utc):
+        logger.warning("Refresh token not found or expired")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Refresh token expired"
@@ -684,15 +697,25 @@ def refresh_token(req: Request, response: Response, db: Session = Depends(get_db
         User.is_active == True
     ).first()
     if not user:
+        # SECURITY: Log user_id (internal reference) but not the token value
+        logger.warning(f"User not found for refresh token (user_id={rt.user_id})")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="User not found"
         )
 
     # Revoke old token, issue new ones
-    rt.revoked = True
-    new_access = create_access_token({"sub": str(user.id), "role": user.role})
-    new_refresh_str = create_refresh_token({"sub": str(user.id)})
+    logger.info(f"Refreshing token for user {user.id} ({user.email})")
+    try:
+        rt.revoked = True
+        new_access = create_access_token({"sub": str(user.id), "role": user.role})
+        new_refresh_str = create_refresh_token({"sub": str(user.id)})
+        logger.info(f"Tokens created successfully for user {user.id}")
+    except Exception as e:
+        # SECURITY: Log error type, not full exception (prevents info leakage)
+        logger.error(f"Failed to create tokens: {type(e).__name__}")
+        db.rollback()
+        raise
 
     new_rt = RefreshToken(
         user_id=user.id,
@@ -701,6 +724,7 @@ def refresh_token(req: Request, response: Response, db: Session = Depends(get_db
     )
     db.add(new_rt)
     db.commit()
+    logger.info(f"Token refresh successful for user {user.id}")
 
     # Set new refresh token as HttpOnly cookie
     _set_refresh_cookie(response, new_refresh_str, settings.REFRESH_TOKEN_EXPIRE_DAYS)
