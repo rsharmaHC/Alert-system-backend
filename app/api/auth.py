@@ -73,7 +73,7 @@ MFA_CHALLENGE_EXPIRE_SECONDS = 300  # 5 minutes to complete MFA verification
 def _set_refresh_cookie(response: Response, token: str, expire_days: int) -> None:
     """
     Attach the refresh token as an HttpOnly cookie on a FastAPI Response object.
-    
+
     NOTE: For cross-origin deployments (Vercel + Railway), cookies are set but
     browsers may block them. Frontend should also accept refresh_token in response body.
 
@@ -86,7 +86,7 @@ def _set_refresh_cookie(response: Response, token: str, expire_days: int) -> Non
     In development mode, secure=False so localhost works without HTTPS.
     """
     is_secure = settings.APP_ENV != "development"
-    
+
     # For cross-origin (Vercel -> Railway), we need SameSite=None
     # This is secure because we always use Secure flag (HTTPS only)
     response.set_cookie(
@@ -620,7 +620,7 @@ async def login(request: LoginRequest, req: Request, response: Response, db: Ses
 
 
 @router.post("/refresh", response_model=TokenResponse)
-def refresh_token(req: Request, response: Response, db: Session = Depends(get_db)):
+async def refresh_token(req: Request, response: Response, db: Session = Depends(get_db)):
     """
     Refresh access token using the refresh token from HttpOnly cookie or request body.
 
@@ -631,24 +631,20 @@ def refresh_token(req: Request, response: Response, db: Session = Depends(get_db
     """
     # Try to read refresh token from HttpOnly cookie first (same-origin fallback)
     refresh_token_str = req.cookies.get("refresh_token")
-    
+
     # If no cookie, try request body (cross-origin fallback for Vercel + Railway)
     if not refresh_token_str:
         try:
-            body = req.query_params if req.method == "GET" else None
-            if body is None:
-                # Try to parse JSON body
+            content_type = req.headers.get("content-type", "")
+            if "application/json" in content_type:
+                # Read body asynchronously
                 import json
-                content_type = req.headers.get("content-type", "")
-                if "application/json" in content_type:
-                    # Read body asynchronously
-                    import asyncio
-                    body_bytes = asyncio.run(req.body())
-                    body_data = json.loads(body_bytes.decode())
-                    refresh_token_str = body_data.get("refresh_token")
+                body_bytes = await req.body()
+                body_data = json.loads(body_bytes.decode())
+                refresh_token_str = body_data.get("refresh_token")
         except Exception:
             pass  # Will raise 401 below if no token found
-    
+
     if not refresh_token_str:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -804,33 +800,50 @@ def forgot_password(request: PasswordResetRequest, req: Request, db: Session = D
 def reset_password(request: PasswordResetConfirm, db: Session = Depends(get_db)):
     """
     Reset password using a valid reset token.
-    
+
     Security:
     - Token is hashed before comparison with stored hash
-    - Prevents timing attacks via constant-time comparison
+    - Uses constant-time comparison (hmac.compare_digest) to prevent timing attacks
     - Token must not be expired
+    - Fetches all users with valid reset tokens, then compares in application code
+    - No email enumeration (same error for invalid token vs non-existent user)
     """
-    # Hash the incoming token and compare with stored hash
+    import hmac
+    
+    # Hash the incoming token
     incoming_hash = hash_password_reset_token(request.token)
     
-    user = db.query(User).filter(
-        User.password_reset_token == incoming_hash,
-        User.password_reset_expires > datetime.now(timezone.utc)
-    ).first()
-
-    if not user:
+    # Fetch all users with non-expired reset tokens
+    # This prevents timing attacks that could enumerate emails
+    now = datetime.now(timezone.utc)
+    users_with_tokens = db.query(User).filter(
+        User.password_reset_token.isnot(None),
+        User.password_reset_expires > now
+    ).all()
+    
+    # Find matching user using constant-time comparison
+    matched_user = None
+    for user in users_with_tokens:
+        stored_token = user.password_reset_token or ""
+        # Use constant-time comparison to prevent timing attacks
+        if hmac.compare_digest(stored_token, incoming_hash):
+            matched_user = user
+            break
+    
+    if not matched_user:
+        # Generic error to prevent enumeration of whether token exists
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired reset token")
 
-    user.hashed_password = hash_password(request.new_password)
-    user.password_reset_token = None
-    user.password_reset_expires = None
+    matched_user.hashed_password = hash_password(request.new_password)
+    matched_user.password_reset_token = None
+    matched_user.password_reset_expires = None
 
     # Invalidate all existing access tokens
-    user.token_valid_after = datetime.now(timezone.utc)
+    matched_user.token_valid_after = datetime.now(timezone.utc)
 
     # Revoke all refresh tokens to force re-authentication with new password
     db.query(RefreshToken).filter(
-        RefreshToken.user_id == user.id,
+        RefreshToken.user_id == matched_user.id,
         RefreshToken.revoked == False
     ).update({"revoked": True})
 
