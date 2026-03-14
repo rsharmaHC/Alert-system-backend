@@ -20,18 +20,16 @@ def upgrade() -> None:
     conn = op.get_bind()
     inspector = sa.inspect(conn)
 
-    # Create enum types if they don't exist
     # Check if enum types already exist in database
     enum_types = inspector.get_enums()
     enum_names = [e['name'] for e in enum_types]
 
+    # Create enum types using Alembic's native operations (if they don't exist)
     if 'userlocationassignmenttype' not in enum_names:
-        assignment_type = sa.dialects.postgresql.ENUM('MANUAL', 'GEOFENCE', name='userlocationassignmenttype')
-        assignment_type.create(conn)
+        op.create_type('userlocationassignmenttype', ['MANUAL', 'GEOFENCE'])
 
     if 'userlocationstatus' not in enum_names:
-        status_type = sa.dialects.postgresql.ENUM('ACTIVE', 'INACTIVE', name='userlocationstatus')
-        status_type.create(conn)
+        op.create_type('userlocationstatus', ['ACTIVE', 'INACTIVE'])
 
     # Check if tables already exist
     existing_tables = inspector.get_table_names()
@@ -42,7 +40,7 @@ def upgrade() -> None:
             sa.Column('id', sa.Integer(), nullable=False),
             sa.Column('user_id', sa.Integer(), nullable=False),
             sa.Column('location_id', sa.Integer(), nullable=False),
-            # Use create_type=False since we already created the enum above
+            # Enums already created above, use create_type=False
             sa.Column('assignment_type', sa.Enum('MANUAL', 'GEOFENCE', name='userlocationassignmenttype', create_type=False), nullable=False),
             sa.Column('status', sa.Enum('ACTIVE', 'INACTIVE', name='userlocationstatus', create_type=False), nullable=False),
             sa.Column('detected_latitude', sa.Float(), nullable=True),
@@ -70,7 +68,7 @@ def upgrade() -> None:
             sa.Column('location_id', sa.Integer(), nullable=False),
             sa.Column('user_location_id', sa.Integer(), nullable=True),
             sa.Column('action', sa.String(length=50), nullable=False),
-            # Use create_type=False since we already created the enum above
+            # Enums already created above, use create_type=False
             sa.Column('assignment_type', sa.Enum('MANUAL', 'GEOFENCE', name='userlocationassignmenttype', create_type=False), nullable=True),
             sa.Column('previous_status', sa.Enum('ACTIVE', 'INACTIVE', name='userlocationstatus', create_type=False), nullable=True),
             sa.Column('new_status', sa.Enum('ACTIVE', 'INACTIVE', name='userlocationstatus', create_type=False), nullable=True),
@@ -109,19 +107,19 @@ def downgrade() -> None:
     op.drop_index(op.f('ix_user_location_history_location_id'), table_name='user_location_history')
     op.drop_index(op.f('ix_user_location_history_user_id'), table_name='user_location_history')
     op.drop_index(op.f('ix_user_location_history_id'), table_name='user_location_history')
-    
+
     op.drop_index(op.f('ix_user_locations_location_id'), table_name='user_locations')
     op.drop_index(op.f('ix_user_locations_user_id'), table_name='user_locations')
     op.drop_index(op.f('ix_user_locations_id'), table_name='user_locations')
-    
+
     # Drop tables
     op.drop_table('user_location_history')
     op.drop_table('user_locations')
-    
-    # Drop enum types
-    sa.Enum(name='userlocationassignmenttype').drop(op.get_bind())
-    sa.Enum(name='userlocationstatus').drop(op.get_bind())
-    
+
+    # Drop enum types using Alembic's native operation
+    op.drop_type('userlocationassignmenttype')
+    op.drop_type('userlocationstatus')
+
     # Remove latitude/longitude from users table
     op.drop_column('users', 'longitude')
     op.drop_column('users', 'latitude')
