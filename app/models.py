@@ -1,6 +1,6 @@
 from sqlalchemy import (
     Column, Integer, String, Boolean, DateTime, Text,
-    ForeignKey, Enum, Float, JSON, Table
+    ForeignKey, Enum, Float, JSON, Table, UniqueConstraint
 )
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -263,6 +263,9 @@ class Notification(Base):
 
 class DeliveryLog(Base):
     __tablename__ = "delivery_logs"
+    __table_args__ = (
+        UniqueConstraint('notification_id', 'user_id', 'channel', name='uq_delivery_log_notification_user_channel'),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     notification_id = Column(Integer, ForeignKey("notifications.id", ondelete="CASCADE"), nullable=False)

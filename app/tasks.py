@@ -124,8 +124,9 @@ def send_notification_task(self, notification_id: int, triggered_by_user_id: int
             logger.warning(f"Notification {notification_id} config: target_all={notification.target_all}, target_group_ids={[g.id for g in notification.target_groups]}, target_user_ids={[u.id for u in notification.target_users]}")
             return
 
-        # Dispatch per recipient per channel - create delivery log and dispatch task
+        # Dispatch per recipient per channel - create delivery logs first, then dispatch tasks
         dispatched_count = 0
+        dispatch_list = []
         for user in recipients:
             for channel in notification.channels:
                 # Check if already dispatched to avoid duplicates on retry
@@ -136,26 +137,27 @@ def send_notification_task(self, notification_id: int, triggered_by_user_id: int
                 ).first()
 
                 if not existing_log:
-                    # Create delivery log immediately to track this attempt
-                    # This ensures logs exist even if celery task fails to start
                     log = DeliveryLog(
                         notification_id=notification_id,
                         user_id=user.id,
                         user_email=user.email,
                         channel=channel,
                         status=DeliveryStatus.PENDING,
-                        sent_at=datetime.now(timezone.utc)
                     )
                     db.add(log)
-                    # Dispatch task for this recipient/channel
-                    _send_to_channel.delay(
-                        notification_id, user.id, channel,
-                        triggered_by_user_id=triggered_by_user_id,
-                    )
+                    dispatch_list.append((notification_id, user.id, channel))
                     dispatched_count += 1
 
-        # Commit all delivery logs at once
+        # Commit all delivery logs BEFORE dispatching channel tasks
+        # This prevents _send_to_channel from creating duplicate logs
         db.commit()
+
+        # Now dispatch tasks — logs are guaranteed to exist
+        for n_id, u_id, ch in dispatch_list:
+            _send_to_channel.delay(
+                n_id, u_id, ch,
+                triggered_by_user_id=triggered_by_user_id,
+            )
         logger.info(f"Notification {notification_id}: created {dispatched_count} delivery logs and dispatched tasks")
 
         # Status will be updated by _send_to_channel tasks based on delivery results
