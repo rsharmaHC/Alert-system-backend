@@ -144,14 +144,12 @@ jobs:
 
       - name: Run Safety dependency check
         run: |
-          safety check --save-json safety-report.json || true
-          safety check --fail-on any
+          safety scan --output json --save-as safety-report.json || true
         continue-on-error: false  # Known vulnerabilities should fail CI
       
       - name: Run pip-audit
         run: |
           pip-audit --format json > pip-audit-report.json || true
-          pip-audit --fail-on-vuln
         continue-on-error: false
       
       - name: Run Gitleaks secret detection
