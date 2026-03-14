@@ -351,14 +351,16 @@ jobs:
           pytest app/tests/property \
             -v \
             --tb=short \
-            --hypothesis-seed=0
-      
+            --hypothesis-seed=0 \
+            --no-cov
+
       - name: Run fuzz tests
         run: |
           pytest app/tests/fuzz \
             -v \
             --tb=short \
-            --hypothesis-seed=0
+            --hypothesis-seed=0 \
+            --no-cov
 
   # ===========================================================================
   # DOCKER BUILD
