@@ -24,12 +24,14 @@ def upgrade() -> None:
     enum_types = inspector.get_enums()
     enum_names = [e['name'] for e in enum_types]
 
-    # Create enum types using Alembic's native operations (if they don't exist)
+    # Create enum types if they don't exist (using SQLAlchemy DDL)
     if 'userlocationassignmenttype' not in enum_names:
-        op.create_type('userlocationassignmenttype', ['MANUAL', 'GEOFENCE'])
+        assignment_type = sa.dialects.postgresql.ENUM('MANUAL', 'GEOFENCE', name='userlocationassignmenttype')
+        assignment_type.create(conn)
 
     if 'userlocationstatus' not in enum_names:
-        op.create_type('userlocationstatus', ['ACTIVE', 'INACTIVE'])
+        status_type = sa.dialects.postgresql.ENUM('ACTIVE', 'INACTIVE', name='userlocationstatus')
+        status_type.create(conn)
 
     # Check if tables already exist
     existing_tables = inspector.get_table_names()
@@ -40,7 +42,7 @@ def upgrade() -> None:
             sa.Column('id', sa.Integer(), nullable=False),
             sa.Column('user_id', sa.Integer(), nullable=False),
             sa.Column('location_id', sa.Integer(), nullable=False),
-            # Enums already created above, use create_type=False
+            # Enums already created above, use create_type=False to prevent duplicate creation
             sa.Column('assignment_type', sa.Enum('MANUAL', 'GEOFENCE', name='userlocationassignmenttype', create_type=False), nullable=False),
             sa.Column('status', sa.Enum('ACTIVE', 'INACTIVE', name='userlocationstatus', create_type=False), nullable=False),
             sa.Column('detected_latitude', sa.Float(), nullable=True),
@@ -68,7 +70,7 @@ def upgrade() -> None:
             sa.Column('location_id', sa.Integer(), nullable=False),
             sa.Column('user_location_id', sa.Integer(), nullable=True),
             sa.Column('action', sa.String(length=50), nullable=False),
-            # Enums already created above, use create_type=False
+            # Enums already created above, use create_type=False to prevent duplicate creation
             sa.Column('assignment_type', sa.Enum('MANUAL', 'GEOFENCE', name='userlocationassignmenttype', create_type=False), nullable=True),
             sa.Column('previous_status', sa.Enum('ACTIVE', 'INACTIVE', name='userlocationstatus', create_type=False), nullable=True),
             sa.Column('new_status', sa.Enum('ACTIVE', 'INACTIVE', name='userlocationstatus', create_type=False), nullable=True),
@@ -116,9 +118,9 @@ def downgrade() -> None:
     op.drop_table('user_location_history')
     op.drop_table('user_locations')
 
-    # Drop enum types using Alembic's native operation
-    op.drop_type('userlocationassignmenttype')
-    op.drop_type('userlocationstatus')
+    # Drop enum types (using SQLAlchemy DDL)
+    sa.Enum(name='userlocationassignmenttype').drop(op.get_bind())
+    sa.Enum(name='userlocationstatus').drop(op.get_bind())
 
     # Remove latitude/longitude from users table
     op.drop_column('users', 'longitude')
