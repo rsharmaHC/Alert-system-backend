@@ -1060,6 +1060,7 @@ class NotificationResponseOut(BaseModel):
 
 class DashboardStats(BaseModel):
     total_users: int
+    online_users: int
     total_groups: int
     total_locations: int
     active_incidents: int
