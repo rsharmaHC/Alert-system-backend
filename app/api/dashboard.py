@@ -25,7 +25,8 @@ def get_dashboard_stats(
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     week_start = now - timedelta(days=7)
 
-    total_users = db.query(User).filter(User.is_active == True).count()
+    total_users = db.query(User).count()
+    online_users = db.query(User).filter(User.is_active == True).count()
     total_groups = db.query(Group).filter(Group.is_active == True).count()
     total_locations = db.query(Location).filter(Location.is_active == True).count()
     active_incidents = db.query(Incident).filter(Incident.status == IncidentStatus.ACTIVE).count()
@@ -61,6 +62,7 @@ def get_dashboard_stats(
 
     return {
         "total_users": total_users,
+        "online_users": online_users,
         "total_groups": total_groups,
         "total_locations": total_locations,
         "active_incidents": active_incidents,
