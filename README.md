@@ -11,15 +11,27 @@ emergencies, with two-way safety check-in responses.
 
 ---
 
+## Deployment Model: Single-Tenant
+
+**This application is designed as a single-tenant system for Taylor Morrison only.**
+
+### Architecture Decisions:
+
+- **No multi-tenancy isolation** - All data belongs to Taylor Morrison
+- **No organisation_id/tenant_id** fields on database models
+- **No cross-organisation access controls** - Not needed for single customer
+
+---
+
 ## Tech Stack
 
 - **Backend**: Python 3.11 + FastAPI
 - **Database**: PostgreSQL 16
 - **Cache / Queue Broker**: Redis 7
-- **Background Tasks**: Celery
+- **Background Tasks**: Celery + Celery Beat
 - **SMS / Voice**: Twilio
-- **Email**: AWS SES
-- **Auth**: JWT (email + password)
+- **Email**: AWS SES + SMTP
+- **Auth**: JWT with MFA support (email + password + TOTP)
 
 ---
 
@@ -113,14 +125,13 @@ celery -A app.celery_app beat --loglevel=info
 
 ## Default Admin Login
 
-On first startup, a default admin is created:
+On first startup, a default admin account is created with:
+- **Email:** `admin@tmalert.com`
+- **Password:** A secure random password generated at runtime
 
-```
-Email:    admin@tmalert.com
-Password: Admin@123456
-```
+The bootstrap password is written to `/run/secrets/bootstrap_pw` on first boot. If that path is not available, check the application logs on **first boot only** for the password.
 
-**Change this immediately after first login.**
+**⚠️ You will be forced to change the password on first login.**
 
 ---
 

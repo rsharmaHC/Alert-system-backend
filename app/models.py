@@ -1,6 +1,6 @@
 from sqlalchemy import (
     Column, Integer, String, Boolean, DateTime, Text,
-    ForeignKey, Enum, Float, JSON, Table
+    ForeignKey, Enum, Float, JSON, Table, UniqueConstraint
 )
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -109,7 +109,7 @@ class User(Base):
     title = Column(String(100))
     employee_id = Column(String(50), unique=True)
     role = Column(Enum(UserRole), default=UserRole.VIEWER, nullable=False)
-    is_active = Column(Boolean, default=True)
+    is_active = Column(Boolean, default=False)  # Tracks real-time online presence
     is_verified = Column(Boolean, default=False)
     mfa_enabled = Column(Boolean, default=False)
     mfa_secret = Column(String(255))  # Increased from 32 to store Fernet-encrypted secrets
@@ -121,9 +121,11 @@ class User(Base):
     longitude = Column(Float, nullable=True)  # Last known longitude
     location_id = Column(Integer, ForeignKey("locations.id"), nullable=True)
     last_login = Column(DateTime(timezone=True))
+    last_seen_at = Column(DateTime(timezone=True), nullable=True)  # Last heartbeat timestamp
     password_reset_token = Column(String(100))
     password_reset_expires = Column(DateTime(timezone=True))
     token_valid_after = Column(DateTime(timezone=True), nullable=True)
+    force_password_change = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
@@ -261,6 +263,9 @@ class Notification(Base):
 
 class DeliveryLog(Base):
     __tablename__ = "delivery_logs"
+    __table_args__ = (
+        UniqueConstraint('notification_id', 'user_id', 'channel', name='uq_delivery_log_notification_user_channel'),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     notification_id = Column(Integer, ForeignKey("notifications.id", ondelete="CASCADE"), nullable=False)

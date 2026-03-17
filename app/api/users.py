@@ -1,22 +1,58 @@
 import io
 import csv
 import logging
+from datetime import datetime, timezone, timedelta
 from fastapi import APIRouter, Depends, HTTPException, status, Query, UploadFile, File, Request
 from sqlalchemy.orm import Session
 from sqlalchemy import or_, func
 from typing import Optional, List
 from app.database import get_db
 from app.models import User, UserRole, AuditLog, Group, GroupType, UserLocation, UserLocationHistory, Incident, Notification, NotificationTemplate
-from app.utils.search import escape_like
 from app.utils.audit import create_audit_log
+from app.schemas import UserCreate, UserUpdate, UserResponse, UserListResponse, CSVImportResponse, UserBulkDeleteResponse, AdminMFAStatusResponse, AdminMFAResetRequest, AdminMFAResetResponse, HeartbeatResponse
+from app.utils.search import escape_like
 from app.schemas import UserCreate, UserUpdate, UserResponse, UserListResponse, CSVImportResponse, UserBulkDeleteResponse, AdminMFAStatusResponse, AdminMFAResetRequest, AdminMFAResetResponse
 from app.core.security import hash_password
 from app.core.deps import get_current_user, require_admin, require_manager
 from app.services.mfa_lifecycle import get_mfa_service
 from app.services.mfa_recovery import get_recovery_code_status, invalidate_all_recovery_codes
-from app.utils.audit import create_audit_log
+from app.services.rate_limiter import check_api_rate_limit, record_api_request, API_RATE_LIMIT_MAX
 
 logger = logging.getLogger(__name__)
+
+
+def _scrub_email(email: str) -> str:
+    """
+    Scrub email address for safe logging while keeping it useful for debugging.
+
+    Shows: first 2 chars + *** + @ + domain
+    Example: john.doe@example.com → jo***@example.com
+    """
+    if not email or '@' not in email:
+        return "***@***"
+
+    local, domain = email.rsplit('@', 1)
+    if len(local) <= 2:
+        scrubbed_local = local + "***"
+    else:
+        scrubbed_local = local[:2] + "***"
+
+    return f"{scrubbed_local}@{domain}"
+
+
+def _log_user_identity(user_id: Optional[int], email: Optional[str]) -> str:
+    """
+    Create a safe user identity string for logging.
+
+    Shows: user_id + scrubbed email
+    Example: "user_id=12345, email=jo***@example.com"
+    """
+    parts = []
+    if user_id is not None:
+        parts.append(f"user_id={user_id}")
+    if email:
+        parts.append(f"email={_scrub_email(email)}")
+    return ", ".join(parts) if parts else "[UNKNOWN]"
 
 router = APIRouter(prefix="/users", tags=["Users / People"])
 
@@ -511,6 +547,18 @@ async def import_users_csv(
 
     Sends welcome emails with login credentials to newly created users.
     """
+    # Rate limiting: Check API rate limit for state-changing operations
+    is_allowed, retry_after = await check_api_rate_limit(current_user.id, "import_users_csv")
+    if not is_allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Rate limit exceeded. Maximum {API_RATE_LIMIT_MAX} requests per minute for this endpoint.",
+            headers={"Retry-After": str(retry_after)}
+        )
+    
+    # Record the API request for rate limiting
+    await record_api_request(current_user.id, "import_users_csv")
+    
     # Validate file extension
     if not file.filename.endswith('.csv'):
         raise HTTPException(status_code=400, detail="File must be a CSV")
@@ -659,6 +707,7 @@ async def import_users_csv(
             refresh_dynamic_groups_for_user(db, user_obj)
     else:
         # No valid rows to commit - still log the failed import attempt
+        # Store all errors (no truncation) for complete audit trail
         db.add(create_audit_log(
             user_id=current_user.id,
             user_email=current_user.email,
@@ -667,7 +716,7 @@ async def import_users_csv(
             details={
                 "failed": failed,
                 "total_rows": failed,
-                "errors": errors[:10]  # Include first 10 errors in audit log
+                "errors": errors  # Include all errors for complete audit trail
             },
             request=request,
         ))
@@ -690,15 +739,15 @@ async def import_users_csv(
             )
             if result.get('status') == 'failed':
                 emails_failed += 1
-                email_failures.append(f"Email to {user_data['email']} failed: {result.get('error', 'Unknown error')}")
-                logger.error(f"Welcome email failed for {user_data['email']}: {result.get('error')}")
+                email_failures.append(f"Email to {_scrub_email(user_data['email'])} failed: {result.get('error', 'Unknown error')}")
+                logger.error(f"Welcome email failed for user_id={user.id}, email={_scrub_email(user_data['email'])}: {result.get('error')}")
             else:
                 emails_sent += 1
-                logger.info(f"Welcome email sent to {user_data['email']}")
+                logger.info(f"Welcome email sent to user_id={user.id}, email={_scrub_email(user_data['email'])}")
         except Exception as e:
             emails_failed += 1
-            email_failures.append(f"Email to {user_data['email']} error: {str(e)}")
-            logger.error(f"Exception sending welcome email to {user_data['email']}: {e}")
+            email_failures.append(f"Email to {_scrub_email(user_data['email'])} error: {str(e)}")
+            logger.error(f"Exception sending welcome email to user_id={user.id}, email={_scrub_email(user_data['email'])}: {e}")
 
     # Add secondary audit log for email results if there were newly created users
     if created_users and (emails_sent > 0 or emails_failed > 0):
@@ -893,7 +942,7 @@ def admin_reset_user_mfa(
 
     # Notify target user (in production, send email)
     user_notified = True  # In production, use email_service.send_mfa_reset_notification()
-    logger.info(f"Admin {current_user.email} reset MFA for user {target_user.email}")
+    logger.info(f"Admin {_log_user_identity(current_user.id, current_user.email)} reset MFA for {_log_user_identity(target_user.id, target_user.email)}")
 
     db.commit()
 
@@ -902,4 +951,28 @@ def admin_reset_user_mfa(
         mfa_reset=True,
         user_notified=user_notified,
         reason=request_data.reason
+    )
+
+
+@router.post("/heartbeat", response_model=HeartbeatResponse)
+def heartbeat(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Heartbeat endpoint to mark user as online.
+    
+    Called periodically by the frontend (every 30 seconds) to indicate
+    the user is still active and online. Updates last_seen_at timestamp
+    and sets is_active to True.
+    """
+    now = datetime.now(timezone.utc)
+    current_user.last_seen_at = now
+    current_user.is_active = True
+    db.commit()
+    
+    return HeartbeatResponse(
+        status="ok",
+        message="Heartbeat received",
+        last_seen_at=current_user.last_seen_at
     )

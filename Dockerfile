@@ -29,7 +29,7 @@ COPY --from=builder /install /usr/local
 COPY --chown=appuser:appgroup . .
 
 # 3. Make startup script executable
-RUN chmod +x /app/start.sh
+RUN sed -i 's/\r$//' start.sh
 
 # 4. Create tmp directory for celerybeat schedule with proper permissions
 RUN mkdir -p /tmp && chown appuser:appgroup /tmp
@@ -40,4 +40,5 @@ USER appuser
 EXPOSE 8000
 
 # Use startup script that runs migrations before starting
-CMD ["/app/start.sh", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Railway injects $PORT — start.sh reads it via ${PORT:-8000}
+CMD ["/app/start.sh"]

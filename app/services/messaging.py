@@ -391,23 +391,28 @@ def _is_safe_url(url: str) -> bool:
         
         # Resolve hostname and check IP addresses
         # Use getaddrinfo to handle both IPv4 and IPv6
-        addr_info = socket.getaddrinfo(hostname, None, socket.AF_INET, socket.SOCK_STREAM)
-        
+        try:
+            # Resolve both IPv4 (AF_INET) and IPv6 (AF_INET6) addresses
+            addr_info = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        except socket.gaierror:
+            logger.warning(f"Webhook URL blocked: DNS resolution failed for '{hostname}'")
+            return False
+
         for info in addr_info:
             ip_str = info[4][0]
             try:
                 ip = ipaddress.ip_address(ip_str)
+                # Block private, loopback, link-local, and reserved addresses
+                # IPv4: 10.x.x.x, 172.16-31.x.x, 192.168.x.x, 127.x.x.x, 169.254.x.x
+                # IPv6: ::1, fc00::/7 (unique local), fe80::/10 (link-local)
                 if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
                     logger.warning(f"Webhook URL blocked: hostname resolves to private IP '{ip_str}'")
                     return False
             except ValueError:
                 continue
-        
+
         return True  # All resolved IPs are public
-        
-    except socket.gaierror:
-        logger.warning(f"Webhook URL blocked: DNS resolution failed for '{url}'")
-        return False
+
     except Exception as e:
         logger.warning(f"Webhook URL blocked: validation error '{url}' - {e}")
         return False

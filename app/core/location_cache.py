@@ -1,56 +1,152 @@
 """
-Redis Cache Utility for Location Autocomplete
+Location Cache — Two-tier permanent cache with bounded growth
 
-Provides efficient caching layer with query normalization, prefix caching,
-and automatic TTL management.
+Architecture:
+  L1: In-process dict (instant, survives Redis blips, ~0ms)
+  L2: Redis with NO TTL by default (survives restarts, shared across workers)
+
+Why permanent?
+  Location data (city names, addresses, coordinates) doesn't change meaningfully.
+  "New York" → (40.71, -74.00) is valid for years. A 15-min TTL means the same
+  popular queries hammer the upstream provider repeatedly for no reason.
+
+  Permanent cache means:
+  - First user to search "new york" pays the latency cost
+  - Every subsequent user gets instant results from L1/L2
+  - Photon's public API sees minimal traffic → no throttling/bans
+
+Safety valves:
+  - L1 bounded to MAX_L1_ENTRIES (evicts LRU when full)
+  - L2 uses optional TTL (default 30 days) so Redis doesn't grow unbounded
+  - Admin endpoint to flush cache if data goes stale
+  - Empty results are cached briefly (5 min) to avoid re-querying bad input,
+    but NOT permanently (the upstream might have been temporarily down)
+
+Security:
+  - All inputs are normalized before use as cache keys (injection-safe)
+  - Cache keys use only [a-z0-9_] via normalize+hash
+  - No user-supplied strings used raw in Redis commands
+  - TLS enforced for rediss:// connections (CERT_REQUIRED)
+  - No pickle/eval — JSON only for serialization
 """
+
 import json
 import hashlib
 import logging
+import time
 from typing import Optional, Any
-from datetime import datetime
+from collections import OrderedDict
+from threading import Lock
 import redis.asyncio as redis
 from redis.exceptions import RedisError
 
 logger = logging.getLogger(__name__)
 
 
+# ─── L1 IN-MEMORY CACHE (per-process) ────────────────────────────────────────
+
+class _LRUCache:
+    """
+    Thread-safe LRU dict with bounded size.
+
+    No TTL — entries live until evicted by size pressure or explicit flush.
+    This is intentional: location data is essentially static.
+    """
+
+    def __init__(self, max_size: int = 5000):
+        self._data: OrderedDict[str, Any] = OrderedDict()
+        self._max_size = max_size
+        self._lock = Lock()
+        self._hits = 0
+        self._misses = 0
+
+    def get(self, key: str) -> Optional[Any]:
+        with self._lock:
+            if key in self._data:
+                self._data.move_to_end(key)
+                self._hits += 1
+                return self._data[key]
+            self._misses += 1
+            return None
+
+    def set(self, key: str, value: Any) -> None:
+        with self._lock:
+            if key in self._data:
+                self._data.move_to_end(key)
+                self._data[key] = value
+                return
+            if len(self._data) >= self._max_size:
+                self._data.popitem(last=False)  # evict LRU
+            self._data[key] = value
+
+    def delete(self, key: str) -> bool:
+        with self._lock:
+            if key in self._data:
+                del self._data[key]
+                return True
+            return False
+
+    def clear(self) -> int:
+        with self._lock:
+            count = len(self._data)
+            self._data.clear()
+            return count
+
+    def stats(self) -> dict:
+        with self._lock:
+            total = self._hits + self._misses
+            return {
+                "l1_entries": len(self._data),
+                "l1_max_size": self._max_size,
+                "l1_hits": self._hits,
+                "l1_misses": self._misses,
+                "l1_hit_rate": round(self._hits / total, 3) if total > 0 else 0,
+            }
+
+
+# ─── MAIN CACHE CLASS ────────────────────────────────────────────────────────
+
 class LocationCache:
     """
-    Redis-based cache for location autocomplete queries.
-    
-    Features:
-    - Query normalization (trim, lowercase, remove extra spaces)
-    - Prefix caching (cache partial queries for faster typeahead)
-    - Automatic TTL management
-    - JSON serialization/deserialization
-    - Error handling with graceful degradation
-    """
-    
-    # Cache key prefix
-    KEY_PREFIX = "location:query"
-    
-    # TTL in seconds
-    DEFAULT_TTL = 900  # 15 minutes
-    PREFIX_TTL = 300   # 5 minutes for prefix cache
-    
-    # Minimum query length for prefix caching
-    MIN_PREFIX_LENGTH = 3
-    
-    def __init__(self, redis_url: str):
-        """
-        Initialize Redis cache connection.
+    Two-tier location cache: L1 in-memory + L2 Redis.
 
-        Args:
-            redis_url: Redis connection URL (e.g., redis://localhost:6379/0)
-        
-        Security: Redis connections use TLS with full certificate verification
-        when using rediss:// scheme (ssl_cert_reqs=CERT_REQUIRED).
-        """
+    Read path:  L1 → L2 → miss
+    Write path: Write to both L1 + L2 simultaneously
+
+    Cache key format: "loc:v3:{hash}" where hash is MD5 of normalized query.
+    The "v3" version tag lets us invalidate all old cache entries by bumping it,
+    without needing to scan+delete (old keys just expire via Redis TTL or are
+    never read from L1 since L1 resets on restart).
+    """
+
+    # Cache key versioning — bump this to invalidate all cached data
+    KEY_VERSION = "v3"
+    KEY_PREFIX = f"loc:{KEY_VERSION}"
+
+    # L2 Redis TTL: 30 days (safety valve, not functional expiry)
+    # Location data is valid essentially forever, but we don't want Redis
+    # growing unbounded if the app generates many unique queries over months
+    DEFAULT_TTL = 30 * 24 * 60 * 60  # 30 days in seconds
+
+    # Empty-result TTL: cache "no results" briefly to avoid re-querying typos,
+    # but don't cache permanently in case the upstream was temporarily broken
+    EMPTY_RESULT_TTL = 5 * 60  # 5 minutes
+
+    # Prefix cache uses the same long TTL since prefix results are
+    # just as stable as full-query results
+    PREFIX_TTL = DEFAULT_TTL
+
+    MIN_PREFIX_LENGTH = 3
+
+    # L1 size limit per process (each entry ≈ 2-5 KB → 5000 entries ≈ 10-25 MB)
+    MAX_L1_ENTRIES = 5000
+
+    def __init__(self, redis_url: str):
         self.redis_url = redis_url
         self._redis: Optional[redis.Redis] = None
-        # Build SSL options for TLS connections
-        # SECURITY: Require TLS with full certificate verification (CERT_REQUIRED)
+        self._l1 = _LRUCache(max_size=self.MAX_L1_ENTRIES)
+
+        # TLS configuration
         self.ssl_opts = {}
         import ssl
         if redis_url.startswith("rediss://"):
@@ -60,7 +156,6 @@ class LocationCache:
             }
 
     async def connect(self) -> None:
-        """Establish Redis connection."""
         if self._redis is None:
             self._redis = redis.from_url(
                 self.redis_url,
@@ -68,139 +163,121 @@ class LocationCache:
                 decode_responses=True,
                 socket_connect_timeout=5,
                 socket_timeout=5,
-                **self.ssl_opts
+                retry_on_timeout=True,
+                **self.ssl_opts,
             )
-            logger.info("Redis cache connected")
-    
+            logger.info("Location cache connected (L1 in-memory + L2 Redis)")
+
     async def disconnect(self) -> None:
-        """Close Redis connection."""
         if self._redis:
             await self._redis.close()
             self._redis = None
-            logger.info("Redis cache disconnected")
-    
+            logger.info("Location cache disconnected")
+
     @property
     def is_connected(self) -> bool:
-        """Check if Redis is connected."""
         return self._redis is not None
-    
+
+    # ── Key generation ────────────────────────────────────────────────────
+
     @staticmethod
     def normalize_query(query: str) -> str:
         """
-        Normalize query for consistent caching.
-        
-        Args:
-            query: Raw search query
-            
-        Returns:
-            Normalized query (trimmed, lowercase, single spaces)
+        Normalize query for cache key consistency.
+
+        Security: strips everything except [a-z0-9 ,.-#'] to prevent
+        injection via cache keys. The result is always safe for use in
+        Redis key construction after hashing.
         """
-        # Trim whitespace
-        normalized = query.strip()
-        # Convert to lowercase
-        normalized = normalized.lower()
-        # Replace multiple spaces with single space
-        normalized = ' '.join(normalized.split())
-        # Remove special characters except common address chars
+        normalized = query.strip().lower()
+        normalized = ' '.join(normalized.split())  # collapse whitespace
         allowed = set("abcdefghijklmnopqrstuvwxyz0123456789 ,.-#'")
         normalized = ''.join(c for c in normalized if c in allowed)
-        # Final trim
         return normalized.strip()
-    
+
     @staticmethod
     def generate_cache_key(query: str, countrycodes: Optional[str] = None) -> str:
         """
-        Generate consistent cache key for query.
-        
-        Args:
-            query: Normalized search query
-            countrycodes: Optional country filter
-            
-        Returns:
-            Cache key string
+        Generate a safe, fixed-length cache key.
+
+        Always hashes — never puts raw user input in the key name.
+        This prevents key injection and keeps key length predictable.
         """
         normalized = LocationCache.normalize_query(query)
-        
-        # Create key components
         key_parts = [normalized]
         if countrycodes:
-            key_parts.append(countrycodes.lower())
-        
-        # For short queries, use hash to keep key length reasonable
+            key_parts.append(countrycodes.strip().lower())
+
         key_string = "|".join(key_parts)
-        
-        if len(key_string) > 50:
-            # Use MD5 hash for long keys
-            key_hash = hashlib.md5(key_string.encode()).hexdigest()[:16]
-            return f"{LocationCache.KEY_PREFIX}:{key_hash}"
-        
-        # For short keys, use readable format
-        safe_key = key_string.replace(" ", "_").replace("|", "_")
-        return f"{LocationCache.KEY_PREFIX}:{safe_key}"
-    
+        # Always hash to keep keys safe and uniform length
+        key_hash = hashlib.sha256(key_string.encode()).hexdigest()[:24]
+        return f"{LocationCache.KEY_PREFIX}:{key_hash}"
+
     @staticmethod
     def generate_prefix_keys(query: str, countrycodes: Optional[str] = None) -> list[str]:
         """
-        Generate cache keys for all prefixes of the query.
-        
-        Args:
-            query: Search query
-            countrycodes: Optional country filter
-            
-        Returns:
-            List of cache keys for prefixes (min 3 chars)
+        Generate cache keys for character-level prefixes.
+
+        For "new york", generates keys for: "new", "new ", "new y", "new yo",
+        "new yor", "new york". This means as the user types each character,
+        there's already a cached result waiting.
         """
         normalized = LocationCache.normalize_query(query)
-        words = normalized.split()
-        
+        if len(normalized) < LocationCache.MIN_PREFIX_LENGTH:
+            return []
+
         prefix_keys = []
-        current_prefix = ""
-        
-        for i, word in enumerate(words):
-            if i > 0:
-                current_prefix += " "
-            current_prefix += word
-            
-            # Only cache prefixes with 3+ characters
-            if len(current_prefix) >= LocationCache.MIN_PREFIX_LENGTH:
-                key = LocationCache.generate_cache_key(current_prefix, countrycodes)
+        for i in range(LocationCache.MIN_PREFIX_LENGTH, len(normalized) + 1):
+            prefix = normalized[:i]
+            # Skip if prefix ends mid-whitespace (looks like "new ")
+            # — still cache it, user might pause after space
+            key = LocationCache.generate_cache_key(prefix, countrycodes)
+            if key not in prefix_keys:  # dedup
                 prefix_keys.append(key)
-        
+
         return prefix_keys
-    
+
+    # ── Read path ─────────────────────────────────────────────────────────
+
     async def get(self, query: str, countrycodes: Optional[str] = None) -> Optional[list[dict]]:
         """
-        Retrieve cached location results.
-        
-        Args:
-            query: Search query
-            countrycodes: Optional country filter
-            
-        Returns:
-            Cached results or None if not found
+        L1 → L2 lookup. Returns None only on true cache miss.
+
+        Empty list [] is a valid cached result (means "no results for this query").
+        None means "not in cache, go fetch from upstream".
         """
+        key = self.generate_cache_key(query, countrycodes)
+
+        # L1 check (instant, no I/O)
+        l1_result = self._l1.get(key)
+        if l1_result is not None:
+            return l1_result
+
+        # L2 check (Redis)
         if not self.is_connected:
             return None
-        
+
         try:
-            key = self.generate_cache_key(query, countrycodes)
             cached = await self._redis.get(key)
-            
-            if cached:
+            if cached is not None:
                 data = json.loads(cached)
-                logger.debug(f"Cache hit for query: {query}")
+                # Backfill L1 from L2 (warm the fast path)
+                self._l1.set(key, data)
                 return data
-            
-            logger.debug(f"Cache miss for query: {query}")
-            return None
-            
         except RedisError as e:
-            logger.error(f"Redis get error: {e}")
-            return None
+            logger.warning(f"Redis get error (degrading to L1-only): {e}")
         except json.JSONDecodeError as e:
-            logger.error(f"Cache JSON decode error: {e}")
-            return None
-    
+            logger.error(f"Corrupt cache entry for key {key}: {e}")
+            # Delete corrupt entry
+            try:
+                await self._redis.delete(key)
+            except RedisError:
+                pass
+
+        return None
+
+    # ── Write path ────────────────────────────────────────────────────────
+
     async def set(
         self,
         query: str,
@@ -210,195 +287,149 @@ class LocationCache:
         cache_prefixes: bool = True,
     ) -> bool:
         """
-        Cache location results with optional prefix caching.
-        
-        Args:
-            query: Search query
-            results: Location results to cache
-            countrycodes: Optional country filter
-            ttl: Optional custom TTL (defaults to 900s)
-            cache_prefixes: Whether to cache query prefixes
-            
-        Returns:
-            True if successful, False otherwise
+        Write to both L1 and L2.
+
+        If results is empty [], caches with short TTL (5 min) to prevent
+        re-querying bad input, but doesn't pollute the permanent cache.
+
+        If results is non-empty, caches with long TTL (30 days) and also
+        caches all character-level prefixes of the query for instant
+        typeahead on future searches.
         """
+        normalized = self.normalize_query(query)
+        key = self.generate_cache_key(normalized, countrycodes)
+
+        # Decide TTL based on whether results are empty
+        if not results:
+            effective_ttl = self.EMPTY_RESULT_TTL
+            cache_prefixes = False  # don't pollute prefix cache with empty results
+        else:
+            effective_ttl = ttl or self.DEFAULT_TTL
+
+        serialized = json.dumps(results)
+
+        # L1 write (always, even if Redis fails)
+        self._l1.set(key, results)
+
+        # L2 write (Redis)
         if not self.is_connected:
-            return False
-        
+            return True  # L1-only is fine, will backfill L2 on reconnect
+
         try:
-            normalized = self.normalize_query(query)
-            ttl = ttl or self.DEFAULT_TTL
-            
-            # Cache the full query
-            key = self.generate_cache_key(normalized, countrycodes)
-            serialized = json.dumps(results)
-            
-            # Use pipeline for atomic operations
             pipe = self._redis.pipeline()
-            pipe.setex(key, ttl, serialized)
-            
-            # Cache prefixes for faster typeahead
-            if cache_prefixes:
+            pipe.setex(key, effective_ttl, serialized)
+
+            # Cache all character-level prefixes for typeahead
+            if cache_prefixes and results:
                 prefix_keys = self.generate_prefix_keys(normalized, countrycodes)
                 for prefix_key in prefix_keys:
-                    if prefix_key != key:  # Don't duplicate the full query
+                    if prefix_key != key:
                         pipe.setex(prefix_key, self.PREFIX_TTL, serialized)
-            
+                        # Also warm L1 for prefixes
+                        self._l1.set(prefix_key, results)
+
             await pipe.execute()
-            logger.debug(f"Cached {len(results)} results for query: {query}")
             return True
-            
+
         except RedisError as e:
             logger.error(f"Redis set error: {e}")
-            return False
-        except (json.JSONEncodeError, TypeError) as e:
-            logger.error(f"Cache JSON encode error: {e}")
-            return False
-    
-    async def get_or_set(
-        self,
-        query: str,
-        fetch_func,
-        countrycodes: Optional[str] = None,
-        ttl: Optional[int] = None,
-    ) -> tuple[list[dict], bool]:
-        """
-        Get from cache or fetch and cache.
-        
-        Args:
-            query: Search query
-            fetch_func: Async function to call if cache miss
-            countrycodes: Optional country filter
-            ttl: Optional custom TTL
-            
-        Returns:
-            Tuple of (results, is_cached)
-        """
-        # Try cache first
-        cached = await self.get(query, countrycodes)
-        if cached is not None:
-            return cached, True
-        
-        # Cache miss - fetch fresh data
-        results = await fetch_func()
-        
-        # Cache the results
-        if results:
-            await self.set(query, results, countrycodes, ttl)
-        
-        return results, False
-    
+            return True  # L1 write succeeded, so not a total failure
+
+    # ── Admin operations ──────────────────────────────────────────────────
+
     async def delete(self, query: str, countrycodes: Optional[str] = None) -> bool:
-        """
-        Delete cached results for a query.
-        
-        Args:
-            query: Search query
-            countrycodes: Optional country filter
-            
-        Returns:
-            True if deleted, False otherwise
-        """
+        key = self.generate_cache_key(query, countrycodes)
+        self._l1.delete(key)
+
         if not self.is_connected:
-            return False
-        
+            return True
         try:
-            key = self.generate_cache_key(query, countrycodes)
             await self._redis.delete(key)
-            logger.debug(f"Deleted cache for query: {query}")
             return True
         except RedisError as e:
             logger.error(f"Redis delete error: {e}")
             return False
-    
+
     async def clear_all(self) -> bool:
         """
-        Clear all location cache entries.
-        
-        Returns:
-            True if successful, False otherwise
+        Flush all location cache entries from L1 and L2.
+
+        L2 uses SCAN to avoid blocking Redis with a massive DEL.
         """
+        l1_count = self._l1.clear()
+        logger.info(f"Cleared {l1_count} L1 entries")
+
         if not self.is_connected:
-            return False
-        
+            return True
+
         try:
-            # Find all location cache keys
             pattern = f"{self.KEY_PREFIX}:*"
+            total_deleted = 0
             cursor = 0
-            
+
             while True:
-                cursor, keys = await self._redis.scan(cursor, match=pattern, count=100)
+                cursor, keys = await self._redis.scan(
+                    cursor, match=pattern, count=200
+                )
                 if keys:
                     await self._redis.delete(*keys)
-                    logger.info(f"Cleared {len(keys)} cache entries")
-                
+                    total_deleted += len(keys)
                 if cursor == 0:
                     break
-            
+
+            logger.info(f"Cleared {total_deleted} L2 (Redis) entries")
             return True
-            
+
         except RedisError as e:
             logger.error(f"Redis clear_all error: {e}")
             return False
-    
+
     async def get_stats(self) -> dict[str, Any]:
-        """
-        Get cache statistics.
-        
-        Returns:
-            Dictionary with cache statistics
-        """
+        """Combined L1 + L2 statistics."""
+        stats = self._l1.stats()
+        stats["connected"] = self.is_connected
+
         if not self.is_connected:
-            return {"connected": False}
-        
+            return stats
+
         try:
-            # Count location cache keys
+            # Count L2 keys (sampled, not exact)
             pattern = f"{self.KEY_PREFIX}:*"
             cursor = 0
-            total_keys = 0
-            
+            l2_keys = 0
             while True:
-                cursor, keys = await self._redis.scan(cursor, match=pattern, count=100)
-                total_keys += len(keys)
+                cursor, keys = await self._redis.scan(
+                    cursor, match=pattern, count=200
+                )
+                l2_keys += len(keys)
                 if cursor == 0:
                     break
-            
-            # Get Redis info
+
             info = await self._redis.info("memory")
-            
-            return {
-                "connected": True,
-                "location_cache_keys": total_keys,
+            stats.update({
+                "l2_entries": l2_keys,
+                "l2_ttl_days": self.DEFAULT_TTL // 86400,
                 "used_memory_human": info.get("used_memory_human", "N/A"),
                 "used_memory_peak_human": info.get("used_memory_peak_human", "N/A"),
-            }
-            
+            })
         except RedisError as e:
-            logger.error(f"Redis stats error: {e}")
-            return {"connected": False, "error": str(e)}
+            stats["l2_error"] = str(e)
+
+        return stats
 
 
-# Global cache instance (initialized in app startup)
+# ─── GLOBAL INSTANCE ──────────────────────────────────────────────────────────
+
 _location_cache: Optional[LocationCache] = None
 
 
 def get_location_cache() -> LocationCache:
-    """Get the global location cache instance."""
     if _location_cache is None:
         raise RuntimeError("Location cache not initialized. Call init_location_cache() first.")
     return _location_cache
 
 
 async def init_location_cache(redis_url: str) -> LocationCache:
-    """
-    Initialize the global location cache.
-    
-    Args:
-        redis_url: Redis connection URL
-        
-    Returns:
-        Initialized LocationCache instance
-    """
     global _location_cache
     _location_cache = LocationCache(redis_url)
     await _location_cache.connect()
@@ -406,7 +437,6 @@ async def init_location_cache(redis_url: str) -> LocationCache:
 
 
 async def close_location_cache() -> None:
-    """Close the global location cache connection."""
     global _location_cache
     if _location_cache:
         await _location_cache.disconnect()

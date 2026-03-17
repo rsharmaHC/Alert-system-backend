@@ -1,17 +1,16 @@
 import secrets
 import time
 import logging
-import json
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, status, Request, Query, Response
-from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import desc, func
 import redis
 from app.database import get_db
-from app.models import User, RefreshToken, AuditLog, UserRole, LoginAttempt
+from app.models import User, RefreshToken, LoginAttempt
 from app.schemas import (
-    LoginRequest, TokenResponse, RefreshRequest, UserResponse,
+    LoginRequest, TokenResponse, UserResponse,
     PasswordResetRequest, PasswordResetConfirm, ChangePasswordRequest,
     UserProfileUpdate, MFASetupInitiateResponse, MFASetupConfirmRequest,
     MFAStatusResponse, MFANeededResponse,
@@ -56,6 +55,25 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
+
+def _scrub_email(email: str) -> str:
+    """Scrub email for safe logging: john.doe@example.com → jo***@example.com"""
+    if not email or '@' not in email:
+        return "***@***"
+    local, domain = email.rsplit('@', 1)
+    scrubbed_local = local + "***" if len(local) <= 2 else local[:2] + "***"
+    return f"{scrubbed_local}@{domain}"
+
+
+def _log_user_identity(user_id: Optional[int], email: Optional[str]) -> str:
+    """Create safe user identity for logging: user_id=12345, email=jo***@example.com"""
+    parts = []
+    if user_id is not None:
+        parts.append(f"user_id={user_id}")
+    if email:
+        parts.append(f"email={_scrub_email(email)}")
+    return ", ".join(parts) if parts else "[UNKNOWN]"
+
 # Simple in-memory rate limiting for password reset requests
 # Format: {email: last_request_timestamp}
 _password_reset_rate_limit: dict[str, float] = {}
@@ -73,7 +91,7 @@ MFA_CHALLENGE_EXPIRE_SECONDS = 300  # 5 minutes to complete MFA verification
 def _set_refresh_cookie(response: Response, token: str, expire_days: int) -> None:
     """
     Attach the refresh token as an HttpOnly cookie on a FastAPI Response object.
-    
+
     NOTE: For cross-origin deployments (Vercel + Railway), cookies are set but
     browsers may block them. Frontend should also accept refresh_token in response body.
 
@@ -85,18 +103,21 @@ def _set_refresh_cookie(response: Response, token: str, expire_days: int) -> Non
 
     In development mode, secure=False so localhost works without HTTPS.
     """
-    is_secure = settings.APP_ENV != "development"
-    
-    # For cross-origin (Vercel -> Railway), we need SameSite=None
-    # This is secure because we always use Secure flag (HTTPS only)
+    is_production = settings.APP_ENV != "development"
+
+    # SameSite=None is required for cross-origin cookie usage (Vercel → Railway).
+    # In development (same-origin localhost), SameSite=Lax is sufficient and avoids
+    # ZAP's "Cookie with SameSite Attribute None" alert.
+    # Secure=True is always set — modern browsers accept Secure cookies on localhost,
+    # and ZAP flags Secure=False as "Cookie Without Secure Flag" regardless of scheme.
     response.set_cookie(
         key="refresh_token",
         value=token,
         httponly=True,
-        secure=is_secure,
-        samesite="none",  # Required for cross-origin (Vercel to Railway)
-        path="/api/v1/auth",  # Scoped: only sent to auth endpoints
-        max_age=expire_days * 86400,  # seconds
+        secure=True,
+        samesite="none" if is_production else "lax",
+        path="/api/v1/auth",
+        max_age=expire_days * 86400,
     )
 
 
@@ -445,15 +466,6 @@ async def login(request: LoginRequest, req: Request, response: Response, db: Ses
             detail="Invalid credentials"
         )
 
-    # Check if account is active
-    if not user.is_active:
-        # Record failed attempt for IP tracking
-        await record_ip_failure(client_ip)
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Invalid credentials"
-        )
-
     # STEP 5: Device fingerprint tracking (if provided)
     # Track failures per device to detect automated attacks
     if request.device_fingerprint:
@@ -514,7 +526,7 @@ async def login(request: LoginRequest, req: Request, response: Response, db: Ses
             # Generate challenge token for verification
             challenge_token = _generate_challenge_token(user.id)
 
-            logger.info(f"MFA setup initiated for privileged user {user.id} ({user.email})")
+            logger.info(f"MFA setup initiated for privileged user {_log_user_identity(user.id, user.email)}")
 
             # Return setup information - NO tokens issued yet
             return LoginMFASetupResponse(
@@ -531,7 +543,7 @@ async def login(request: LoginRequest, req: Request, response: Response, db: Ses
         if not request.mfa_code:
             # User has MFA configured but didn't provide code - return challenge response
             challenge_token = _generate_challenge_token(user.id)
-            logger.info(f"MFA challenge issued for user {user.id} ({user.email})")
+            logger.info(f"MFA challenge issued for {_log_user_identity(user.id, user.email)}")
 
             return LoginMFAChallengeResponse(
                 status="mfa_required",
@@ -552,7 +564,7 @@ async def login(request: LoginRequest, req: Request, response: Response, db: Ses
             if request.device_fingerprint:
                 await record_device_failure(request.device_fingerprint)
 
-            logger.warning(f"Invalid MFA code for user {user.id} ({user.email})")
+            logger.warning(f"Invalid MFA code for {_log_user_identity(user.id, user.email)}")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid credentials or MFA code"
@@ -560,7 +572,7 @@ async def login(request: LoginRequest, req: Request, response: Response, db: Ses
 
         # Replay protection — reject reuse within the same 30-second window
         if is_totp_replay(user, request.mfa_code):
-            logger.warning(f"TOTP replay attempt detected for user {user.id} ({user.email})")
+            logger.warning(f"TOTP replay attempt detected for {_log_user_identity(user.id, user.email)}")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="TOTP code already used. Please wait for the next code."
@@ -593,8 +605,10 @@ async def login(request: LoginRequest, req: Request, response: Response, db: Ses
     )
     db.add(rt)
 
-    # Update last login
+    # Update last login and mark user as online
     user.last_login = datetime.now(timezone.utc)
+    user.last_seen_at = datetime.now(timezone.utc)
+    user.is_active = True
 
     # Audit log
     db.add(create_audit_log(
@@ -620,7 +634,7 @@ async def login(request: LoginRequest, req: Request, response: Response, db: Ses
 
 
 @router.post("/refresh", response_model=TokenResponse)
-def refresh_token(req: Request, response: Response, db: Session = Depends(get_db)):
+async def refresh_token(req: Request, response: Response, db: Session = Depends(get_db)):
     """
     Refresh access token using the refresh token from HttpOnly cookie or request body.
 
@@ -631,24 +645,20 @@ def refresh_token(req: Request, response: Response, db: Session = Depends(get_db
     """
     # Try to read refresh token from HttpOnly cookie first (same-origin fallback)
     refresh_token_str = req.cookies.get("refresh_token")
-    
+
     # If no cookie, try request body (cross-origin fallback for Vercel + Railway)
     if not refresh_token_str:
         try:
-            body = req.query_params if req.method == "GET" else None
-            if body is None:
-                # Try to parse JSON body
+            content_type = req.headers.get("content-type", "")
+            if "application/json" in content_type:
+                # Read body asynchronously
                 import json
-                content_type = req.headers.get("content-type", "")
-                if "application/json" in content_type:
-                    # Read body asynchronously
-                    import asyncio
-                    body_bytes = asyncio.run(req.body())
-                    body_data = json.loads(body_bytes.decode())
-                    refresh_token_str = body_data.get("refresh_token")
+                body_bytes = await req.body()
+                body_data = json.loads(body_bytes.decode())
+                refresh_token_str = body_data.get("refresh_token")
         except Exception:
             pass  # Will raise 401 below if no token found
-    
+
     if not refresh_token_str:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -675,10 +685,9 @@ def refresh_token(req: Request, response: Response, db: Session = Depends(get_db
             detail="Refresh token expired"
         )
 
-    # Check if user exists and is active
+    # Check if user exists (don't check is_active - that's for online presence, not account status)
     user = db.query(User).filter(
-        User.id == rt.user_id,
-        User.is_active == True
+        User.id == rt.user_id
     ).first()
     if not user:
         raise HTTPException(
@@ -724,6 +733,7 @@ def logout(
     - Refresh token read from HttpOnly cookie
     - Token revoked in database
     - Cookie cleared from browser
+    - User marked as offline (is_active=False)
     """
     # Read refresh token from HttpOnly cookie
     refresh_token_str = req.cookies.get("refresh_token")
@@ -735,7 +745,10 @@ def logout(
         ).first()
         if rt:
             rt.revoked = True
-            db.commit()
+
+    # Mark user as offline
+    current_user.is_active = False
+    db.commit()
 
     # Clear the HttpOnly cookie
     # Must match the same settings as set_cookie
@@ -804,33 +817,50 @@ def forgot_password(request: PasswordResetRequest, req: Request, db: Session = D
 def reset_password(request: PasswordResetConfirm, db: Session = Depends(get_db)):
     """
     Reset password using a valid reset token.
-    
+
     Security:
     - Token is hashed before comparison with stored hash
-    - Prevents timing attacks via constant-time comparison
+    - Uses constant-time comparison (hmac.compare_digest) to prevent timing attacks
     - Token must not be expired
+    - Fetches all users with valid reset tokens, then compares in application code
+    - No email enumeration (same error for invalid token vs non-existent user)
     """
-    # Hash the incoming token and compare with stored hash
+    import hmac
+    
+    # Hash the incoming token
     incoming_hash = hash_password_reset_token(request.token)
     
-    user = db.query(User).filter(
-        User.password_reset_token == incoming_hash,
-        User.password_reset_expires > datetime.now(timezone.utc)
-    ).first()
-
-    if not user:
+    # Fetch all users with non-expired reset tokens
+    # This prevents timing attacks that could enumerate emails
+    now = datetime.now(timezone.utc)
+    users_with_tokens = db.query(User).filter(
+        User.password_reset_token.isnot(None),
+        User.password_reset_expires > now
+    ).all()
+    
+    # Find matching user using constant-time comparison
+    matched_user = None
+    for user in users_with_tokens:
+        stored_token = user.password_reset_token or ""
+        # Use constant-time comparison to prevent timing attacks
+        if hmac.compare_digest(stored_token, incoming_hash):
+            matched_user = user
+            break
+    
+    if not matched_user:
+        # Generic error to prevent enumeration of whether token exists
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired reset token")
 
-    user.hashed_password = hash_password(request.new_password)
-    user.password_reset_token = None
-    user.password_reset_expires = None
+    matched_user.hashed_password = hash_password(request.new_password)
+    matched_user.password_reset_token = None
+    matched_user.password_reset_expires = None
 
     # Invalidate all existing access tokens
-    user.token_valid_after = datetime.now(timezone.utc)
+    matched_user.token_valid_after = datetime.now(timezone.utc)
 
     # Revoke all refresh tokens to force re-authentication with new password
     db.query(RefreshToken).filter(
-        RefreshToken.user_id == user.id,
+        RefreshToken.user_id == matched_user.id,
         RefreshToken.revoked == False
     ).update({"revoked": True})
 
@@ -1368,8 +1398,8 @@ async def verify_mfa_and_complete_login(
 
     # Fetch user from database
     user = db.query(User).filter(User.id == user_id).first()
-    if not user or not user.is_active:
-        logger.warning(f"User {user_id} not found or inactive")
+    if not user:
+        logger.warning(f"User {user_id} not found")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid credentials or MFA code"
@@ -1466,8 +1496,10 @@ async def verify_mfa_and_complete_login(
     )
     db.add(rt)
 
-    # Update last login
+    # Mark user as online (same as successful login)
     user.last_login = datetime.now(timezone.utc)
+    user.last_seen_at = datetime.now(timezone.utc)
+    user.is_active = True
 
     # Audit log
     db.add(create_audit_log(
