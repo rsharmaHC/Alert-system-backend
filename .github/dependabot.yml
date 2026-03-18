@@ -48,7 +48,7 @@ updates:
         patterns:
           - "ruff"
           - "mypy"
-    ignore:                                     
+    ignore:                                      
       - dependency-name: "sqlalchemy"
         versions: [">= 3.0.0, < 4.0.0"]
       - dependency-name: "celery"
