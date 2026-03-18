@@ -355,6 +355,7 @@ app = FastAPI(
 # Build allowed origins list from config with validation
 allowed_origins = [
     "http://localhost:3000",
+    "http://localhost:3001",
     "http://localhost:5173",
     "https://alert-system-frontend-jq7u.vercel.app",
 ]
@@ -542,6 +543,10 @@ async def limit_response_size(request: Request, call_next):
 # to SecurityHeadersMiddleware so their early-return 413/500 responses also receive
 # HSTS, X-Content-Type-Options, CSP, etc.  Placing this call last guarantees it.
 app.add_middleware(SecurityHeadersMiddleware)
+
+# Add custom request logging middleware (after CORS and other middleware)
+# REMOVED - was causing issues
+
 
 # ─── ROUTES ───────────────────────────────────────────────────────────────────
 
