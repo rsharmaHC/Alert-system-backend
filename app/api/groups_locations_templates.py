@@ -2,7 +2,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Request
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
-from typing import Optional, List
+from typing import Annotated, Optional, List
 from app.database import get_db
 from app.models import Group, GroupType, Location, NotificationTemplate, User, AuditLog, UserLocation, UserLocationStatus, UserRole
 from app.utils.audit import create_audit_log
@@ -13,6 +13,10 @@ from app.schemas import (
     TemplateCreate, TemplateUpdate, TemplateResponse
 )
 from app.core.deps import get_current_user, require_admin, require_manager
+
+# ─── ERROR MESSAGE CONSTANTS ──────────────────────────────────────────────────
+GROUP_NOT_FOUND_MSG = "Group not found"
+
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +131,7 @@ def get_group(
         Group.is_active == True
     ).first()
     if not group:
-        raise HTTPException(status_code=404, detail="Group not found")
+        raise HTTPException(status_code=404, detail=GROUP_NOT_FOUND_MSG)
     
     # Filter access based on user role:
     # - Admin/Super Admin: can view any group
@@ -155,7 +159,7 @@ def update_group(
         Group.is_active == True
     ).first()
     if not group:
-        raise HTTPException(status_code=404, detail="Group not found")
+        raise HTTPException(status_code=404, detail=GROUP_NOT_FOUND_MSG)
 
     # Handle member_ids separately (M2M relationship can't be set via setattr)
     member_ids = data.member_ids
@@ -221,7 +225,7 @@ def delete_group(
         Group.is_active == True
     ).first()
     if not group:
-        raise HTTPException(status_code=404, detail="Group not found")
+        raise HTTPException(status_code=404, detail=GROUP_NOT_FOUND_MSG)
     group.is_active = False
     db.commit()
     return {"message": "Group deleted"}
@@ -236,7 +240,7 @@ def add_members(
 ):
     group = db.query(Group).filter(Group.id == group_id).first()
     if not group:
-        raise HTTPException(status_code=404, detail="Group not found")
+        raise HTTPException(status_code=404, detail=GROUP_NOT_FOUND_MSG)
     
     # Managers can only add members to groups they are part of
     # Admin/Super Admin can add members to any group
@@ -269,7 +273,7 @@ def remove_member(
         Group.is_active == True
     ).first()
     if not group:
-        raise HTTPException(status_code=404, detail="Group not found")
+        raise HTTPException(status_code=404, detail=GROUP_NOT_FOUND_MSG)
     user = db.query(User).filter(User.id == user_id).first()
     if user and user in group.members:
         group.members.remove(user)

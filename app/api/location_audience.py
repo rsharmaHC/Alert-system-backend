@@ -19,7 +19,7 @@ from fastapi import APIRouter, Depends, HTTPException, status, Query, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session, aliased
 from sqlalchemy import select, func, and_, or_
-from typing import Optional, List
+from typing import Annotated, Optional, List
 from time import time as current_time
 
 from app.database import get_db
@@ -350,7 +350,7 @@ def update_user_geofence(
     allowed, retry_after = _geofence_update_limiter.is_allowed(f"geofence:{current_user.id}")
     if not allowed:
         # Log rate limit event without sensitive data
-        logger.warning(f"Rate limit exceeded for geofence update")
+        logger.warning("Rate limit exceeded for geofence update")
         raise HTTPException(
             status_code=429,
             detail=f"Too many location updates. Try again in {retry_after} seconds.",

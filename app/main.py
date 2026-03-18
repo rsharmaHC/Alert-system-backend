@@ -389,7 +389,7 @@ if railway_domain:
 # - Migration between Railway accounts (different subdomains)
 # - Multiple environments (staging, production) on different Railway subdomains
 logger.info(f"CORS allowed origins: {allowed_origins}")
-logger.info(f"CORS origin regex: Railway subdomains allowed for migration flexibility")
+logger.info("CORS origin regex: Railway subdomains allowed for migration flexibility")
 
 # Request ID — generates UUID per request for log correlation
 app.add_middleware(RequestIDMiddleware)
@@ -398,6 +398,11 @@ app.add_middleware(RequestIDMiddleware)
 # Registered before CORS so it can validate state-changing requests
 app.add_middleware(CSRFMiddleware)
 
+# GZip compression
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+# CORSMiddleware must be added last so it becomes the outermost middleware layer,
+# ensuring CORS headers are always present on every response (including errors).
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
@@ -410,7 +415,6 @@ app.add_middleware(
     # Expose Retry-After and X-CSRF-Token headers for client use
     expose_headers=["Retry-After", "X-Request-ID", "X-CSRF-Token"],
 )
-app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 
 # Request size limit middleware

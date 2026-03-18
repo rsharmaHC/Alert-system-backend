@@ -1,3 +1,4 @@
+from typing import Annotated, Optional
 import logging
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
@@ -21,8 +22,8 @@ DOCS_AUTH_LOCKOUT_SECONDS = 900  # 15 minute lockout
 
 async def get_admin_or_super_admin_user(
     request: Request,
-    credentials: HTTPBasicCredentials = Depends(security),
-    db: Session = Depends(get_db),
+    credentials: Annotated[HTTPBasicCredentials, Depends(security)],
+    db: Annotated[Session, Depends(get_db)],
 ) -> User:
     """
     HTTP Basic Auth for admin/super admin access to docs.

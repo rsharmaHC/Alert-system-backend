@@ -40,7 +40,7 @@ import time
 import asyncio
 import logging
 import re
-from typing import Optional, List, Dict, Any
+from typing import Annotated, Optional, List, Dict, Any
 from urllib.parse import urlparse
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
@@ -267,7 +267,8 @@ class _RequestCoalescer:
             source = "fetched" if task.done() else "coalesced"
             return result or [], source
         except asyncio.CancelledError:
-            return [], "cancelled"
+            # Clean up and re-raise per structured concurrency best practices
+            raise
         except Exception as e:
             logger.error(f"Coalesced fetch error: {type(e).__name__}: {e}")
             return [], "error"
