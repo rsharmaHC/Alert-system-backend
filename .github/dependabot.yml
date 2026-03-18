@@ -21,7 +21,6 @@ updates:
       auth-security:
         patterns:
           - "PyJWT"
-          - "python-jose"
           - "passlib"
           - "bcrypt"
           - "cryptography"
