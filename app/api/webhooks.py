@@ -2,7 +2,7 @@ from fastapi import APIRouter, Request, Depends, HTTPException, Query, Form
 from fastapi.responses import Response, PlainTextResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
-from typing import Optional, List
+from typing import Annotated, Optional, List
 from urllib.parse import parse_qs
 from twilio.request_validator import RequestValidator
 from app.database import get_db
@@ -22,6 +22,10 @@ from app.models import (
 from app.schemas import IncomingMessageResponse
 from datetime import datetime, timezone
 import logging
+
+# ─── CONTENT TYPE CONSTANTS ──────────────────────────────────────────────────
+XML_CONTENT_TYPE = "text/xml"
+
 
 router = APIRouter(prefix="/webhooks", tags=["Webhooks"])
 logger = logging.getLogger(__name__)
@@ -136,7 +140,7 @@ async def handle_voice_response(
 <Response>
   <Say>An error occurred. Please try again later.</Say>
 </Response>"""
-            return Response(content=twiml, media_type="application/xml")
+            return Response(content=twiml, media_type=XML_CONTENT_TYPE)
 
         # Normalize phone number for lookup
         user_phone_clean = user_phone.replace("+", "").replace("-", "").replace(" ", "").replace("(", "").replace(")", "")
@@ -168,7 +172,7 @@ async def handle_voice_response(
 <Response>
   <Say>Thank you for your response.</Say>
 </Response>"""
-            return Response(content=twiml, media_type="application/xml")
+            return Response(content=twiml, media_type=XML_CONTENT_TYPE)
 
         logger.info(f"Voice response matched user: {_log_user_identity(user.id, user.email)} from phone {_scrub_phone(user_phone)}")
 
@@ -188,14 +192,14 @@ async def handle_voice_response(
 <Response>
   <Say>No input received. Goodbye.</Say>
 </Response>"""
-            return Response(content=twiml, media_type="application/xml")
+            return Response(content=twiml, media_type=XML_CONTENT_TYPE)
         else:
             logger.warning(f"Invalid digit received: {Digits} from user {user.id}")
             twiml = """<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say>Invalid option. Please press 1 or 2. Goodbye.</Say>
 </Response>"""
-            return Response(content=twiml, media_type="application/xml")
+            return Response(content=twiml, media_type=XML_CONTENT_TYPE)
 
         # Find the most recent active notification for this user
         notification = db.query(Notification).filter(
@@ -243,7 +247,7 @@ async def handle_voice_response(
   <Say>{message}</Say>
 </Response>"""
 
-        return Response(content=twiml, media_type="application/xml")
+        return Response(content=twiml, media_type=XML_CONTENT_TYPE)
 
     except Exception as e:
         logger.error(f"Error processing voice response: {e}", exc_info=True)
@@ -251,7 +255,7 @@ async def handle_voice_response(
 <Response>
   <Say>An error occurred. Please try again later.</Say>
 </Response>"""
-        return Response(content=twiml, media_type="application/xml")
+        return Response(content=twiml, media_type=XML_CONTENT_TYPE)
 
 
 @router.post("/voice/status")

@@ -53,6 +53,12 @@ from app.services.security_notifications import notify_suspicious_login, notify_
 from app.config import settings
 from app.utils.audit import create_audit_log
 
+# ─── ERROR MESSAGE CONSTANTS ──────────────────────────────────────────────────
+INVALID_CREDENTIALS_MFA_MSG = "Invalid credentials or MFA code"
+INVALID_CREDENTIALS_RECOVERY_MSG = "Invalid credentials or recovery code"
+PASSWORD_RESET_SENT_MSG = "If an account exists with this email, a password reset link has been sent."
+
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
@@ -764,6 +770,72 @@ async def ldap_login(
         refresh_token=refresh_token_str,
     )
 
+async def _handle_login_mfa(user, request, db, client_ip) -> object:
+    """
+    Handle MFA check during login. Returns a response object if MFA is pending,
+    or None if authentication can proceed to token issuance.
+    """
+    from app.core.security import encrypt_mfa_secret, decrypt_mfa_secret
+    if not user_requires_mfa(user):
+        return None
+
+    mfa_fully_configured = user.mfa_enabled and user.mfa_secret and user.mfa_secret.strip()
+
+    if not mfa_fully_configured:
+        # MFA required but not set up — initiate setup
+        temp_secret = generate_mfa_secret()
+        qr_code_uri = generate_mfa_qr_code_uri(user.email, temp_secret)
+        user.mfa_secret = encrypt_mfa_secret(temp_secret)
+        user.mfa_enabled = False
+        db.add(user)
+        db.commit()
+        challenge_token = _generate_challenge_token(user.id)
+        logger.info(f"MFA setup initiated for privileged user {_log_user_identity(user.id, user.email)}")
+        return LoginMFASetupResponse(
+            status="mfa_required",
+            mfa_required=True,
+            mfa_configured=False,
+            challenge_token=challenge_token,
+            qr_code_uri=qr_code_uri,
+            secret=temp_secret,
+            message="MFA is required for your account. Please scan the QR code with your authenticator app and enter the code to complete login."
+        )
+
+    if not request.mfa_code:
+        # MFA configured but code not provided — issue challenge
+        challenge_token = _generate_challenge_token(user.id)
+        logger.info(f"MFA challenge issued for {_log_user_identity(user.id, user.email)}")
+        return LoginMFAChallengeResponse(
+            status="mfa_required",
+            mfa_required=True,
+            mfa_configured=True,
+            challenge_token=challenge_token,
+            message="Enter your authentication code to continue."
+        )
+
+    # Verify TOTP code
+    plain_secret = decrypt_mfa_secret(user.mfa_secret) or user.mfa_secret
+    if not verify_totp_code(plain_secret, request.mfa_code):
+        await redis_record_failed_login(user.id)
+        await record_ip_failure(client_ip)
+        if request.device_fingerprint:
+            await record_device_failure(request.device_fingerprint)
+        logger.warning(f"Invalid MFA code for {_log_user_identity(user.id, user.email)}")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=INVALID_CREDENTIALS_MFA_MSG)
+
+    if is_totp_replay(user, request.mfa_code):
+        logger.warning(f"TOTP replay attempt detected for {_log_user_identity(user.id, user.email)}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="TOTP code already used. Please wait for the next code."
+        )
+
+    # Mark TOTP code as used
+    user.last_used_totp_code = request.mfa_code
+    user.last_used_totp_at = datetime.now(timezone.utc)
+    db.add(user)
+    return None  # Proceed to token issuance
+
 
 @router.post("/login")
 async def login(request: LoginRequest, req: Request, response: Response, db: Session = Depends(get_db)):
@@ -880,87 +952,13 @@ async def login(request: LoginRequest, req: Request, response: Response, db: Ses
             }
         )
 
-    # STEP 7: Check if MFA is required for this user
-    mfa_required = user_requires_mfa(user)
-
-    if mfa_required:
-        # Check if user has MFA fully configured AND enabled
-        # A user might have mfa_secret from partial setup but mfa_enabled=False
-        mfa_fully_configured = user.mfa_enabled and user.mfa_secret and user.mfa_secret.strip()
-
-        if not mfa_fully_configured:
-            # MFA is required but not fully configured - initiate/re-initiate setup flow
-            # Generate a new secret for this user (overwrites any partial setup)
-            temp_secret = generate_mfa_secret()
-            qr_code_uri = generate_mfa_qr_code_uri(user.email, temp_secret)
-
-            # Encrypt and save the secret to user record (MFA not enabled until confirmed)
-            from app.core.security import encrypt_mfa_secret
-            encrypted_secret = encrypt_mfa_secret(temp_secret)
-            user.mfa_secret = encrypted_secret
-            user.mfa_enabled = False  # Explicitly ensure it's not enabled yet
-            db.add(user)
-            db.commit()
-
-            # Generate challenge token for verification
-            challenge_token = _generate_challenge_token(user.id)
-
-            logger.info(f"MFA setup initiated for privileged user {_log_user_identity(user.id, user.email)}")
-
-            # Return setup information - NO tokens issued yet
-            return LoginMFASetupResponse(
-                status="mfa_required",
-                mfa_required=True,
-                mfa_configured=False,
-                challenge_token=challenge_token,
-                qr_code_uri=qr_code_uri,
-                secret=temp_secret,
-                message="MFA is required for your account. Please scan the QR code with your authenticator app and enter the code to complete login."
-            )
-
-        # MFA is configured and enabled - validate code
-        if not request.mfa_code:
-            # User has MFA configured but didn't provide code - return challenge response
-            challenge_token = _generate_challenge_token(user.id)
-            logger.info(f"MFA challenge issued for {_log_user_identity(user.id, user.email)}")
-
-            return LoginMFAChallengeResponse(
-                status="mfa_required",
-                mfa_required=True,
-                mfa_configured=True,
-                challenge_token=challenge_token,
-                message="Enter your authentication code to continue."
-            )
-
-        # Verify the TOTP code
-        _plain_secret_for_totp = decrypt_mfa_secret(user.mfa_secret) or user.mfa_secret
-        if not verify_totp_code(_plain_secret_for_totp, request.mfa_code):
-            # Invalid MFA code - record as failed attempt
-            count = await redis_record_failed_login(user.id)
-            await record_ip_failure(client_ip)
-
-            # Track device failures if fingerprint provided
-            if request.device_fingerprint:
-                await record_device_failure(request.device_fingerprint)
-
-            logger.warning(f"Invalid MFA code for {_log_user_identity(user.id, user.email)}")
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid credentials or MFA code"
-            )
-
-        # Replay protection — reject reuse within the same 30-second window
-        if is_totp_replay(user, request.mfa_code):
-            logger.warning(f"TOTP replay attempt detected for {_log_user_identity(user.id, user.email)}")
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="TOTP code already used. Please wait for the next code."
-            )
-
-        # Record this code as used — will be committed with the final db.commit()
-        user.last_used_totp_code = request.mfa_code
-        user.last_used_totp_at = datetime.now(timezone.utc)
-        db.add(user)
+    # STEP 7: Check if MFA is required and handle MFA verification
+    mfa_response = await _handle_login_mfa(
+        user=user, request=request, db=db,
+        client_ip=client_ip
+    )
+    if mfa_response is not None:
+        return mfa_response
 
     # STEP 8: Successful authentication - issue tokens
     await clear_account_failures(user.id)
@@ -1168,7 +1166,7 @@ def forgot_password(request: PasswordResetRequest, req: Request, db: Session = D
     last_request = _password_reset_rate_limit.get(email_normalized)
     if last_request and (current_time - last_request) < PASSWORD_RESET_RATE_LIMIT_SECONDS:
         # Still within rate limit window - return success anyway to prevent enumeration
-        return {"message": "If that email exists, we've sent a password reset link."}
+        return {"message": PASSWORD_RESET_SENT_MSG}
 
     # Find user (case-insensitive email lookup)
     user = db.query(User).filter(
@@ -1179,7 +1177,7 @@ def forgot_password(request: PasswordResetRequest, req: Request, db: Session = D
     if not user:
         # Update rate limit even for non-existent emails
         _password_reset_rate_limit[email_normalized] = current_time
-        return {"message": "If that email exists, we've sent a password reset link."}
+        return {"message": PASSWORD_RESET_SENT_MSG}
 
     # Don't send reset emails for SSO users
     if user.auth_provider != "local":
@@ -1202,7 +1200,7 @@ def forgot_password(request: PasswordResetRequest, req: Request, db: Session = D
     # Update rate limit
     _password_reset_rate_limit[email_normalized] = current_time
 
-    return {"message": "If that email exists, we've sent a password reset link."}
+    return {"message": PASSWORD_RESET_SENT_MSG}
 
 
 @router.post("/reset-password")
@@ -1799,7 +1797,7 @@ async def verify_mfa_and_complete_login(
         logger.warning(f"Invalid or expired MFA challenge token from IP {client_ip}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials or MFA code"
+            detail=INVALID_CREDENTIALS_MFA_MSG
         )
 
     # Fetch user from database
@@ -1808,7 +1806,7 @@ async def verify_mfa_and_complete_login(
         logger.warning(f"User {user_id} not found")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials or MFA code"
+            detail=INVALID_CREDENTIALS_MFA_MSG
         )
 
     # Verify MFA is still required (user might have completed setup in another session)
@@ -1824,7 +1822,7 @@ async def verify_mfa_and_complete_login(
         logger.warning(f"No MFA secret for user {user_id}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials or MFA code"
+            detail=INVALID_CREDENTIALS_MFA_MSG
         )
 
     _plain_secret_for_totp_verify = decrypt_mfa_secret(user.mfa_secret) or user.mfa_secret
@@ -1839,7 +1837,7 @@ async def verify_mfa_and_complete_login(
         logger.warning(f"Invalid MFA code for user {user_id}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials or MFA code"
+            detail=INVALID_CREDENTIALS_MFA_MSG
         )
 
     # Replay protection — reject reuse within the same 30-second window
@@ -1985,7 +1983,7 @@ async def verify_recovery_code_and_login(
         logger.warning(f"Invalid or expired MFA challenge token from IP {client_ip}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials or recovery code"
+            detail=INVALID_CREDENTIALS_RECOVERY_MSG
         )
 
     # Fetch user from database
@@ -1996,7 +1994,7 @@ async def verify_recovery_code_and_login(
         logger.warning(f"User {user_id} not found or account disabled")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials or recovery code"
+            detail=INVALID_CREDENTIALS_RECOVERY_MSG
         )
     
     # Verify and consume recovery code
@@ -2032,7 +2030,7 @@ async def verify_recovery_code_and_login(
         logger.warning(f"Invalid recovery code for user {user_id}: {error}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials or recovery code"
+            detail=INVALID_CREDENTIALS_RECOVERY_MSG
         )
     
     # Recovery code verified - issue tokens

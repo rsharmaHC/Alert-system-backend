@@ -5,7 +5,7 @@ from datetime import datetime, timezone, timedelta
 from fastapi import APIRouter, Depends, HTTPException, status, Query, UploadFile, File, Request
 from sqlalchemy.orm import Session
 from sqlalchemy import or_, func
-from typing import Optional, List
+from typing import Annotated, Optional, List
 from app.database import get_db
 from app.models import User, UserRole, AuditLog, Group, GroupType, UserLocation, UserLocationHistory, Incident, Notification, NotificationTemplate
 from app.utils.audit import create_audit_log
@@ -17,6 +17,10 @@ from app.core.deps import get_current_user, require_admin, require_manager
 from app.services.mfa_lifecycle import get_mfa_service
 from app.services.mfa_recovery import get_recovery_code_status, invalidate_all_recovery_codes
 from app.services.rate_limiter import check_api_rate_limit, record_api_request, API_RATE_LIMIT_MAX
+
+# ─── ERROR MESSAGE CONSTANTS ──────────────────────────────────────────────────
+USER_NOT_FOUND_MSG = "User not found"
+
 
 logger = logging.getLogger(__name__)
 
@@ -63,70 +67,53 @@ MAX_CSV_FILE_SIZE = 5 * 1024 * 1024
 MAX_CSV_ROWS = 1000
 
 
+def _user_matches_dynamic_filter(user: User, f: dict) -> bool:
+    """Check if a user matches a dynamic group's filter criteria."""
+    if f.get("department") and str(f["department"]).strip():
+        if user.department != f["department"].strip():
+            return False
+    if f.get("title") and str(f["title"]).strip():
+        if user.title != f["title"].strip():
+            return False
+    if f.get("role") and str(f["role"]).strip():
+        if user.role != f["role"].strip():
+            return False
+    if f.get("location_id") and str(f["location_id"]).strip():
+        if user.location_id != int(f["location_id"]):
+            return False
+    return True
+
+
+def _update_group_membership(group, user: User) -> None:
+    """Add or remove a user from a group based on filter match result."""
+    if _user_matches_dynamic_filter(user, group.dynamic_filter):
+        if user not in group.members:
+            group.members.append(user)
+    elif user in group.members:
+        group.members.remove(user)
+
+
 def refresh_dynamic_groups_for_user(db: Session, user: User) -> None:
     """
     Refresh dynamic group memberships for a user after create/update.
-    
-    This function finds all active dynamic groups and re-evaluates whether
-    the user should be a member based on the group's filter criteria.
-    
-    Security: Only processes active groups, uses parameterized queries,
-    and doesn't expose sensitive data.
-    
-    Args:
-        db: Database session
-        user: The user whose memberships should be refreshed
+
+    Finds all active dynamic groups and re-evaluates whether the user
+    should be a member based on each group's filter criteria.
     """
     try:
-        # Get all active dynamic groups
         dynamic_groups = db.query(Group).filter(
             Group.type == GroupType.DYNAMIC,
             Group.is_active == True,
             Group.dynamic_filter.isnot(None)
         ).all()
-        
+
         for group in dynamic_groups:
             if not group.dynamic_filter:
                 continue
-                
-            # Build query to check if user matches this group's filters
-            f = group.dynamic_filter
-            user_matches = True
-            
-            # Check each filter criterion
-            # Only match if filter has non-empty, non-whitespace values
-            if f.get("department") and str(f["department"]).strip():
-                if user.department != f["department"].strip():
-                    user_matches = False
-            
-            if f.get("title") and str(f["title"]).strip():
-                if user.title != f["title"].strip():
-                    user_matches = False
-            
-            if f.get("role") and str(f["role"]).strip():
-                if user.role != f["role"].strip():
-                    user_matches = False
-            
-            if f.get("location_id") and str(f["location_id"]).strip():
-                if user.location_id != int(f["location_id"]):
-                    user_matches = False
-            
-            # Add/remove user from group based on match result
-            if user_matches:
-                # Add user to group if not already a member
-                if user not in group.members:
-                    group.members.append(user)
-            else:
-                # Remove user from group if they're a member
-                if user in group.members:
-                    group.members.remove(user)
-        
-        # Commit changes if any were made
+            _update_group_membership(group, user)
+
         db.commit()
-        
     except Exception as e:
-        # Log error but don't fail the user create/update operation
-        # User was successfully saved, group membership is secondary
         logger.error(f"Error refreshing dynamic groups for user {user.id}: {e}")
         db.rollback()
 
@@ -160,7 +147,7 @@ def _sanitize_formula_characters(value: str) -> str:
         return value
     
     # Check if value starts with formula-triggering characters
-    if value and value[0] in ['=', '+', '-', '@']:
+    if value[0] in ['=', '+', '-', '@']:
         # Prefix with single quote to escape formula interpretation
         return "'" + value
     
@@ -271,7 +258,7 @@ def get_user(
 ):
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(status_code=404, detail=USER_NOT_FOUND_MSG)
     return user
 
 
@@ -285,7 +272,7 @@ def update_user(
 ):
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(status_code=404, detail=USER_NOT_FOUND_MSG)
 
     # Prevent privilege escalation: ADMIN cannot modify SUPER_ADMIN users
     if user.role == UserRole.SUPER_ADMIN and current_user.role != UserRole.SUPER_ADMIN:
@@ -358,7 +345,7 @@ def delete_user(
     """Permanently delete a user (hard delete). Only ADMIN and SUPER_ADMIN can delete."""
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(status_code=404, detail=USER_NOT_FOUND_MSG)
     if user.id == current_user.id:
         raise HTTPException(status_code=400, detail="Cannot delete yourself")
 
@@ -536,6 +523,71 @@ def bulk_delete_users(
     )
 
 
+
+def _process_csv_row(
+    row: dict, row_num: int, db: Session,
+    current_user: User, created_users: list, valid_users: list
+) -> dict:
+    """Process a single CSV import row. Returns dict with status/action/error."""
+    import secrets as _secrets
+    try:
+        email = row.get('email', '').strip().lower()
+        if not email:
+            return {"status": "error", "error": f"Row {row_num}: Email is required"}
+
+        first_name = _sanitize_formula_characters(row.get('first_name', '').strip())
+        last_name = _sanitize_formula_characters(row.get('last_name', '').strip())
+        if not first_name or not last_name:
+            return {"status": "error", "error": f"Row {row_num}: first_name and last_name are required"}
+
+        role_str = row.get('role', 'viewer').strip().lower()
+        try:
+            role = UserRole(role_str)
+        except ValueError:
+            role = UserRole.VIEWER
+
+        if role == UserRole.SUPER_ADMIN and current_user.role != UserRole.SUPER_ADMIN:
+            return {"status": "error", "error": f"Row {row_num}: Only SUPER_ADMIN can assign SUPER_ADMIN role"}
+
+        existing = db.query(User).filter(User.email == email).first()
+
+        if existing:
+            if existing.role == UserRole.SUPER_ADMIN and current_user.role != UserRole.SUPER_ADMIN:
+                return {"status": "error", "error": f"Row {row_num}: Only SUPER_ADMIN can modify SUPER_ADMIN user ({email})"}
+            existing.first_name = first_name
+            existing.last_name = last_name
+            existing.phone = _sanitize_formula_characters(row.get('phone', '').strip()) or existing.phone
+            existing.department = _sanitize_formula_characters(row.get('department', '').strip()) or existing.department
+            existing.title = _sanitize_formula_characters(row.get('title', '').strip()) or existing.title
+            existing.employee_id = _sanitize_formula_characters(row.get('employee_id', '').strip()) or existing.employee_id
+            valid_users.append(("updated", existing))
+            return {"status": "ok", "action": "updated"}
+        else:
+            default_password = _secrets.token_urlsafe(12)
+            user = User(
+                email=email,
+                hashed_password=hash_password(default_password),
+                first_name=first_name,
+                last_name=last_name,
+                phone=_sanitize_formula_characters(row.get('phone', '').strip()),
+                department=_sanitize_formula_characters(row.get('department', '').strip()),
+                title=_sanitize_formula_characters(row.get('title', '').strip()),
+                employee_id=_sanitize_formula_characters(row.get('employee_id', '').strip()) or None,
+                role=role,
+                is_active=True
+            )
+            db.add(user)
+            created_users.append({
+                "email": email, "password": default_password,
+                "first_name": first_name, "last_name": last_name
+            })
+            valid_users.append(("created", user))
+            return {"status": "ok", "action": "created"}
+    except Exception as e:
+        logger.warning(f"CSV import row {row_num} failed: {e}")
+        return {"status": "error", "error": f"Row {row_num}: {str(e)}"}
+
+
 @router.post("/import/csv", response_model=CSVImportResponse)
 async def import_users_csv(
     file: UploadFile = File(...),
@@ -601,88 +653,20 @@ async def import_users_csv(
     valid_users = []  # Track successfully processed users for batch commit
 
     for i, row in enumerate(rows, start=2):
-        try:
-            # Sanitize all text fields to prevent CSV injection
-            email = row.get('email', '').strip().lower()
-            if not email:
-                errors.append(f"Row {i}: Email is required")
-                failed += 1
-                continue
-
-            # Sanitize formula characters in all text fields
-            first_name = _sanitize_formula_characters(row.get('first_name', '').strip())
-            last_name = _sanitize_formula_characters(row.get('last_name', '').strip())
-            if not first_name or not last_name:
-                errors.append(f"Row {i}: first_name and last_name are required")
-                failed += 1
-                continue
-
-            # Check for existing user
-            existing = db.query(User).filter(User.email == email).first()
-
-            role_str = row.get('role', 'viewer').strip().lower()
-            try:
-                role = UserRole(role_str)
-            except ValueError:
-                role = UserRole.VIEWER
-
-            # Prevent privilege escalation: ADMIN cannot create/update SUPER_ADMIN via CSV
-            if role == UserRole.SUPER_ADMIN and current_user.role != UserRole.SUPER_ADMIN:
-                errors.append(f"Row {i}: Only SUPER_ADMIN can assign SUPER_ADMIN role")
-                failed += 1
-                continue
-
-            if existing:
-                # Prevent privilege escalation: ADMIN cannot modify SUPER_ADMIN users via CSV
-                if existing.role == UserRole.SUPER_ADMIN and current_user.role != UserRole.SUPER_ADMIN:
-                    errors.append(f"Row {i}: Only SUPER_ADMIN can modify SUPER_ADMIN user ({email})")
-                    failed += 1
-                    continue
-
-                # Update user fields with sanitization (changes are persisted on commit below)
-                existing.first_name = first_name
-                existing.last_name = last_name
-                existing.phone = _sanitize_formula_characters(row.get('phone', '').strip()) or existing.phone
-                existing.department = _sanitize_formula_characters(row.get('department', '').strip()) or existing.department
-                existing.title = _sanitize_formula_characters(row.get('title', '').strip()) or existing.title
-                existing.employee_id = _sanitize_formula_characters(row.get('employee_id', '').strip()) or existing.employee_id
-                updated += 1
-
-                # Track for batch commit
-                valid_users.append(("updated", existing))
-            else:
-                import secrets
-                default_password = secrets.token_urlsafe(12)
-                user = User(
-                    email=email,
-                    hashed_password=hash_password(default_password),
-                    first_name=first_name,
-                    last_name=last_name,
-                    phone=_sanitize_formula_characters(row.get('phone', '').strip()),
-                    department=_sanitize_formula_characters(row.get('department', '').strip()),
-                    title=_sanitize_formula_characters(row.get('title', '').strip()),
-                    employee_id=_sanitize_formula_characters(row.get('employee_id', '').strip()) or None,
-                    role=role,
-                    is_active=True
-                )
-                db.add(user)
+        result = _process_csv_row(
+            row=row, row_num=i, db=db,
+            current_user=current_user,
+            created_users=created_users,
+            valid_users=valid_users
+        )
+        if result["status"] == "ok":
+            if result["action"] == "created":
                 created += 1
-                # Track new user credentials for email sending
-                created_users.append({
-                    "email": email,
-                    "password": default_password,
-                    "first_name": first_name,
-                    "last_name": last_name
-                })
-                # Track for batch commit
-                valid_users.append(("created", user))
-
-        except Exception as e:
-            errors.append(f"Row {i}: {str(e)}")
+            else:
+                updated += 1
+        else:
+            errors.append(result["error"])
             failed += 1
-            # Continue processing remaining rows - don't fail entire upload
-            logger.warning(f"CSV import row {i} failed: {e}")
-            continue
 
     # Commit all valid rows in a single transaction
     # Invalid rows are skipped but don't affect valid rows
@@ -818,7 +802,7 @@ def admin_get_user_mfa_status(
     """
     target_user = db.query(User).filter(User.id == user_id).first()
     if not target_user:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=USER_NOT_FOUND_MSG)
 
     # Prevent privilege escalation: ADMIN cannot view SUPER_ADMIN MFA status
     if target_user.role == UserRole.SUPER_ADMIN and current_user.role != UserRole.SUPER_ADMIN:
@@ -888,7 +872,7 @@ def admin_reset_user_mfa(
     """
     target_user = db.query(User).filter(User.id == user_id).first()
     if not target_user:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=USER_NOT_FOUND_MSG)
 
     # Prevent privilege escalation: ADMIN cannot reset SUPER_ADMIN MFA
     if target_user.role == UserRole.SUPER_ADMIN and current_user.role != UserRole.SUPER_ADMIN:

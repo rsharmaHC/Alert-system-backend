@@ -333,7 +333,7 @@ class LocationCache:
 
         except RedisError as e:
             logger.error(f"Redis set error: {e}")
-            return True  # L1 write succeeded, so not a total failure
+            return False  # L2 write failed (L1 succeeded, but report failure)
 
     # ── Admin operations ──────────────────────────────────────────────────
 

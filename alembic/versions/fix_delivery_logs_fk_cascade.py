@@ -12,6 +12,9 @@ instead of attempting to set user_id to NULL which violates the NOT NULL constra
 from alembic import op
 import sqlalchemy as sa
 
+FK_ON_DELETE_SET_NULL = 'SET NULL'
+
+
 
 # revision identifiers, used by Alembic.
 revision = 'fix_delivery_logs_fk_cascade'
@@ -73,7 +76,7 @@ def downgrade() -> None:
         'users',
         ['user_id'],
         ['id'],
-        ondelete='SET NULL'
+        ondelete=FK_ON_DELETE_SET_NULL
     )
 
     # Revert notification_responses
@@ -84,7 +87,7 @@ def downgrade() -> None:
         'users',
         ['user_id'],
         ['id'],
-        ondelete='SET NULL'
+        ondelete=FK_ON_DELETE_SET_NULL
     )
 
     # Revert incoming_messages
@@ -95,5 +98,5 @@ def downgrade() -> None:
         'users',
         ['user_id'],
         ['id'],
-        ondelete='SET NULL'
+        ondelete=FK_ON_DELETE_SET_NULL
     )

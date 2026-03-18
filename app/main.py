@@ -12,14 +12,12 @@ MAX_REQUEST_SIZE = 10 * 1024 * 1024  # 10 MB max request body size
 MAX_JSON_SIZE = 1 * 1024 * 1024  # 1 MB max JSON payload
 
 from sqlalchemy import text
-from alembic import command
-from alembic.config import Config
 from app.config import settings
 from app.middleware.security_headers import SecurityHeadersMiddleware
 from app.middleware.request_id import RequestIDMiddleware
 from app.middleware.csrf import CSRFMiddleware
 from sqlalchemy import text
-from app.database import engine, Base, SessionLocal, ensure_column_exists, ensure_mfa_secret_column_expanded
+from app.database import engine, Base, SessionLocal, ensure_column_exists, ensure_mfa_secret_column_expanded, ensure_sso_columns
 from app.models import (
     User, UserRole, AlertChannel, Location, Group, NotificationTemplate,
     Incident, Notification, DeliveryLog, NotificationResponse, IncomingMessage,
@@ -241,8 +239,9 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to initialize location cache: {e}")
 
-    # Migrations already run in start.sh before uvicorn starts
-    # No need to run them again here
+    # Note: Database tables are created by app.db_init during startup
+    # No Alembic migrations needed for fresh deployments
+    logger.info("Database schema initialized (using db_init)")
 
     # Ensure alertchannel enum has 'web' value
     logger.info("Ensuring alertchannel enum has 'web' value...")
@@ -268,6 +267,13 @@ async def lifespan(app: FastAPI):
         ensure_mfa_secret_column_expanded()
     except Exception as e:
         logger.error(f"Failed to expand mfa_secret column: {e}")
+
+    # Ensure SSO-related columns exist (auth_provider, external_id, is_enabled, is_online)
+    logger.info("Ensuring SSO columns exist...")
+    try:
+        ensure_sso_columns()
+    except Exception as e:
+        logger.error(f"Failed to ensure SSO columns: {e}")
 
     # Ensure audit_logs table has user_email column
     logger.info("Ensuring audit_logs table has user_email column...")
@@ -389,7 +395,7 @@ if railway_domain:
 # - Migration between Railway accounts (different subdomains)
 # - Multiple environments (staging, production) on different Railway subdomains
 logger.info(f"CORS allowed origins: {allowed_origins}")
-logger.info(f"CORS origin regex: Railway subdomains allowed for migration flexibility")
+logger.info("CORS origin regex: Railway subdomains allowed for migration flexibility")
 
 # Request ID — generates UUID per request for log correlation
 app.add_middleware(RequestIDMiddleware)
@@ -398,6 +404,11 @@ app.add_middleware(RequestIDMiddleware)
 # Registered before CORS so it can validate state-changing requests
 app.add_middleware(CSRFMiddleware)
 
+# GZip compression
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+# CORSMiddleware must be added last so it becomes the outermost middleware layer,
+# ensuring CORS headers are always present on every response (including errors).
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
@@ -410,7 +421,6 @@ app.add_middleware(
     # Expose Retry-After and X-CSRF-Token headers for client use
     expose_headers=["Retry-After", "X-Request-ID", "X-CSRF-Token"],
 )
-app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 
 # Request size limit middleware

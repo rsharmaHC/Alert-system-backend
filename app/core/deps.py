@@ -13,22 +13,47 @@ logger = logging.getLogger(__name__)
 security = HTTPBearer()
 
 
+def _validate_token_payload(payload: dict) -> str:
+    """Extract and validate user_id from JWT payload. Raises 401 on failure."""
+    if not payload or payload.get("type") != "access":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token"
+        )
+    user_id = payload.get("sub")
+    if not user_id:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+    return user_id
+
+
+def _check_token_session_validity(user: User, payload: dict) -> None:
+    """Reject tokens issued before the user's last password change."""
+    if user.token_valid_after is None:
+        return
+    token_iat = payload.get("iat")
+    if token_iat is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session expired. Please log in again."
+        )
+    if isinstance(token_iat, (int, float)):
+        issued_at = datetime.fromtimestamp(token_iat, tz=timezone.utc)
+    else:
+        issued_at = token_iat
+    if issued_at < user.token_valid_after:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session expired due to password change. Please log in again."
+        )
+
+
 def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
     db: Session = Depends(get_db)
 ) -> User:
     token = credentials.credentials
     payload = decode_token(token, token_type="access")
-
-    if not payload or payload.get("type") != "access":
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired token"
-        )
-
-    user_id = payload.get("sub")
-    if not user_id:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+    user_id = _validate_token_payload(payload)
 
     # Check account status (is_enabled), NOT online presence (is_online)
     # is_enabled = admin-controlled account status (enabled/disabled)
@@ -42,35 +67,10 @@ def get_current_user(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found or account disabled")
 
     # Session invalidation: reject tokens issued before the last password change.
-    # token_valid_after is set when the user changes/resets their password.
-    # If NULL, no restriction (user never changed password since feature was added).
-    # Note: This check is wrapped in try-except to handle cases where the column
-    # doesn't exist yet (during migration or in Celery workers before startup).
+    # Note: wrapped in try-except for cases where column doesn't exist yet (migration).
     try:
-        if user.token_valid_after is not None:
-            token_iat = payload.get("iat")
-            if token_iat is not None:
-                # iat can be a float (unix timestamp) or int — normalize to datetime
-                if isinstance(token_iat, (int, float)):
-                    issued_at = datetime.fromtimestamp(token_iat, tz=timezone.utc)
-                else:
-                    issued_at = token_iat
-
-                if issued_at < user.token_valid_after:
-                    raise HTTPException(
-                        status_code=status.HTTP_401_UNAUTHORIZED,
-                        detail="Session expired due to password change. Please log in again."
-                    )
-            # If token has no iat claim (old tokens before this feature),
-            # and user HAS changed password, reject it — old tokens are untrusted
-            else:
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="Session expired. Please log in again."
-                )
+        _check_token_session_validity(user, payload)
     except OperationalError as e:
-        # Column doesn't exist yet - log warning and skip validation
-        # This can happen in Celery workers before main app startup completes
         if "token_valid_after" in str(e):
             logger.warning(
                 "token_valid_after column not found, skipping session validation. "

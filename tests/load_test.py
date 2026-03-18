@@ -29,6 +29,13 @@ from datetime import datetime
 # USER BEHAVIOR SIMULATION
 # =============================================================================
 
+# ─── TEST CONSTANTS ─────────────────────────────────────────────────────────
+LOGIN_ENDPOINT = LOGIN_ENDPOINT
+LOCATIONS_ENDPOINT = LOCATIONS_ENDPOINT
+NOTIFICATIONS_ENDPOINT = NOTIFICATIONS_ENDPOINT
+DEFAULT_ADMIN_PASSWORD = DEFAULT_ADMIN_PASSWORD  # nosec - test credential only
+
+
 class AlertSystemUser(HttpUser):
     """
     Simulates a typical TM Alert user.
@@ -45,7 +52,7 @@ class AlertSystemUser(HttpUser):
     
     # Test data
     test_credentials = [
-        {"email": "admin@tmalert.com", "password": "Admin@123456"},
+        {"email": "admin@tmalert.com", "password": DEFAULT_ADMIN_PASSWORD},
         {"email": "manager@tmalert.com", "password": "Manager@123456"},
         {"email": "viewer@tmalert.com", "password": "Viewer@123456"},
     ]
@@ -62,7 +69,7 @@ class AlertSystemUser(HttpUser):
         credentials = random.choice(self.test_credentials)
         
         response = self.client.post(
-            "/api/v1/auth/login",
+            LOGIN_ENDPOINT,
             json={
                 "email": credentials["email"],
                 "password": credentials["password"]
@@ -103,7 +110,7 @@ class AlertSystemUser(HttpUser):
     @task(6)
     def list_locations(self):
         """View location list."""
-        self.client.get("/api/v1/locations")
+        self.client.get(LOCATIONS_ENDPOINT)
     
     @task(3)
     def list_groups(self):
@@ -120,7 +127,7 @@ class AlertSystemUser(HttpUser):
         """Send a notification (only for managers/admins)."""
         if self.user_role in ["admin", "manager", "super_admin"]:
             self.client.post(
-                "/api/v1/notifications",
+                NOTIFICATIONS_ENDPOINT,
                 json={
                     "title": f"Load Test Notification {int(time.time())}",
                     "message": "This is a simulated notification for load testing purposes.",
@@ -158,7 +165,7 @@ class AuthLoadTest(HttpUser):
         """Simulate login requests."""
         user_id = random.randint(1, 1000)
         self.client.post(
-            "/api/v1/auth/login",
+            LOGIN_ENDPOINT,
             json={
                 "email": f"user{user_id}@example.com",
                 "password": "TestPassword123!"
@@ -170,10 +177,10 @@ class AuthLoadTest(HttpUser):
         """Simulate token refresh."""
         # First login to get refresh token
         login_response = self.client.post(
-            "/api/v1/auth/login",
+            LOGIN_ENDPOINT,
             json={
                 "email": "admin@tmalert.com",
-                "password": "Admin@123456"
+                "password": DEFAULT_ADMIN_PASSWORD
             }
         )
         
@@ -212,10 +219,10 @@ class NotificationBroadcastTest(HttpUser):
     def on_start(self):
         """Login as admin."""
         response = self.client.post(
-            "/api/v1/auth/login",
+            LOGIN_ENDPOINT,
             json={
                 "email": "admin@tmalert.com",
-                "password": "Admin@123456"
+                "password": DEFAULT_ADMIN_PASSWORD
             }
         )
         if response.status_code == 200:
@@ -226,7 +233,7 @@ class NotificationBroadcastTest(HttpUser):
     def send_emergency_notification(self):
         """Send emergency notification."""
         self.client.post(
-            "/api/v1/notifications",
+            NOTIFICATIONS_ENDPOINT,
             json={
                 "title": f"🚨 EMERGENCY: Load Test {int(time.time())}",
                 "message": "This is a simulated emergency alert for load testing. Please disregard.",
@@ -242,7 +249,7 @@ class NotificationBroadcastTest(HttpUser):
     def send_routine_notification(self):
         """Send routine notification."""
         self.client.post(
-            "/api/v1/notifications",
+            NOTIFICATIONS_ENDPOINT,
             json={
                 "title": f"Routine Update {int(time.time())}",
                 "message": "This is a routine notification for load testing.",
@@ -274,10 +281,10 @@ class LocationUpdateStormTest(HttpUser):
     def on_start(self):
         """Login as admin."""
         response = self.client.post(
-            "/api/v1/auth/login",
+            LOGIN_ENDPOINT,
             json={
                 "email": "admin@tmalert.com",
-                "password": "Admin@123456"
+                "password": DEFAULT_ADMIN_PASSWORD
             }
         )
         if response.status_code == 200:
@@ -291,7 +298,7 @@ class LocationUpdateStormTest(HttpUser):
         lon = random.uniform(-125.0, -70.0)
         
         self.client.post(
-            "/api/v1/locations",
+            LOCATIONS_ENDPOINT,
             json={
                 "name": f"Load Test Location {int(time.time())}_{random.randint(1, 1000)}",
                 "address": f"{random.randint(1, 999)} Test Street",
@@ -350,7 +357,7 @@ class BurstTrafficTest(HttpUser):
             "/api/v1/dashboard/stats",
             "/api/v1/notifications?page=1",
             "/api/v1/users?page=1",
-            "/api/v1/locations",
+            LOCATIONS_ENDPOINT,
         ]
         
         endpoint = random.choice(endpoints)

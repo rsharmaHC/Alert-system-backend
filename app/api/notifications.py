@@ -28,6 +28,10 @@ from app.services.rate_limiter import (
     API_RATE_LIMIT_MAX,
 )
 
+# ─── ERROR MESSAGE CONSTANTS ──────────────────────────────────────────────────
+NOTIFICATION_NOT_FOUND_MSG = "Notification not found"
+
+
 logger = logging.getLogger(__name__)
 
 # ─── INCIDENT STATUS TRANSITIONS ──────────────────────────────────────────────
@@ -373,7 +377,7 @@ async def send_notification(
 
     notification = db.query(Notification).filter(Notification.id == notification_id).first()
     if not notification:
-        raise HTTPException(status_code=404, detail="Notification not found")
+        raise HTTPException(status_code=404, detail=NOTIFICATION_NOT_FOUND_MSG)
     if notification.status not in [NotificationStatus.DRAFT, NotificationStatus.SCHEDULED]:
         raise HTTPException(status_code=400, detail=f"Cannot send notification in {notification.status} state")
 
@@ -408,7 +412,7 @@ def cancel_notification(
 ):
     notification = db.query(Notification).filter(Notification.id == notification_id).first()
     if not notification:
-        raise HTTPException(status_code=404, detail="Notification not found")
+        raise HTTPException(status_code=404, detail=NOTIFICATION_NOT_FOUND_MSG)
     if notification.status not in [NotificationStatus.DRAFT, NotificationStatus.SCHEDULED]:
         raise HTTPException(status_code=400, detail="Can only cancel draft or scheduled notifications")
     notification.status = NotificationStatus.CANCELLED
@@ -430,7 +434,7 @@ def get_notification(
     """
     notification = db.query(Notification).filter(Notification.id == notification_id).first()
     if not notification:
-        raise HTTPException(status_code=404, detail="Notification not found")
+        raise HTTPException(status_code=404, detail=NOTIFICATION_NOT_FOUND_MSG)
     
     # Viewer-role users can only see notifications where they are recipients
     if current_user.role == UserRole.VIEWER:
@@ -481,7 +485,7 @@ def get_delivery_logs(
     # Fetch the notification first to check permissions
     notification = db.query(Notification).filter(Notification.id == notification_id).first()
     if not notification:
-        raise HTTPException(status_code=404, detail="Notification not found")
+        raise HTTPException(status_code=404, detail=NOTIFICATION_NOT_FOUND_MSG)
 
     # Viewer-role users can only see delivery logs for notifications where they are recipients
     if current_user.role == UserRole.VIEWER:
@@ -542,7 +546,7 @@ def get_responses(
     # Fetch the notification first to check permissions
     notification = db.query(Notification).filter(Notification.id == notification_id).first()
     if not notification:
-        raise HTTPException(status_code=404, detail="Notification not found")
+        raise HTTPException(status_code=404, detail=NOTIFICATION_NOT_FOUND_MSG)
 
     # Viewer-role users can only see responses for notifications where they are recipients
     if current_user.role == UserRole.VIEWER:
@@ -578,6 +582,52 @@ def get_responses(
     return result
 
 
+
+async def _resolve_response_user(
+    db: Session, request, token: Optional[str], notification_id: int
+):
+    """Resolve the responding user from either a checkin token or an auth header."""
+    from app.utils.checkin_link import verify_checkin_token
+    from fastapi.security import HTTPBearer
+    from app.core.security import decode_token
+
+    if token:
+        payload = verify_checkin_token(token)
+        if not payload:
+            raise HTTPException(status_code=400, detail="Invalid or expired token")
+        if payload.get('notification_id') != notification_id:
+            raise HTTPException(status_code=400, detail="Token does not match this notification")
+        user_id = payload.get('user_id')
+        # Token links are SINGLE-USE — reject if already responded
+        if db.query(NRModel).filter(
+            NRModel.notification_id == notification_id,
+            NRModel.user_id == user_id
+        ).first():
+            raise HTTPException(
+                status_code=400,
+                detail="You have already submitted your safety response. Contact administrator if you need to change it."
+            )
+        user = db.query(User).filter(User.id == user_id).first()
+        return user_id, (user.email if user else None)
+
+    # Auth-header path
+    bearer = HTTPBearer(auto_error=False)
+    credentials = await bearer(request)
+    if not credentials:
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required - provide JWT token (from email/SMS link) or log in"
+        )
+    payload = decode_token(credentials.credentials, token_type="access")
+    if not payload or payload.get("type") != "access":
+        raise HTTPException(status_code=401, detail="Invalid token")
+    user_id_str = payload.get("sub")
+    user = db.query(User).filter(User.id == int(user_id_str), User.is_active == True).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    return user.id, user.email
+
+
 @notifications_router.post("/{notification_id}/respond")
 async def submit_response(
     notification_id: int,
@@ -598,69 +648,13 @@ async def submit_response(
     
     notification = db.query(Notification).filter(Notification.id == notification_id).first()
     if not notification:
-        raise HTTPException(status_code=404, detail="Notification not found")
+        raise HTTPException(status_code=404, detail=NOTIFICATION_NOT_FOUND_MSG)
     
     # Determine user from token or current_user
-    user_id = None
-    user_email = None
-    
-    if token:
-        # Token-based authentication (from email/SMS link) - NO CSRF REQUIRED
-        payload = verify_checkin_token(token)
-        if not payload:
-            raise HTTPException(status_code=400, detail="Invalid or expired token")
-        
-        # Verify token matches notification
-        if payload.get('notification_id') != notification_id:
-            raise HTTPException(status_code=400, detail="Token does not match this notification")
-        
-        user_id = payload.get('user_id')
-        
-        # SECURITY: Check if user already responded via token
-        # Token links are SINGLE-USE only - prevent response manipulation
-        existing_response = db.query(NRModel).filter(
-            NRModel.notification_id == notification_id,
-            NRModel.user_id == user_id
-        ).first()
-        
-        if existing_response:
-            raise HTTPException(
-                status_code=400, 
-                detail="You have already submitted your safety response. Contact administrator if you need to change it."
-            )
-        
-        # Get user email for the response record
-        user = db.query(User).filter(User.id == user_id).first()
-        if user:
-            user_email = user.email
-        else:
-            user_email = None
-    else:
-        # Try to get authenticated user (requires Authorization header + CSRF token)
-        # Use Security with HTTPBearer - will raise if no auth header
-        bearer = HTTPBearer(auto_error=False)
-        credentials = await bearer(request)
-        
-        if not credentials:
-            raise HTTPException(
-                status_code=401, 
-                detail="Authentication required - provide JWT token (from email/SMS link) or log in"
-            )
-        
-        # Manually get user from token
-        from app.core.security import decode_token
-        payload = decode_token(credentials.credentials, token_type="access")
-        if not payload or payload.get("type") != "access":
-            raise HTTPException(status_code=401, detail="Invalid token")
-        
-        user_id = payload.get("sub")
-        # Check is_enabled (account status) NOT is_online (presence)
-        user = db.query(User).filter(User.id == int(user_id), User.is_enabled == True).first()
-        if not user:
-            raise HTTPException(status_code=401, detail="User not found or account disabled")
-        
-        user_id = user.id
-        user_email = user.email
+    user_id, user_email = await _resolve_response_user(
+        db=db, request=request, token=token,
+        notification_id=notification_id
+    )
 
     # Use database row-level locking to prevent race conditions
     # Lock the notification row to prevent concurrent response creation
