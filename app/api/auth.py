@@ -129,17 +129,22 @@ def format_lockout_time(seconds: int) -> str:
     """Format lockout duration in human-readable format."""
     if seconds < 60:
         return f"{seconds} seconds"
-    elif seconds < 3600:
-        mins = seconds // 60
+    
+    mins = seconds // 60
+    if mins < 60:
         return f"{mins} minute{'s' if mins > 1 else ''}"
-    elif seconds < 86400:
-        hours = seconds // 3600
-        mins = (seconds % 3600) // 60
-        if mins > 0:
-            return f"{hours} hour{'s' if hours > 1 else ''} {mins} minute{'s' if mins > 1 else ''}"
-        return f"{hours} hour{'s' if hours > 1 else ''}"
-    days = seconds // 86400
-    return f"{days} day{'s' if days > 1 else ''}"
+    
+    hours = mins // 60
+    remaining_mins = mins % 60
+    
+    if hours >= 24:
+        days = hours // 24
+        return f"{days} day{'s' if days > 1 else ''}"
+    
+    if remaining_mins > 0:
+        return f"{hours} hour{'s' if hours > 1 else ''} {remaining_mins} minute{'s' if remaining_mins > 1 else ''}"
+    
+    return f"{hours} hour{'s' if hours > 1 else ''}"
 
 
 def _generate_challenge_token(user_id: int) -> str:
@@ -682,6 +687,130 @@ async def entra_callback(
     return await _entra_callback_success(user, request, response, db)
 
 
+# ─── LDAP LOGIN HELPER FUNCTIONS ─────────────────────────────────────────────
+
+async def _check_ldap_ip_lockout(client_ip: str) -> None:
+    """Check IP rate limit for LDAP login and raise HTTPException if locked."""
+    if await is_ip_locked(client_ip):
+        logger.warning(f"IP lockout for LDAP login from {client_ip}")
+        from app.services.rate_limiter import _ip_lock_key, _get_client
+        r = _get_client()
+        ttl_seconds = await r.ttl(_ip_lock_key(client_ip))
+        
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={
+                "message": "Too many login attempts from this IP. Please try again later.",
+                "retry_after_seconds": max(0, ttl_seconds),
+                "retry_after": format_lockout_time(max(0, ttl_seconds))
+            },
+            headers={"Retry-After": str(max(0, ttl_seconds))}
+        )
+
+
+async def _handle_ldap_auth_failure(client_ip: str) -> None:
+    """Handle failed LDAP authentication with rate limiting."""
+    await record_ip_failure(client_ip)
+    
+    from app.services.rate_limiter import _ip_fail_key, _get_client
+    r = _get_client()
+    ip_fail_count = await r.get(_ip_fail_key(client_ip)) or 0
+    ip_remaining = max(0, IP_RATE_LIMIT_MAX_ATTEMPTS - int(ip_fail_count))
+    
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail={
+            "message": INVALID_CREDENTIALS_MSG,
+            "remaining_attempts": ip_remaining,
+            "lockout_threshold": IP_RATE_LIMIT_MAX_ATTEMPTS
+        }
+    )
+
+
+def _check_ldap_email_domain(email: str) -> bool:
+    """Check if LDAP user email domain is allowed."""
+    if not settings.ALLOWED_EMAIL_DOMAINS:
+        return True
+    
+    allowed = [d.strip().lower() for d in settings.ALLOWED_EMAIL_DOMAINS.split(",") if d.strip()]
+    email_domain = email.split("@")[-1]
+    return not allowed or email_domain in allowed
+
+
+def _find_or_provision_ldap_user(db: Session, ldap_user: dict) -> User:
+    """Find existing user or provision new LDAP user."""
+    user = db.query(User).filter(func.lower(User.email) == ldap_user["email"].lower()).first()
+    
+    if user:
+        if user.auth_provider != "ldap":
+            user.auth_provider = "ldap"
+            user.external_id = ldap_user["dn"]
+        if ldap_user.get("first_name"):
+            user.first_name = ldap_user["first_name"]
+        if ldap_user.get("last_name"):
+            user.last_name = ldap_user["last_name"]
+        return user
+    
+    if not settings.AUTO_PROVISION_USERS:
+        raise HTTPException(status_code=403, detail="Account not found. Contact your administrator.")
+    
+    user = User(
+        email=ldap_user["email"],
+        hashed_password=None,
+        first_name=ldap_user.get("first_name") or "User",
+        last_name=ldap_user.get("last_name") or ".",
+        role=UserRole.VIEWER,
+        auth_provider="ldap",
+        external_id=ldap_user["dn"],
+        is_verified=True,
+    )
+    db.add(user)
+    db.flush()
+    logger.info(f"JIT provisioned LDAP user: {user.email}")
+    return user
+
+
+async def _ldap_login_success(user: User, request: Request, response: Response, db: Session) -> LoginSuccessResponse:
+    """Create LDAP login success response with tokens."""
+    from app.core.security import create_access_token, create_refresh_token
+    
+    access_token = create_access_token({"sub": str(user.id), "role": user.role})
+    refresh_token_str = create_refresh_token({"sub": str(user.id)})
+    
+    rt = RefreshToken(
+        user_id=user.id,
+        token=refresh_token_str,
+        expires_at=datetime.now(timezone.utc) + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
+    )
+    db.add(rt)
+    
+    user.last_login = datetime.now(timezone.utc)
+    user.last_seen_at = datetime.now(timezone.utc)
+    user.is_online = True
+    user.is_enabled = True
+    
+    db.add(create_audit_log(
+        user_id=user.id,
+        user_email=user.email,
+        action="login_ldap",
+        resource_type="user",
+        resource_id=user.id,
+        request=request,
+    ))
+    db.commit()
+    
+    _set_refresh_cookie(response, refresh_token_str, settings.REFRESH_TOKEN_EXPIRE_DAYS)
+    
+    return LoginSuccessResponse(
+        status="success",
+        access_token=access_token,
+        token_type="bearer",
+        user=UserResponse.model_validate(user),
+        refresh_token=refresh_token_str,
+    )
+
+
+# ─── LDAP LOGIN ENDPOINT ─────────────────────────────────────────────────────
 @router.post("/ldap/login")
 async def ldap_login(
     request: Request,
