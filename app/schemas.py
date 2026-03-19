@@ -1,5 +1,5 @@
 import re
-from pydantic import BaseModel, EmailStr, Field, validator, field_validator, constr
+from pydantic import BaseModel, EmailStr, Field, validator, field_validator, constr, ConfigDict
 from typing import Optional, List, Any, Dict, Union
 from datetime import datetime
 from app.models import (
@@ -51,6 +51,14 @@ NAME_FIELD_MAX_LENGTH = 100
 MAX_PAGE_SIZE = 100
 DEFAULT_PAGE_SIZE = 20
 
+# Validation error messages
+COORDINATES_NAN_ERROR = "Coordinates cannot be NaN or Infinity"
+CODE_REQUIRED_MSG = "Code is required"
+CODE_FORMAT_MSG = "Code must be exactly 6 digits"
+TOTP_DESCRIPTION = "6-digit TOTP code from authenticator app"
+CURRENT_PASSWORD_DESCRIPTION = "Current password for reauthentication"
+CURRENT_PASSWORD_REQUIRED_MSG = "Current password is required"
+
 
 # ─── AUTH ─────────────────────────────────────────────────────────────────────
 
@@ -65,6 +73,7 @@ class LoginRequest(BaseModel):
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
+    expires_in: int = 3600  # Token expiry in seconds (default 1 hour)
     user: "UserResponse"
     refresh_token: Optional[str] = None  # For cross-origin deployments (Vercel + Railway)
 
@@ -117,7 +126,7 @@ class MFASetupConfirmRequest(BaseModel):
         min_length=MFA_CODE_LENGTH,
         max_length=MFA_CODE_LENGTH,
         pattern=MFA_CODE_PATTERN,
-        description="6-digit TOTP code from authenticator app"
+        description=TOTP_DESCRIPTION
     )
 
     @field_validator("code")
@@ -125,10 +134,10 @@ class MFASetupConfirmRequest(BaseModel):
     def validate_code_format(cls, v):
         """Ensure code contains only digits and is exactly 6 digits."""
         if not v or not isinstance(v, str):
-            raise ValueError("Code is required")
+            raise ValueError(CODE_REQUIRED_MSG)
         code = v.strip()
-        if not re.match(r"^\d{6}$", code):
-            raise ValueError("Code must be exactly 6 digits")
+        if not re.match(MFA_CODE_PATTERN, code):
+            raise ValueError(CODE_FORMAT_MSG)
         return code
 
 
@@ -160,6 +169,7 @@ class LoginSuccessResponse(BaseModel):
     status: str = "success"
     access_token: str
     token_type: str = "bearer"
+    expires_in: int = 3600  # Token expiry in seconds (default 1 hour)
     user: "UserResponse"
     refresh_token: Optional[str] = None  # For cross-origin deployments (Vercel + Railway)
     recovery_codes: Optional[List[str]] = None  # Only present on first MFA setup
@@ -194,7 +204,7 @@ class MFAVerifyLoginRequest(BaseModel):
         min_length=MFA_CODE_LENGTH,
         max_length=MFA_CODE_LENGTH,
         pattern=MFA_CODE_PATTERN,
-        description="6-digit TOTP code from authenticator app"
+        description=TOTP_DESCRIPTION
     )
 
     @field_validator("code")
@@ -202,10 +212,10 @@ class MFAVerifyLoginRequest(BaseModel):
     def validate_code_format(cls, v):
         """Ensure code contains only digits and is exactly 6 digits."""
         if not v or not isinstance(v, str):
-            raise ValueError("Code is required")
+            raise ValueError(CODE_REQUIRED_MSG)
         code = v.strip()
-        if not re.match(r"^\d{6}$", code):
-            raise ValueError("Code must be exactly 6 digits")
+        if not re.match(MFA_CODE_PATTERN, code):
+            raise ValueError(CODE_FORMAT_MSG)
         return code
 
 
@@ -250,8 +260,8 @@ class MFARecoveryCodeStatus(BaseModel):
     """Status of user's recovery codes."""
     has_codes: bool
     unused_count: int
-    batch_id: Optional[str]
-    codes_generated_at: Optional[datetime]
+    batch_id: Optional[str] = None
+    codes_generated_at: Optional[datetime] = None
 
 
 class MFARegenerateRecoveryCodesRequest(BaseModel):
@@ -273,7 +283,7 @@ class MFARegenerateRecoveryCodesRequest(BaseModel):
         ...,
         min_length=1,
         max_length=PASSWORD_MAX_LENGTH,
-        description="Current password for reauthentication"
+        description=CURRENT_PASSWORD_DESCRIPTION
     )
     method: str = Field(
         default="totp",
@@ -297,7 +307,7 @@ class MFARegenerateRecoveryCodesRequest(BaseModel):
     @classmethod
     def validate_password_not_empty(cls, v):
         if not v or not v.strip():
-            raise ValueError("Current password is required")
+            raise ValueError(CURRENT_PASSWORD_REQUIRED_MSG)
         return v
 
     @field_validator("method")
@@ -315,7 +325,7 @@ class MFARegenerateRecoveryCodesRequest(BaseModel):
             if not v or not isinstance(v, str):
                 raise ValueError("MFA code is required for TOTP method")
             code = v.strip()
-            if not re.match(r"^\d{6}$", code):
+            if not re.match(MFA_CODE_PATTERN, code):
                 raise ValueError("MFA code must be exactly 6 digits")
         return v
 
@@ -352,14 +362,14 @@ class MFAEnrollStartRequest(BaseModel):
         ...,
         min_length=1,
         max_length=PASSWORD_MAX_LENGTH,
-        description="Current password for reauthentication"
+        description=CURRENT_PASSWORD_DESCRIPTION
     )
 
     @field_validator("current_password")
     @classmethod
     def validate_password_not_empty(cls, v):
         if not v or not v.strip():
-            raise ValueError("Current password is required")
+            raise ValueError(CURRENT_PASSWORD_REQUIRED_MSG)
         return v
 
 
@@ -379,7 +389,7 @@ class MFAEnrollConfirmRequest(BaseModel):
         min_length=MFA_CODE_LENGTH,
         max_length=MFA_CODE_LENGTH,
         pattern=MFA_CODE_PATTERN,
-        description="6-digit TOTP code from authenticator app"
+        description=TOTP_DESCRIPTION
     )
 
     @field_validator("code")
@@ -387,10 +397,10 @@ class MFAEnrollConfirmRequest(BaseModel):
     def validate_code_format(cls, v):
         """Ensure code contains only digits and is exactly 6 digits."""
         if not v or not isinstance(v, str):
-            raise ValueError("Code is required")
+            raise ValueError(CODE_REQUIRED_MSG)
         code = v.strip()
-        if not re.match(r"^\d{6}$", code):
-            raise ValueError("Code must be exactly 6 digits")
+        if not re.match(MFA_CODE_PATTERN, code):
+            raise ValueError(CODE_FORMAT_MSG)
         return code
 
 
@@ -407,7 +417,7 @@ class MFADisableRequest(BaseModel):
         ...,
         min_length=1,
         max_length=PASSWORD_MAX_LENGTH,
-        description="Current password for reauthentication"
+        description=CURRENT_PASSWORD_DESCRIPTION
     )
     mfa_code: str = Field(
         ...,
@@ -420,7 +430,7 @@ class MFADisableRequest(BaseModel):
     @classmethod
     def validate_password_not_empty(cls, v):
         if not v or not v.strip():
-            raise ValueError("Current password is required")
+            raise ValueError(CURRENT_PASSWORD_REQUIRED_MSG)
         return v
 
     @field_validator("mfa_code")
@@ -447,7 +457,7 @@ class MFAResetStartRequest(BaseModel):
         ...,
         min_length=1,
         max_length=PASSWORD_MAX_LENGTH,
-        description="Current password for reauthentication"
+        description=CURRENT_PASSWORD_DESCRIPTION
     )
     mfa_code: str = Field(
         ...,
@@ -460,7 +470,7 @@ class MFAResetStartRequest(BaseModel):
     @classmethod
     def validate_password_not_empty(cls, v):
         if not v or not v.strip():
-            raise ValueError("Current password is required")
+            raise ValueError(CURRENT_PASSWORD_REQUIRED_MSG)
         return v
 
 
@@ -471,7 +481,7 @@ class MFAResetConfirmRequest(BaseModel):
         min_length=MFA_CODE_LENGTH,
         max_length=MFA_CODE_LENGTH,
         pattern=MFA_CODE_PATTERN,
-        description="6-digit TOTP code from authenticator app"
+        description=TOTP_DESCRIPTION
     )
 
     @field_validator("code")
@@ -479,10 +489,10 @@ class MFAResetConfirmRequest(BaseModel):
     def validate_code_format(cls, v):
         """Ensure code contains only digits and is exactly 6 digits."""
         if not v or not isinstance(v, str):
-            raise ValueError("Code is required")
+            raise ValueError(CODE_REQUIRED_MSG)
         code = v.strip()
-        if not re.match(r"^\d{6}$", code):
-            raise ValueError("Code must be exactly 6 digits")
+        if not re.match(MFA_CODE_PATTERN, code):
+            raise ValueError(CODE_FORMAT_MSG)
         return code
 
 
@@ -500,7 +510,7 @@ class MFAReauthenticateRequest(BaseModel):
     @validator("current_password")
     def validate_password_not_empty(cls, v):
         if not v or not v.strip():
-            raise ValueError("Current password is required")
+            raise ValueError(CURRENT_PASSWORD_REQUIRED_MSG)
         return v
 
 
@@ -627,6 +637,8 @@ class UserCreate(BaseModel):
 
 
 class UserUpdate(BaseModel):
+    model_config = ConfigDict(extra='ignore')
+    
     first_name: Optional[str] = Field(
         None,
         min_length=1,
@@ -722,14 +734,15 @@ class UserResponse(BaseModel):
     first_name: str
     last_name: str
     full_name: str
-    phone: Optional[str]
-    department: Optional[str]
-    title: Optional[str]
-    employee_id: Optional[str]
+    phone: Optional[str] = None
+    department: Optional[str] = None
+    title: Optional[str] = None
+    employee_id: Optional[str] = None
     role: UserRole
-    is_active: bool
-    location_id: Optional[int]
-    preferred_channels: Optional[List[str]]
+    is_enabled: Optional[bool] = None  # Account enabled status
+    is_online: Optional[bool] = None   # Real-time online presence (heartbeat)
+    location_id: Optional[int] = None
+    preferred_channels: Optional[List[str]] = None
     created_at: datetime
 
     class Config:
@@ -749,7 +762,7 @@ class CSVImportResponse(BaseModel):
     failed: int
     errors: List[str]
     # List of newly created users (passwords excluded for security, sent via email)
-    created_users: List[dict] = []  # [{email, first_name, last_name}, ...]
+    created_users: Optional[List[dict]] = None  # [{email, first_name, last_name}, ...]
 
 
 class UserBulkDeleteResponse(BaseModel):
@@ -786,7 +799,7 @@ class LocationCreate(BaseModel):
         if v is not None:
             import math
             if math.isnan(v) or math.isinf(v):
-                raise ValueError("Coordinates cannot be NaN or Infinity")
+                raise ValueError(COORDINATES_NAN_ERROR)
         return v
 
 
@@ -809,20 +822,20 @@ class LocationUpdate(BaseModel):
         if v is not None:
             import math
             if math.isnan(v) or math.isinf(v):
-                raise ValueError("Coordinates cannot be NaN or Infinity")
+                raise ValueError(COORDINATES_NAN_ERROR)
         return v
 
 
 class LocationResponse(BaseModel):
     id: int
     name: str
-    address: Optional[str]
-    city: Optional[str]
-    state: Optional[str]
-    zip_code: Optional[str]
+    address: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[str] = None
+    zip_code: Optional[str] = None
     country: str
-    latitude: Optional[float]
-    longitude: Optional[float]
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
     geofence_radius_miles: float
     is_active: bool
     user_count: Optional[int] = 0
@@ -840,7 +853,7 @@ class GroupCreate(BaseModel):
     type: GroupType = GroupType.STATIC
     location_id: Optional[int] = None
     dynamic_filter: Optional[dict] = None
-    member_ids: Optional[List[int]] = []
+    member_ids: Optional[List[int]] = None
 
 
 class GroupUpdate(BaseModel):
@@ -859,10 +872,10 @@ class GroupMemberAdd(BaseModel):
 class GroupResponse(BaseModel):
     id: int
     name: str
-    description: Optional[str]
+    description: Optional[str] = None
     type: GroupType
-    location_id: Optional[int]
-    dynamic_filter: Optional[dict]
+    location_id: Optional[int] = None
+    dynamic_filter: Optional[dict] = None
     is_active: bool
     member_count: int
     created_at: datetime
@@ -901,11 +914,11 @@ class TemplateUpdate(BaseModel):
 class TemplateResponse(BaseModel):
     id: int
     name: str
-    category: Optional[str]
-    subject: Optional[str]
+    category: Optional[str] = None
+    subject: Optional[str] = None
     body: str
     channels: List[str]
-    variables: Optional[List[dict]]
+    variables: Optional[List[dict]] = None
     is_active: bool
     created_at: datetime
 
@@ -933,13 +946,13 @@ class IncidentUpdate(BaseModel):
 class IncidentResponse(BaseModel):
     id: int
     title: str
-    type: Optional[str]
+    type: Optional[str] = None
     severity: IncidentSeverity
     status: IncidentStatus
-    description: Optional[str]
-    location_id: Optional[int]
+    description: Optional[str] = None
+    location_id: Optional[int] = None
     created_by_id: int
-    resolved_at: Optional[datetime]
+    resolved_at: Optional[datetime] = None
     created_at: datetime
 
     class Config:
@@ -956,8 +969,8 @@ class NotificationCreate(BaseModel):
     subject: Optional[str] = None
     channels: List[AlertChannel]
     target_all: bool = False
-    target_group_ids: Optional[List[int]] = []
-    target_user_ids: Optional[List[int]] = []
+    target_group_ids: Optional[List[int]] = None
+    target_user_ids: Optional[List[int]] = None
     scheduled_at: Optional[datetime] = None
     scheduled_timezone: Optional[str] = None  # Timezone for scheduled time (e.g., "America/New_York")
     response_required: bool = False
@@ -968,15 +981,15 @@ class NotificationCreate(BaseModel):
 
 class NotificationResponse(BaseModel):
     id: int
-    incident_id: Optional[int]
+    incident_id: Optional[int] = None
     title: str
     message: str
-    subject: Optional[str]
+    subject: Optional[str] = None
     channels: List[str]
     status: NotificationStatus
     target_all: bool
-    scheduled_at: Optional[datetime]
-    sent_at: Optional[datetime]
+    scheduled_at: Optional[datetime] = None
+    sent_at: Optional[datetime] = None
     total_recipients: int
     sent_count: int
     delivered_count: int
@@ -1035,21 +1048,21 @@ class NotificationResponseCreate(BaseModel):
         if v is not None:
             import math
             if math.isnan(v) or math.isinf(v):
-                raise ValueError("Coordinates cannot be NaN or Infinity")
+                raise ValueError(COORDINATES_NAN_ERROR)
         return v
 
 
 class NotificationResponseOut(BaseModel):
     id: int
     notification_id: int
-    user_id: Optional[int]
-    user_email: Optional[str]
-    user_name: Optional[str]
-    channel: Optional[AlertChannel]
+    user_id: Optional[int] = None
+    user_email: Optional[str] = None
+    user_name: Optional[str] = None
+    channel: Optional[AlertChannel] = None
     response_type: ResponseType
-    message: Optional[str]
-    latitude: Optional[float]
-    longitude: Optional[float]
+    message: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
     responded_at: datetime
 
     class Config:
@@ -1075,12 +1088,12 @@ class DashboardStats(BaseModel):
 class IncomingMessageResponse(BaseModel):
     id: Union[int, str]  # Can be int for SMS or string for voice responses (e.g., "voice_7")
     from_number: str
-    body: Optional[str]
+    body: Optional[str] = None
     channel: AlertChannel
-    user_id: Optional[int]
-    user_email: Optional[str]
-    user_name: Optional[str]
-    notification_id: Optional[int]
+    user_id: Optional[int] = None
+    user_email: Optional[str] = None
+    user_name: Optional[str] = None
+    notification_id: Optional[int] = None
     is_processed: bool
     received_at: datetime
 

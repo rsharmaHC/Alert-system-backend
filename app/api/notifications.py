@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Request
 from sqlalchemy.orm import Session
 from sqlalchemy import desc, update
-from typing import Optional, List
+from typing import Annotated, Optional, List
 from datetime import datetime, timezone
 import logging
 from app.database import get_db
@@ -28,7 +28,90 @@ from app.services.rate_limiter import (
     API_RATE_LIMIT_MAX,
 )
 
+# ─── ERROR MESSAGE CONSTANTS ──────────────────────────────────────────────────
+NOTIFICATION_NOT_FOUND_MSG = "Notification not found"
+
+
 logger = logging.getLogger(__name__)
+
+# ─── ROUTERS ──────────────────────────────────────────────────────────────────
+# Define routers first before any route decorators use them
+notifications_router = APIRouter(prefix="/notifications", tags=["Notifications"])
+incidents_router = APIRouter(prefix="/incidents", tags=["Incidents"])
+
+
+def _apply_viewer_notification_filter(query, current_user):
+    """Restrict notification query to only records the viewer is a recipient of."""
+    if current_user.role != UserRole.VIEWER:
+        return query
+    from sqlalchemy import or_
+    return query.filter(
+        or_(
+            Notification.target_all == True,
+            Notification.target_users.any(User.id == current_user.id),
+            Notification.target_groups.any(Group.members.any(User.id == current_user.id)),
+        )
+    )
+
+
+def _notification_to_dict(item) -> dict:
+    """Serialize a Notification model to a JSON-safe dict."""
+    return {
+        "id": item.id,
+        "incident_id": item.incident_id,
+        "title": item.title,
+        "message": item.message,
+        "subject": item.subject,
+        "channels": item.channels,
+        "status": item.status.value if item.status else None,
+        "target_all": item.target_all,
+        "scheduled_at": item.scheduled_at.isoformat() if item.scheduled_at else None,
+        "sent_at": item.sent_at.isoformat() if item.sent_at else None,
+        "total_recipients": item.total_recipients,
+        "sent_count": item.sent_count,
+        "delivered_count": item.delivered_count,
+        "failed_count": item.failed_count,
+        "response_required": item.response_required,
+        "response_deadline_minutes": item.response_deadline_minutes,
+        "created_by_id": item.created_by_id,
+        "created_at": item.created_at.isoformat() if item.created_at else None,
+    }
+
+
+def _assert_notification_recipient_access(notification, current_user) -> None:
+    """Raise 403 if a VIEWER is not a recipient of the given notification."""
+    if current_user.role == UserRole.VIEWER:
+        is_recipient = (
+            notification.target_all
+            or any(u.id == current_user.id for u in notification.target_users)
+            or any(
+                g.members and any(m.id == current_user.id for m in g.members)
+                for g in notification.target_groups
+            )
+        )
+        if not is_recipient:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied. You can only view notifications where you are a recipient.",
+            )
+
+
+def _build_response_out(r) -> NotificationResponseOut:
+    """Build a NotificationResponseOut from a NotificationResponse ORM row."""
+    return NotificationResponseOut(
+        id=r.id,
+        notification_id=r.notification_id,
+        user_id=r.user_id,
+        user_email=r.user_email,
+        user_name=r.user.full_name if r.user else r.from_number,
+        channel=r.channel,
+        response_type=r.response_type,
+        message=r.message,
+        latitude=r.latitude,
+        longitude=r.longitude,
+        responded_at=r.responded_at,
+    )
+
 
 # ─── INCIDENT STATUS TRANSITIONS ──────────────────────────────────────────────
 
@@ -65,16 +148,13 @@ def _validate_incident_status_transition(
 
 # ─── INCIDENTS ────────────────────────────────────────────────────────────────
 
-incidents_router = APIRouter(prefix="/incidents", tags=["Incidents"])
-
-
 @incidents_router.get("", response_model=List[IncidentResponse])
 def list_incidents(
-    status: Optional[IncidentStatus] = None,
-    severity: Optional[IncidentSeverity] = None,
-    limit: int = Query(20, ge=1, le=100),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    status: Annotated[Optional[IncidentStatus], Query()] = None,
+    severity: Annotated[Optional[IncidentSeverity], Query()] = None,
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    db: Annotated[Session, Depends(get_db)] = None,
+    current_user: Annotated[User, Depends(get_current_user)] = None
 ):
     """List incidents with optional filtering by status and severity.
 
@@ -94,8 +174,8 @@ def list_incidents(
 @incidents_router.post("", response_model=IncidentResponse, status_code=201)
 def create_incident(
     data: IncidentCreate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(require_manager),
+    db: Annotated[Session, Depends(get_db)] = None,
+    current_user: Annotated[User, Depends(require_manager)] = None,
     request: Request = None,
 ):
     incident = Incident(**data.model_dump(), created_by_id=current_user.id)
@@ -113,12 +193,19 @@ def create_incident(
     return incident
 
 
-@incidents_router.put("/{incident_id}", response_model=IncidentResponse)
+@incidents_router.put(
+    "/{incident_id}",
+    response_model=IncidentResponse,
+    responses={
+        400: {"description": "Bad Request - Invalid status transition"},
+        404: {"description": "Not Found - Incident does not exist"},
+    }
+)
 def update_incident(
     incident_id: int,
     data: IncidentUpdate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(require_manager)
+    db: Annotated[Session, Depends(get_db)] = None,
+    current_user: Annotated[User, Depends(require_manager)] = None
 ):
     incident = db.query(Incident).filter(Incident.id == incident_id).first()
     if not incident:
@@ -147,11 +234,17 @@ def update_incident(
     return incident
 
 
-@incidents_router.get("/{incident_id}", response_model=IncidentResponse)
+@incidents_router.get(
+    "/{incident_id}",
+    response_model=IncidentResponse,
+    responses={
+        404: {"description": "Not Found - Incident does not exist"},
+    }
+)
 def get_incident(
     incident_id: int,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    db: Annotated[Session, Depends(get_db)] = None,
+    current_user: Annotated[User, Depends(get_current_user)] = None
 ):
     incident = db.query(Incident).filter(Incident.id == incident_id).first()
     if not incident:
@@ -159,146 +252,65 @@ def get_incident(
     return incident
 
 
-# ─── NOTIFICATIONS ────────────────────────────────────────────────────────────
+# ─── NOTIFICATION CREATION HELPERS ───────────────────────────────────────────
 
-notifications_router = APIRouter(prefix="/notifications", tags=["Notifications"])
-
-
-@notifications_router.get("", response_model=dict)
-def list_notifications(
-    page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100),
-    incident_id: Optional[int] = None,
-    status: Optional[NotificationStatus] = None,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """List notifications with optional filtering.
-    
-    Access Control:
-        - Manager and Admin roles: Can see all notifications
-        - Viewer role: Can only see notifications where they are recipients
-    """
-    query = db.query(Notification)
-    
-    # Viewer-role users can only see notifications where they are recipients
-    if current_user.role == UserRole.VIEWER:
-        # Show notifications where: target_all=True OR user is in target_users OR user is in target_groups
-        from sqlalchemy import or_
-        query = query.filter(
-            or_(
-                Notification.target_all == True,
-                Notification.target_users.any(User.id == current_user.id),
-                Notification.target_groups.any(Group.members.any(User.id == current_user.id))
-            )
-        )
-    
-    if incident_id:
-        query = query.filter(Notification.incident_id == incident_id)
-    if status:
-        query = query.filter(Notification.status == status)
-
-    # Get total count
-    total = query.count()
-
-    # Get paginated results and convert to dict
-    items = query.order_by(desc(Notification.created_at)).offset((page - 1) * page_size).limit(page_size).all()
-    
-    # Convert SQLAlchemy models to dict for JSON serialization
-    items_data = []
-    for item in items:
-        items_data.append({
-            "id": item.id,
-            "incident_id": item.incident_id,
-            "title": item.title,
-            "message": item.message,
-            "subject": item.subject,
-            "channels": item.channels,
-            "status": item.status.value if item.status else None,
-            "target_all": item.target_all,
-            "scheduled_at": item.scheduled_at.isoformat() if item.scheduled_at else None,
-            "sent_at": item.sent_at.isoformat() if item.sent_at else None,
-            "total_recipients": item.total_recipients,
-            "sent_count": item.sent_count,
-            "delivered_count": item.delivered_count,
-            "failed_count": item.failed_count,
-            "response_required": item.response_required,
-            "response_deadline_minutes": item.response_deadline_minutes,
-            "created_by_id": item.created_by_id,
-            "created_at": item.created_at.isoformat() if item.created_at else None,
-        })
-    
-    return {"items": items_data, "total": total, "page": page, "page_size": page_size}
-
-
-@notifications_router.post("", response_model=NotificationResponse, status_code=201)
-async def create_notification(
-    data: NotificationCreate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(require_manager),
-    request: Request = None,
-):
-    # Rate limiting 1: Check general API rate limit for state-changing operations
-    is_allowed, retry_after = await check_api_rate_limit(current_user.id, "create_notification")
-    if not is_allowed:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=f"Rate limit exceeded. Maximum {API_RATE_LIMIT_MAX} requests per minute for this endpoint.",
-            headers={"Retry-After": str(retry_after)}
-        )
-    
-    # Rate limiting 2: Check notification-specific dispatch limit
-    is_allowed, retry_after = await check_notification_rate_limit(current_user.id)
-    if not is_allowed:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=f"Rate limit exceeded. Maximum {NOTIFICATION_RATE_LIMIT_MAX} notifications per minute.",
-            headers={"Retry-After": str(retry_after)}
-        )
-    
-    # Record both rate limit counters
-    await record_api_request(current_user.id, "create_notification")
-    await record_notification_dispatch(current_user.id)
-
-    # Validate at least one recipient method
+def _validate_recipients(data: NotificationCreate) -> None:
+    """Validate that at least one recipient method is specified."""
     if not data.target_all and not data.target_group_ids and not data.target_user_ids:
-        raise HTTPException(status_code=400, detail="Must specify recipients: target_all, groups, or users")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Must specify recipients: target_all, groups, or users"
+        )
 
-    # Validate webhook URLs to prevent SSRF attacks
+
+def _validate_webhook_urls(data: NotificationCreate) -> None:
+    """Validate webhook URLs to prevent SSRF attacks."""
     if data.slack_webhook_url and not _is_safe_url(data.slack_webhook_url):
         raise HTTPException(
-            status_code=400,
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid Slack webhook URL. URLs must use HTTP/HTTPS and cannot point to internal/private addresses"
         )
     if data.teams_webhook_url and not _is_safe_url(data.teams_webhook_url):
         raise HTTPException(
-            status_code=400,
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid Teams webhook URL. URLs must use HTTP/HTTPS and cannot point to internal/private addresses"
         )
 
-    # Validate timezone if provided
+
+def _convert_scheduled_time_to_utc(data: NotificationCreate) -> tuple:
+    """Convert scheduled time from local timezone to UTC.
+    
+    Returns:
+        tuple: (scheduled_at_utc, scheduled_timezone)
+    """
     scheduled_timezone = data.scheduled_timezone
     scheduled_at_utc = data.scheduled_at
-    
+
     if data.scheduled_at and scheduled_timezone:
-        # Convert scheduled time from local timezone to UTC
         try:
-            import pytz
-            local_tz = pytz.timezone(scheduled_timezone)
-            # Assume the incoming datetime is naive (no timezone) and localize it
-            local_dt = local_tz.localize(data.scheduled_at)
-            # Convert to UTC
-            scheduled_at_utc = local_dt.astimezone(pytz.UTC)
+            from zoneinfo import ZoneInfo
+            local_tz = ZoneInfo(scheduled_timezone)
+            local_dt = data.scheduled_at.replace(tzinfo=local_tz)
+            scheduled_at_utc = local_dt.astimezone(timezone.utc)
         except Exception as e:
             logger.warning(f"Invalid timezone '{scheduled_timezone}', using UTC: {e}")
             scheduled_at_utc = data.scheduled_at.replace(tzinfo=timezone.utc)
             scheduled_timezone = "UTC"
     elif data.scheduled_at and not scheduled_timezone:
-        # Assume UTC if no timezone provided
         scheduled_at_utc = data.scheduled_at.replace(tzinfo=timezone.utc)
         scheduled_timezone = "UTC"
 
-    notification = Notification(
+    return scheduled_at_utc, scheduled_timezone
+
+
+def _create_notification_record(
+    data: NotificationCreate,
+    scheduled_at_utc: datetime,
+    scheduled_timezone: str,
+    current_user: User
+) -> Notification:
+    """Create a Notification ORM object from validated data."""
+    return Notification(
         incident_id=data.incident_id,
         template_id=data.template_id,
         title=data.title,
@@ -313,10 +325,16 @@ async def create_notification(
         slack_webhook_url=data.slack_webhook_url,
         teams_webhook_url=data.teams_webhook_url,
         created_by_id=current_user.id,
-        # Set status to SENDING for immediate send, SCHEDULED for future
         status=NotificationStatus.SCHEDULED if data.scheduled_at else NotificationStatus.SENDING
     )
 
+
+def _assign_notification_recipients(
+    db: Session,
+    notification: Notification,
+    data: NotificationCreate
+) -> None:
+    """Assign target groups and users to notification."""
     if data.target_group_ids:
         groups = db.query(Group).filter(Group.id.in_(data.target_group_ids)).all()
         notification.target_groups = groups
@@ -325,6 +343,121 @@ async def create_notification(
         users = db.query(User).filter(User.id.in_(data.target_user_ids)).all()
         notification.target_users = users
 
+
+@notifications_router.get("", response_model=dict)
+def list_notifications(
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=100)] = 20,
+    incident_id: Annotated[Optional[int], Query()] = None,
+    status: Annotated[Optional[NotificationStatus], Query()] = None,
+    db: Annotated[Session, Depends(get_db)] = None,
+    current_user: Annotated[User, Depends(get_current_user)] = None
+):
+    """List notifications with optional filtering.
+
+    Access Control:
+        - Manager and Admin roles: Can see all notifications
+        - Viewer role: Can only see notifications where they are recipients
+    """
+    query = _apply_viewer_notification_filter(db.query(Notification), current_user)
+    if incident_id:
+        query = query.filter(Notification.incident_id == incident_id)
+    if status:
+        query = query.filter(Notification.status == status)
+    total = query.count()
+    items = query.order_by(desc(Notification.created_at)).offset((page - 1) * page_size).limit(page_size).all()
+    return {"items": [_notification_to_dict(item) for item in items], "total": total, "page": page, "page_size": page_size}
+
+
+# ─── NOTIFICATIONS ────────────────────────────────────────────────────────────
+
+@notifications_router.post(
+    "",
+    response_model=NotificationResponse,
+    status_code=201,
+    responses={
+        400: {
+            "description": "Bad Request - Invalid input data",
+            "content": {
+                "application/json": {
+                    "example": {"detail": "Must specify recipients: target_all, groups, or users"}
+                }
+            }
+        },
+        404: {
+            "description": "Not Found - Referenced incident or template not found",
+            "content": {
+                "application/json": {
+                    "example": {"detail": "Incident not found"}
+                }
+            }
+        },
+        429: {
+            "description": "Too Many Requests - Rate limit exceeded",
+            "content": {
+                "application/json": {
+                    "example": {"detail": "Rate limit exceeded. Maximum 10 notifications per minute."}
+                }
+            }
+        },
+    }
+)
+async def create_notification(
+    data: NotificationCreate,
+    db: Annotated[Session, Depends(get_db)] = None,
+    current_user: Annotated[User, Depends(require_manager)] = None,
+    request: Request = None,
+):
+    """Create a new notification.
+
+    Args:
+        data: Notification creation data
+        db: Database session
+        current_user: Authenticated manager user
+        request: HTTP request for audit logging
+
+    Returns:
+        Created notification with status SENDING (immediate) or SCHEDULED (future)
+
+    Raises:
+        HTTPException: 400 - Invalid recipients or webhook URLs
+        HTTPException: 404 - Referenced incident/template not found
+        HTTPException: 429 - Rate limit exceeded
+    """
+    # Rate limiting checks
+    is_allowed, retry_after = await check_api_rate_limit(current_user.id, "create_notification")
+    if not is_allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Rate limit exceeded. Maximum {API_RATE_LIMIT_MAX} requests per minute for this endpoint.",
+            headers={"Retry-After": str(retry_after)}
+        )
+
+    is_allowed, retry_after = await check_notification_rate_limit(current_user.id)
+    if not is_allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Rate limit exceeded. Maximum {NOTIFICATION_RATE_LIMIT_MAX} notifications per minute.",
+            headers={"Retry-After": str(retry_after)}
+        )
+
+    await record_api_request(current_user.id, "create_notification")
+    await record_notification_dispatch(current_user.id)
+
+    # Validate input
+    _validate_recipients(data)
+    _validate_webhook_urls(data)
+
+    # Convert scheduled time to UTC
+    scheduled_at_utc, scheduled_timezone = _convert_scheduled_time_to_utc(data)
+
+    # Create notification record
+    notification = _create_notification_record(data, scheduled_at_utc, scheduled_timezone, current_user)
+
+    # Assign recipients
+    _assign_notification_recipients(db, notification, data)
+
+    # Save to database
     db.add(notification)
     db.add(create_audit_log(
         user_id=current_user.id,
@@ -337,10 +470,10 @@ async def create_notification(
     db.commit()
     db.refresh(notification)
 
-    # Record this dispatch for rate limiting
+    # Record dispatch for rate limiting
     await record_notification_dispatch(current_user.id)
 
-    # Send immediately if not scheduled (task will change status to SENT when complete)
+    # Send immediately if not scheduled
     if not data.scheduled_at:
         send_notification_task.delay(
             notification.id,
@@ -351,15 +484,23 @@ async def create_notification(
     return notification
 
 
-@notifications_router.post("/{notification_id}/send", response_model=NotificationResponse)
+@notifications_router.post(
+    "/{notification_id}/send",
+    response_model=NotificationResponse,
+    responses={
+        400: {"description": "Bad Request - Cannot send notification in current state"},
+        404: {"description": "Not Found - Notification does not exist"},
+        429: {"description": "Too Many Requests - Rate limit exceeded"},
+    }
+)
 async def send_notification(
     notification_id: int,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(require_manager),
+    db: Annotated[Session, Depends(get_db)] = None,
+    current_user: Annotated[User, Depends(require_manager)] = None,
     request: Request = None,
 ):
     """Manually trigger a draft notification.
-    
+
     Rate Limit: Maximum 10 notifications per minute per user.
     """
     # Rate limiting: Check if user has exceeded notification dispatch limit
@@ -373,7 +514,7 @@ async def send_notification(
 
     notification = db.query(Notification).filter(Notification.id == notification_id).first()
     if not notification:
-        raise HTTPException(status_code=404, detail="Notification not found")
+        raise HTTPException(status_code=404, detail=NOTIFICATION_NOT_FOUND_MSG)
     if notification.status not in [NotificationStatus.DRAFT, NotificationStatus.SCHEDULED]:
         raise HTTPException(status_code=400, detail=f"Cannot send notification in {notification.status} state")
 
@@ -400,15 +541,21 @@ async def send_notification(
     return notification
 
 
-@notifications_router.post("/{notification_id}/cancel")
+@notifications_router.post(
+    "/{notification_id}/cancel",
+    responses={
+        400: {"description": "Bad Request - Can only cancel draft or scheduled notifications"},
+        404: {"description": "Not Found - Notification does not exist"},
+    }
+)
 def cancel_notification(
     notification_id: int,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(require_manager)
+    db: Annotated[Session, Depends(get_db)] = None,
+    current_user: Annotated[User, Depends(require_manager)] = None
 ):
     notification = db.query(Notification).filter(Notification.id == notification_id).first()
     if not notification:
-        raise HTTPException(status_code=404, detail="Notification not found")
+        raise HTTPException(status_code=404, detail=NOTIFICATION_NOT_FOUND_MSG)
     if notification.status not in [NotificationStatus.DRAFT, NotificationStatus.SCHEDULED]:
         raise HTTPException(status_code=400, detail="Can only cancel draft or scheduled notifications")
     notification.status = NotificationStatus.CANCELLED
@@ -416,11 +563,18 @@ def cancel_notification(
     return {"message": "Notification cancelled"}
 
 
-@notifications_router.get("/{notification_id}", response_model=NotificationDetailResponse)
+@notifications_router.get(
+    "/{notification_id}",
+    response_model=NotificationDetailResponse,
+    responses={
+        403: {"description": "Forbidden - Viewer is not a recipient of this notification"},
+        404: {"description": "Not Found - Notification does not exist"},
+    }
+)
 def get_notification(
     notification_id: int,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    db: Annotated[Session, Depends(get_db)] = None,
+    current_user: Annotated[User, Depends(get_current_user)] = None
 ):
     """Get notification details.
     
@@ -430,7 +584,7 @@ def get_notification(
     """
     notification = db.query(Notification).filter(Notification.id == notification_id).first()
     if not notification:
-        raise HTTPException(status_code=404, detail="Notification not found")
+        raise HTTPException(status_code=404, detail=NOTIFICATION_NOT_FOUND_MSG)
     
     # Viewer-role users can only see notifications where they are recipients
     if current_user.role == UserRole.VIEWER:
@@ -455,15 +609,22 @@ def get_notification(
     return result
 
 
-@notifications_router.get("/{notification_id}/delivery", response_model=List[DeliveryLogResponse])
+@notifications_router.get(
+    "/{notification_id}/delivery",
+    response_model=List[DeliveryLogResponse],
+    responses={
+        403: {"description": "Forbidden - Viewer is not a recipient of this notification"},
+        404: {"description": "Not Found - Notification does not exist"},
+    }
+)
 def get_delivery_logs(
     notification_id: int,
-    channel: Optional[AlertChannel] = None,
-    status: Optional[DeliveryStatus] = None,
-    limit: int = Query(100, ge=1, le=1000),
-    offset: int = Query(0, ge=0),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    channel: Annotated[Optional[AlertChannel], Query()] = None,
+    status: Annotated[Optional[DeliveryStatus], Query()] = None,
+    limit: Annotated[int, Query(ge=1, le=1000)] = 100,
+    offset: Annotated[int, Query(ge=0)] = 0,
+    db: Annotated[Session, Depends(get_db)] = None,
+    current_user: Annotated[User, Depends(get_current_user)] = None
 ):
     """Get delivery logs for a notification with optional filtering.
 
@@ -481,7 +642,7 @@ def get_delivery_logs(
     # Fetch the notification first to check permissions
     notification = db.query(Notification).filter(Notification.id == notification_id).first()
     if not notification:
-        raise HTTPException(status_code=404, detail="Notification not found")
+        raise HTTPException(status_code=404, detail=NOTIFICATION_NOT_FOUND_MSG)
 
     # Viewer-role users can only see delivery logs for notifications where they are recipients
     if current_user.role == UserRole.VIEWER:
@@ -520,13 +681,20 @@ def get_delivery_logs(
     return result
 
 
-@notifications_router.get("/{notification_id}/responses", response_model=List[NotificationResponseOut])
+@notifications_router.get(
+    "/{notification_id}/responses",
+    response_model=List[NotificationResponseOut],
+    responses={
+        403: {"description": "Forbidden - Viewer is not a recipient of this notification"},
+        404: {"description": "Not Found - Notification does not exist"},
+    }
+)
 def get_responses(
     notification_id: int,
-    limit: int = Query(100, ge=1, le=1000),
-    offset: int = Query(0, ge=0),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    limit: Annotated[int, Query(ge=1, le=1000)] = 100,
+    offset: Annotated[int, Query(ge=0)] = 0,
+    db: Annotated[Session, Depends(get_db)] = None,
+    current_user: Annotated[User, Depends(get_current_user)] = None
 ):
     """Get notification responses.
 
@@ -539,127 +707,95 @@ def get_responses(
         limit: Maximum number of results (1-1000, default 100)
         offset: Number of results to skip (default 0)
     """
-    # Fetch the notification first to check permissions
     notification = db.query(Notification).filter(Notification.id == notification_id).first()
     if not notification:
-        raise HTTPException(status_code=404, detail="Notification not found")
+        raise HTTPException(status_code=404, detail=NOTIFICATION_NOT_FOUND_MSG)
+    _assert_notification_recipient_access(notification, current_user)
+    responses = db.query(NRModel).filter(NRModel.notification_id == notification_id).all()
+    return [_build_response_out(r) for r in responses]
 
-    # Viewer-role users can only see responses for notifications where they are recipients
-    if current_user.role == UserRole.VIEWER:
-        from sqlalchemy import or_
-        is_recipient = (
-            notification.target_all or
-            any(u.id == current_user.id for u in notification.target_users) or
-            any(g.members and any(m.id == current_user.id for m in g.members) for g in notification.target_groups)
-        )
-        if not is_recipient:
+
+
+async def _resolve_response_user(
+    db: Session, request, token: Optional[str], notification_id: int
+):
+    """Resolve the responding user from either a checkin token or an auth header."""
+    from app.utils.checkin_link import verify_checkin_token
+    from fastapi.security import HTTPBearer
+    from app.core.security import decode_token
+
+    if token:
+        payload = verify_checkin_token(token)
+        if not payload:
+            raise HTTPException(status_code=400, detail="Invalid or expired token")
+        if payload.get('notification_id') != notification_id:
+            raise HTTPException(status_code=400, detail="Token does not match this notification")
+        user_id = payload.get('user_id')
+        # Token links are SINGLE-USE — reject if already responded
+        if db.query(NRModel).filter(
+            NRModel.notification_id == notification_id,
+            NRModel.user_id == user_id
+        ).first():
             raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Access denied. You can only view responses for notifications where you are a recipient."
+                status_code=400,
+                detail="You have already submitted your safety response. Contact administrator if you need to change it."
             )
+        user = db.query(User).filter(User.id == user_id).first()
+        return user_id, (user.email if user else None)
 
-    query = db.query(NRModel).filter(NRModel.notification_id == notification_id)
-    responses = query.all()
-    result = []
-    for r in responses:
-        result.append(NotificationResponseOut(
-            id=r.id,
-            notification_id=r.notification_id,
-            user_id=r.user_id,
-            user_email=r.user_email,
-            user_name=r.user.full_name if r.user else r.from_number,
-            channel=r.channel,
-            response_type=r.response_type,
-            message=r.message,
-            latitude=r.latitude,
-            longitude=r.longitude,
-            responded_at=r.responded_at
-        ))
-    return result
+    # Auth-header path
+    bearer = HTTPBearer(auto_error=False)
+    credentials = await bearer(request)
+    if not credentials:
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required - provide JWT token (from email/SMS link) or log in"
+        )
+    payload = decode_token(credentials.credentials, token_type="access")
+    if not payload or payload.get("type") != "access":
+        raise HTTPException(status_code=401, detail="Invalid token")
+    user_id_str = payload.get("sub")
+    user = db.query(User).filter(User.id == int(user_id_str), User.is_active == True).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    return user.id, user.email
 
 
-@notifications_router.post("/{notification_id}/respond")
+@notifications_router.post(
+    "/{notification_id}/respond",
+    responses={
+        400: {"description": "Bad Request - Invalid/expired token, token mismatch, or user already responded"},
+        401: {"description": "Unauthorized - Authentication required or invalid token"},
+        404: {"description": "Not Found - Notification does not exist"},
+        500: {"description": "Internal Server Error - Failed to record response"},
+    }
+)
 async def submit_response(
     notification_id: int,
     data: NotificationResponseCreate,
     token: Optional[str] = None,
-    db: Session = Depends(get_db),
+    db: Annotated[Session, Depends(get_db)] = None,
     request: Request = None
 ):
     """
     Employee submits their safety response via the web portal.
-    
+
     Two modes:
     1. Authenticated: Logged-in user responding to their own notification (Authorization header)
     2. Token-based: User clicking link from email/SMS (JWT token query param, no auth header)
     """
     from app.utils.checkin_link import verify_checkin_token
     from fastapi.security import HTTPBearer
-    
+
     notification = db.query(Notification).filter(Notification.id == notification_id).first()
     if not notification:
-        raise HTTPException(status_code=404, detail="Notification not found")
+        raise HTTPException(status_code=404, detail=NOTIFICATION_NOT_FOUND_MSG)
     
     # Determine user from token or current_user
-    user_id = None
-    user_email = None
-    
-    if token:
-        # Token-based authentication (from email/SMS link) - NO CSRF REQUIRED
-        payload = verify_checkin_token(token)
-        if not payload:
-            raise HTTPException(status_code=400, detail="Invalid or expired token")
-        
-        # Verify token matches notification
-        if payload.get('notification_id') != notification_id:
-            raise HTTPException(status_code=400, detail="Token does not match this notification")
-        
-        user_id = payload.get('user_id')
-        
-        # SECURITY: Check if user already responded via token
-        # Token links are SINGLE-USE only - prevent response manipulation
-        existing_response = db.query(NRModel).filter(
-            NRModel.notification_id == notification_id,
-            NRModel.user_id == user_id
-        ).first()
-        
-        if existing_response:
-            raise HTTPException(
-                status_code=400, 
-                detail="You have already submitted your safety response. Contact administrator if you need to change it."
-            )
-        
-        # Get user email for the response record
-        user = db.query(User).filter(User.id == user_id).first()
-        if user:
-            user_email = user.email
-        else:
-            user_email = None
-    else:
-        # Try to get authenticated user (requires Authorization header + CSRF token)
-        # Use Security with HTTPBearer - will raise if no auth header
-        bearer = HTTPBearer(auto_error=False)
-        credentials = await bearer(request)
-        
-        if not credentials:
-            raise HTTPException(
-                status_code=401, 
-                detail="Authentication required - provide JWT token (from email/SMS link) or log in"
-            )
-        
-        # Manually get user from token
-        from app.core.security import decode_token
-        payload = decode_token(credentials.credentials, token_type="access")
-        if not payload or payload.get("type") != "access":
-            raise HTTPException(status_code=401, detail="Invalid token")
-        
-        user_id = payload.get("sub")
-        user = db.query(User).filter(User.id == int(user_id), User.is_active == True).first()
-        if not user:
-            raise HTTPException(status_code=401, detail="User not found")
-        
-        user_id = user.id
-        user_email = user.email
+    user_id, user_email = await _resolve_response_user(
+        db=db, request=request, token=token,
+        notification_id=notification_id
+    )
 
     # Use database row-level locking to prevent race conditions
     # Lock the notification row to prevent concurrent response creation

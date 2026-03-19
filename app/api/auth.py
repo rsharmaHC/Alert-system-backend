@@ -2,13 +2,15 @@ import secrets
 import time
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, status, Request, Query, Response
+from typing import Annotated, Optional
+from fastapi import APIRouter, Depends, HTTPException, status, Request, Query, Response, Body
+from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import desc, func
 import redis
+import json
 from app.database import get_db
-from app.models import User, RefreshToken, LoginAttempt
+from app.models import User, RefreshToken, LoginAttempt, UserRole
 from app.schemas import (
     LoginRequest, TokenResponse, UserResponse,
     PasswordResetRequest, PasswordResetConfirm, ChangePasswordRequest,
@@ -51,6 +53,14 @@ from app.services.security_notifications import notify_suspicious_login, notify_
 from app.config import settings
 from app.utils.audit import create_audit_log
 
+# ─── ERROR MESSAGE CONSTANTS ──────────────────────────────────────────────────
+INVALID_CREDENTIALS_MFA_MSG = "Invalid credentials or MFA code"
+INVALID_CREDENTIALS_RECOVERY_MSG = "Invalid credentials or recovery code"
+INVALID_CREDENTIALS_MSG = "Invalid credentials"
+PASSWORD_RESET_SENT_MSG = "If an account exists with that email, a password reset link has been sent"
+IP_LOCKOUT_MSG = "Too many login attempts from this IP. Please try again later."
+
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
@@ -88,34 +98,29 @@ IP_RATE_LIMIT_WINDOW_SECONDS = 600  # 10 minutes
 MFA_CHALLENGE_EXPIRE_SECONDS = 300  # 5 minutes to complete MFA verification
 
 
+def _get_samesite_policy(is_production: bool) -> str:
+    """Return the SameSite cookie policy based on environment.
+
+    SameSite=None for cross-origin (Vercel → Railway in prod).
+    SameSite=Lax for same-origin localhost in development.
+    """
+    return "none" if is_production else "lax"
+
+
 def _set_refresh_cookie(response: Response, token: str, expire_days: int) -> None:
     """
     Attach the refresh token as an HttpOnly cookie on a FastAPI Response object.
 
-    NOTE: For cross-origin deployments (Vercel + Railway), cookies are set but
-    browsers may block them. Frontend should also accept refresh_token in response body.
-
-    Security properties:
-    - HttpOnly: JS cannot read it — eliminates XSS token theft
-    - Secure: HTTPS only — never sent over plain HTTP
-    - SameSite=None: Required for cross-origin cookie usage
-    - Path=/api/v1/auth: cookie only sent to auth endpoints
-
-    In development mode, secure=False so localhost works without HTTPS.
+    Security: HttpOnly (no XSS), Secure (HTTPS only), SameSite per environment.
+    Path restricted to /api/v1/auth so cookie is not sent to other endpoints.
     """
     is_production = settings.APP_ENV != "development"
-
-    # SameSite=None is required for cross-origin cookie usage (Vercel → Railway).
-    # In development (same-origin localhost), SameSite=Lax is sufficient and avoids
-    # ZAP's "Cookie with SameSite Attribute None" alert.
-    # Secure=True is always set — modern browsers accept Secure cookies on localhost,
-    # and ZAP flags Secure=False as "Cookie Without Secure Flag" regardless of scheme.
     response.set_cookie(
         key="refresh_token",
         value=token,
         httponly=True,
         secure=True,
-        samesite="none" if is_production else "lax",
+        samesite=_get_samesite_policy(is_production),
         path="/api/v1/auth",
         max_age=expire_days * 86400,
     )
@@ -125,17 +130,22 @@ def format_lockout_time(seconds: int) -> str:
     """Format lockout duration in human-readable format."""
     if seconds < 60:
         return f"{seconds} seconds"
-    elif seconds < 3600:
-        mins = seconds // 60
+    
+    mins = seconds // 60
+    if mins < 60:
         return f"{mins} minute{'s' if mins > 1 else ''}"
-    elif seconds < 86400:
-        hours = seconds // 3600
-        mins = (seconds % 3600) // 60
-        if mins > 0:
-            return f"{hours} hour{'s' if hours > 1 else ''} {mins} minute{'s' if mins > 1 else ''}"
-        return f"{hours} hour{'s' if hours > 1 else ''}"
-    days = seconds // 86400
-    return f"{days} day{'s' if days > 1 else ''}"
+    
+    hours = mins // 60
+    remaining_mins = mins % 60
+    
+    if hours >= 24:
+        days = hours // 24
+        return f"{days} day{'s' if days > 1 else ''}"
+    
+    if remaining_mins > 0:
+        return f"{hours} hour{'s' if hours > 1 else ''} {remaining_mins} minute{'s' if remaining_mins > 1 else ''}"
+    
+    return f"{hours} hour{'s' if hours > 1 else ''}"
 
 
 def _generate_challenge_token(user_id: int) -> str:
@@ -342,6 +352,37 @@ def check_account_lockout(user_id: int) -> tuple[bool, int]:
     return True, 0
 
 
+def _parse_attempt_count(r, key: str, user_id: int) -> int:
+    """Parse the current attempt count from Redis, deleting malformed keys."""
+    data = r.get(key)
+    if data is None:
+        return 0
+    try:
+        parts = data.split("|")
+        if len(parts) != 2:
+            logger.warning(f"Malformed lockout data for user {user_id}: wrong format, resetting counter")
+            r.delete(key)
+            return 0
+        return int(parts[0])
+    except (ValueError, IndexError) as e:
+        logger.warning(f"Malformed lockout data for user {user_id}: {e}, resetting counter")
+        r.delete(key)
+        return 0
+
+
+def _calculate_lockout_seconds(attempt_count: int) -> int:
+    """Return lockout duration in seconds based on exponential backoff tiers."""
+    if attempt_count < ACCOUNT_LOCKOUT_THRESHOLD:
+        return 0
+    if attempt_count < 10:
+        return 60    # 1st tier: 5-9 fails → 1 minute
+    if attempt_count < 15:
+        return 300   # 2nd tier: 10-14 fails → 5 minutes
+    if attempt_count < 20:
+        return 900   # 3rd tier: 15-19 fails → 15 minutes
+    return 3600      # 4th+ tier: 20+ fails → 1 hour
+
+
 def record_failed_login(user_id: int) -> int:
     """
     Record a failed login attempt and apply lockout if threshold reached.
@@ -353,52 +394,14 @@ def record_failed_login(user_id: int) -> int:
     - 4th+ lockout (20+ fails) → 1 hour
 
     Returns the retry_after seconds if locked out, 0 otherwise.
-    
-    Parsing is safe: malformed data is logged, deleted, and treated as 0 attempts.
     """
     r = _get_redis_client()
     key = f"lockout:account:{user_id}"
 
-    data = r.get(key)
-    if data is None:
-        attempt_count = 0
-    else:
-        # Safe parsing: handle malformed data gracefully
-        try:
-            parts = data.split("|")
-            if len(parts) != 2:
-                logger.warning(f"Malformed lockout data for user {user_id}: wrong format, resetting counter")
-                r.delete(key)
-                attempt_count = 0
-            else:
-                attempt_count = int(parts[0])
-        except (ValueError, IndexError) as e:
-            # Malformed data - log, delete corrupted key, reset counter
-            logger.warning(f"Malformed lockout data for user {user_id}: {e}, resetting counter")
-            r.delete(key)
-            attempt_count = 0
-
-    attempt_count += 1
-    
-    # Determine lockout duration based on attempt count tier
-    lockout_seconds = 0
-    if attempt_count >= ACCOUNT_LOCKOUT_THRESHOLD:
-        if attempt_count < 10:
-            # 1st lockout tier: 5-9 fails → 1 minute
-            lockout_seconds = 60
-        elif attempt_count < 15:
-            # 2nd lockout tier: 10-14 fails → 5 minutes
-            lockout_seconds = 300
-        elif attempt_count < 20:
-            # 3rd lockout tier: 15-19 fails → 15 minutes
-            lockout_seconds = 900
-        else:
-            # 4th+ lockout tier: 20+ fails → 1 hour
-            lockout_seconds = 3600
-    
+    attempt_count = _parse_attempt_count(r, key, user_id) + 1
+    lockout_seconds = _calculate_lockout_seconds(attempt_count)
     lockout_until = int(time.time()) + lockout_seconds if lockout_seconds > 0 else 0
     r.setex(key, max(lockout_seconds, 86400), f"{attempt_count}|{lockout_until}")
-    
     return lockout_seconds if lockout_seconds > 0 else 0
 
 
@@ -411,192 +414,186 @@ def reset_account_lockout(user_id: int) -> None:
     r.delete(key)
 
 
-@router.post("/login")
-async def login(request: LoginRequest, req: Request, response: Response, db: Session = Depends(get_db)):
+@router.get("/providers")
+def get_auth_providers():
+    """Return the list of enabled authentication providers.
+
+    This is a public endpoint (no auth required) so the login page
+    can show the correct login buttons before the user is authenticated.
     """
-    Authenticate user with email and password.
-    
-    Response varies based on MFA status:
-    - LoginSuccessResponse: Authentication complete, tokens issued
-    - LoginMFASetupResponse: MFA required but not configured, setup needed
-    - LoginMFAChallengeResponse: MFA required and configured, OTP needed
-    
-    No tokens are issued until MFA verification completes (if required).
+    providers = [p.strip().lower() for p in settings.AUTH_PROVIDERS.split(",") if p.strip()]
+
+    result = {
+        "providers": providers,
+        "entra_enabled": "entra" in providers and settings.ENTRA_ENABLED,
+        "ldap_enabled": "ldap" in providers and settings.LDAP_ENABLED,
+        "local_enabled": "local" in providers,
+    }
+
+    # Include Entra tenant info for frontend redirect (non-sensitive)
+    if result["entra_enabled"]:
+        result["entra_tenant_id"] = settings.ENTRA_TENANT_ID
+        result["entra_client_id"] = settings.ENTRA_CLIENT_ID
+
+    return result
+
+
+@router.get(
+    "/entra/login",
+    responses={
+        403: {"description": "Forbidden - Entra ID authentication is not enabled"},
+        500: {"description": "Internal Server Error - Entra ID is not properly configured"},
+    }
+)
+async def entra_login():
+    """Redirect user to Microsoft Entra ID login page.
+
+    Initiates OAuth 2.0 Authorization Code flow with PKCE.
+    Stores state, nonce, and PKCE verifier in Redis for callback verification.
     """
-    client_ip = _get_client_ip(req)
+    if not settings.ENTRA_ENABLED or "entra" not in settings.AUTH_PROVIDERS.lower():
+        raise HTTPException(status_code=403, detail="Entra ID authentication is not enabled")
 
-    # Normalize email to prevent case-based lockout bypass
-    # e.g., "Admin@Site.com" vs "admin@site.com" must hit the same lockout counter
-    normalized_email = request.email.strip().lower()
+    from app.services.entra_auth import get_entra_service
+    entra = get_entra_service()
+    if not entra.is_configured:
+        raise HTTPException(status_code=500, detail="Entra ID is not properly configured")
 
-    # STEP 1: Check IP-based rate limit FIRST (before any user lookup)
-    # This prevents enumeration attacks and applies across ALL accounts
-    if await is_ip_locked(client_ip):
-        logger.warning(f"IP lockout for {client_ip}")
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Too many login attempts. Please try again later.",
-        )
+    # Generate PKCE, state, and nonce
+    state = entra.generate_state()
+    code_verifier, code_challenge = entra.generate_pkce_pair()
+    nonce = entra.generate_nonce()
 
-    # STEP 2: Look up user by email (case-insensitive)
-    # Use func.lower for case-insensitive comparison to match normalized_email
-    user = db.query(User).filter(
-        func.lower(User.email) == normalized_email
-    ).first()
+    # Store in Redis with 10-minute expiry (time for user to complete Microsoft login)
+    from app.services.rate_limiter import get_redis
+    redis = await get_redis()
+    oauth_data = json.dumps({
+        "code_verifier": code_verifier,
+        "nonce": nonce,
+    })
+    await redis.setex(f"oauth_state:{state}", 600, oauth_data)
 
-    # STEP 3: If user exists, check account lockout
-    # If user doesn't exist, skip account lockout but IP limit still applies
-    if user:
-        if await is_account_locked(user.id):
-            # Record this failed attempt for IP tracking
-            await record_ip_failure(client_ip)
-            logger.warning(f"Account lockout for user {user.id}")
-            raise HTTPException(
-                status_code=status.HTTP_423_LOCKED,
-                detail="Account temporarily locked.",
-            )
+    # Build authorization URL and redirect
+    auth_url = await entra.build_authorization_url(state, code_challenge, nonce)
+    return RedirectResponse(url=auth_url, status_code=302)
 
-    # STEP 4: Validate credentials
-    # If user doesn't exist, treat as invalid credentials (don't reveal)
+
+# ─── ENTRA CALLBACK HELPER FUNCTIONS ─────────────────────────────────────────
+
+def _entra_redirect_error(frontend_url: str, error_code: str, detail: str = "") -> RedirectResponse:
+    """Create error redirect response for Entra callback."""
+    if detail:
+        logger.warning(f"Entra callback error: {error_code} - {detail}")
+    return RedirectResponse(
+        url=f"{frontend_url}/#/login?error={error_code}&detail={detail}",
+        status_code=302,
+    )
+
+
+async def _entra_validate_state(state: str, redis) -> tuple[Optional[dict], Optional[str]]:
+    """Validate Entra OAuth state and return PKCE data. Returns (data, error)."""
+    if not state:
+        return None, "missing_params"
+    
+    oauth_data_raw = await redis.get(f"oauth_state:{state}")
+    if not oauth_data_raw:
+        logger.warning("Entra callback: invalid or expired state parameter")
+        return None, "invalid_state"
+    
+    # Delete state immediately (one-time use)
+    await redis.delete(f"oauth_state:{state}")
+    
+    try:
+        oauth_data = json.loads(oauth_data_raw)
+        return {
+            "code_verifier": oauth_data["code_verifier"],
+            "expected_nonce": oauth_data["nonce"]
+        }, None
+    except (json.JSONDecodeError, KeyError):
+        return None, "corrupted_state"
+
+
+def _check_email_domain(email: str) -> bool:
+    """Check if email domain is allowed. Returns True if allowed."""
+    if not settings.ALLOWED_EMAIL_DOMAINS:
+        return True
+    
+    allowed = [d.strip().lower() for d in settings.ALLOWED_EMAIL_DOMAINS.split(",") if d.strip()]
+    email_domain = email.split("@")[-1]
+    return not allowed or email_domain in allowed
+
+
+def _find_or_provision_user(db: Session, user_info: dict, request: Request) -> tuple[Optional[User], Optional[str]]:
+    """Find existing user or provision new one. Returns (user, error)."""
+    # Find by external_id or email
+    user = None
+    if user_info.get("external_id"):
+        user = db.query(User).filter(User.external_id == user_info["external_id"]).first()
+    
     if not user:
-        # Record failed attempt for IP tracking
-        await record_ip_failure(client_ip)
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials"
-        )
-
-    # STEP 5: Device fingerprint tracking (if provided)
-    # Track failures per device to detect automated attacks
-    if request.device_fingerprint:
-        device_count = await get_device_failure_count(request.device_fingerprint)
-        if device_count >= 50:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Too many attempts from this device."
-            )
-
-    # STEP 6: Verify password
-    if not verify_password(request.password, user.hashed_password):
-        # Record failed attempt for account lockout escalation and IP tracking
-        count = await redis_record_failed_login(user.id)
-        await record_ip_failure(client_ip)
-
-        # Track device failures if fingerprint provided
-        if request.device_fingerprint:
-            await record_device_failure(request.device_fingerprint)
-
-        # Send security notification email at first lockout threshold (5 failures)
-        # Only send once at count == 5 to avoid spamming user's inbox
-        if count == 5:
-            await notify_suspicious_login(
-                email=user.email,
-                attempt_count=count,
-                ip_address=client_ip,
-                timestamp=datetime.now(timezone.utc).isoformat(),
-            )
-
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials"
-        )
-
-    # STEP 7: Check if MFA is required for this user
-    mfa_required = user_requires_mfa(user)
-
-    if mfa_required:
-        # Check if user has MFA fully configured AND enabled
-        # A user might have mfa_secret from partial setup but mfa_enabled=False
-        mfa_fully_configured = user.mfa_enabled and user.mfa_secret and user.mfa_secret.strip()
-
-        if not mfa_fully_configured:
-            # MFA is required but not fully configured - initiate/re-initiate setup flow
-            # Generate a new secret for this user (overwrites any partial setup)
-            temp_secret = generate_mfa_secret()
-            qr_code_uri = generate_mfa_qr_code_uri(user.email, temp_secret)
-
-            # Encrypt and save the secret to user record (MFA not enabled until confirmed)
-            from app.core.security import encrypt_mfa_secret
-            encrypted_secret = encrypt_mfa_secret(temp_secret)
-            user.mfa_secret = encrypted_secret
-            user.mfa_enabled = False  # Explicitly ensure it's not enabled yet
-            db.add(user)
-            db.commit()
-
-            # Generate challenge token for verification
-            challenge_token = _generate_challenge_token(user.id)
-
-            logger.info(f"MFA setup initiated for privileged user {_log_user_identity(user.id, user.email)}")
-
-            # Return setup information - NO tokens issued yet
-            return LoginMFASetupResponse(
-                status="mfa_required",
-                mfa_required=True,
-                mfa_configured=False,
-                challenge_token=challenge_token,
-                qr_code_uri=qr_code_uri,
-                secret=temp_secret,
-                message="MFA is required for your account. Please scan the QR code with your authenticator app and enter the code to complete login."
-            )
-
-        # MFA is configured and enabled - validate code
-        if not request.mfa_code:
-            # User has MFA configured but didn't provide code - return challenge response
-            challenge_token = _generate_challenge_token(user.id)
-            logger.info(f"MFA challenge issued for {_log_user_identity(user.id, user.email)}")
-
-            return LoginMFAChallengeResponse(
-                status="mfa_required",
-                mfa_required=True,
-                mfa_configured=True,
-                challenge_token=challenge_token,
-                message="Enter your authentication code to continue."
-            )
-
-        # Verify the TOTP code
-        _plain_secret_for_totp = decrypt_mfa_secret(user.mfa_secret) or user.mfa_secret
-        if not verify_totp_code(_plain_secret_for_totp, request.mfa_code):
-            # Invalid MFA code - record as failed attempt
-            count = await redis_record_failed_login(user.id)
-            await record_ip_failure(client_ip)
-
-            # Track device failures if fingerprint provided
-            if request.device_fingerprint:
-                await record_device_failure(request.device_fingerprint)
-
-            logger.warning(f"Invalid MFA code for {_log_user_identity(user.id, user.email)}")
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid credentials or MFA code"
-            )
-
-        # Replay protection — reject reuse within the same 30-second window
-        if is_totp_replay(user, request.mfa_code):
-            logger.warning(f"TOTP replay attempt detected for {_log_user_identity(user.id, user.email)}")
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="TOTP code already used. Please wait for the next code."
-            )
-
-        # Record this code as used — will be committed with the final db.commit()
-        user.last_used_totp_code = request.mfa_code
-        user.last_used_totp_at = datetime.now(timezone.utc)
-        db.add(user)
-
-    # STEP 8: Successful authentication - issue tokens
-    await clear_account_failures(user.id)
-    # Note: Do NOT record IP attempt on success - only failures count toward rate limit
-
-    # Log successful attempt in database (for audit)
-    db.add(LoginAttempt(
-        email=normalized_email,
-        ip_address=client_ip,
-        success=True
+        user = db.query(User).filter(func.lower(User.email) == user_info["email"].lower()).first()
+    
+    if user:
+        # Update existing user
+        if user.auth_provider != "entra":
+            user.auth_provider = "entra"
+            user.external_id = user_info["external_id"]
+            logger.info(f"Linked existing user {user.id} to Entra ID")
+        
+        # Sync attributes
+        if user_info.get("first_name"):
+            user.first_name = user_info["first_name"]
+        if user_info.get("last_name"):
+            user.last_name = user_info["last_name"]
+        
+        return user, None
+    
+    # New user - check auto-provisioning
+    if not settings.AUTO_PROVISION_USERS:
+        logger.warning(f"Entra login for unknown user {user_info['email']} — auto-provisioning disabled")
+        return None, "user_not_found"
+    
+    # JIT provisioning
+    name_parts = user_info["name"].split() if user_info["name"] else []
+    first_name = user_info["first_name"] or (name_parts[0] if name_parts else "User")
+    last_name = user_info["last_name"] or (name_parts[-1] if len(name_parts) > 1 else ".")
+    
+    user = User(
+        email=user_info["email"],
+        hashed_password=None,
+        first_name=first_name,
+        last_name=last_name,
+        role=UserRole.VIEWER,
+        auth_provider="entra",
+        external_id=user_info["external_id"],
+        is_verified=True,
+    )
+    db.add(user)
+    db.flush()
+    
+    logger.info(f"JIT provisioned new Entra user: {user.email} (id={user.id})")
+    
+    db.add(create_audit_log(
+        user_id=user.id,
+        user_email=user.email,
+        action="user_provisioned_sso",
+        resource_type="user",
+        resource_id=user.id,
+        details={"provider": "entra", "external_id": user_info["external_id"]},
+        request=request,
     ))
+    
+    return user, None
 
+
+async def _entra_callback_success(user: User, request: Request, response: Response, db: Session) -> RedirectResponse:
+    """Create success redirect response with tokens."""
+    from app.core.security import create_access_token, create_refresh_token
+    
+    # Issue tokens
     access_token = create_access_token({"sub": str(user.id), "role": user.role})
     refresh_token_str = create_refresh_token({"sub": str(user.id)})
-
+    
     # Save refresh token
     rt = RefreshToken(
         user_id=user.id,
@@ -604,12 +601,493 @@ async def login(request: LoginRequest, req: Request, response: Response, db: Ses
         expires_at=datetime.now(timezone.utc) + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
     )
     db.add(rt)
+    
+    # Update user
+    user.last_login = datetime.now(timezone.utc)
+    user.last_seen_at = datetime.now(timezone.utc)
+    user.is_online = True
+    user.is_enabled = True
+    
+    # Audit log
+    db.add(create_audit_log(
+        user_id=user.id,
+        user_email=user.email,
+        action="login_entra",
+        resource_type="user",
+        resource_id=user.id,
+        details={"provider": "entra"},
+        request=request,
+    ))
+    db.commit()
+    
+    # Set refresh token cookie
+    _set_refresh_cookie(response, refresh_token_str, settings.REFRESH_TOKEN_EXPIRE_DAYS)
+    
+    # Redirect to frontend
+    frontend_url = settings.FRONTEND_URL.rstrip("/")
+    redirect_url = (
+        f"{frontend_url}/auth/callback"
+        f"?access_token={access_token}"
+        f"&refresh_token={refresh_token_str}"
+    )
+    return RedirectResponse(url=redirect_url, status_code=302)
 
+
+# ─── ENTRA CALLBACK ENDPOINT ─────────────────────────────────────────────────
+@router.get("/entra/callback")
+async def entra_callback(
+    request: Request,
+    response: Response,
+    code: Annotated[Optional[str], Query()] = None,
+    state: Annotated[Optional[str], Query()] = None,
+    error: Annotated[Optional[str], Query()] = None,
+    error_description: Annotated[Optional[str], Query()] = None,
+    db: Annotated[Session, Depends(get_db)] = None,
+):
+    """Handle Microsoft Entra ID OAuth callback."""
+    frontend_url = settings.FRONTEND_URL.rstrip("/")
+
+    # Handle Microsoft error response
+    if error:
+        return _entra_redirect_error(frontend_url, "entra_auth_failed", error)
+
+    if not code or not state:
+        return _entra_redirect_error(frontend_url, "missing_params")
+
+    # Validate state and retrieve PKCE data
+    from app.services.rate_limiter import get_redis
+    redis = await get_redis()
+    oauth_data, err = await _entra_validate_state(state, redis)
+    if err:
+        return _entra_redirect_error(frontend_url, err)
+
+    # Exchange code and validate ID token
+    from app.services.entra_auth import get_entra_service
+    entra = get_entra_service()
+
+    try:
+        token_response = await entra.exchange_code_for_tokens(code, oauth_data["code_verifier"])
+        id_token = token_response.get("id_token")
+        if not id_token:
+            raise ValueError("No id_token in token response")
+
+        claims = await entra.validate_id_token(id_token, oauth_data["expected_nonce"])
+        user_info = entra.extract_user_info(claims)
+
+        if not user_info.get("email"):
+            raise ValueError("No email in ID token claims")
+
+    except Exception as e:
+        logger.error(f"Entra callback error: {type(e).__name__}: {e}")
+        return _entra_redirect_error(frontend_url, "entra_auth_failed")
+
+    # Check email domain
+    if not _check_email_domain(user_info["email"]):
+        return _entra_redirect_error(frontend_url, "domain_not_allowed")
+
+    # Find or provision user
+    user, err = _find_or_provision_user(db, user_info, request)
+    if err:
+        return _entra_redirect_error(frontend_url, err)
+
+    # Issue tokens and redirect
+    return await _entra_callback_success(user, request, response, db)
+
+
+# ─── LDAP LOGIN ENDPOINT ─────────────────────────────────────────────────────
+@router.post(
+    "/ldap/login",
+    responses={
+        401: {"description": "Unauthorized - Invalid LDAP credentials"},
+        403: {"description": "Forbidden - LDAP disabled, email domain not allowed, or account not found"},
+        429: {"description": "Too Many Requests - IP address rate limit exceeded"},
+        500: {"description": "Internal Server Error - LDAP service not properly configured"},
+    }
+)
+async def ldap_login(
+    request: Request,
+    response: Response,
+    username: Annotated[str, Body(...)],
+    password: Annotated[str, Body(...)],
+    db: Annotated[Session, Depends(get_db)] = None,
+):
+    """Authenticate with on-prem Active Directory via LDAP."""
+    if not settings.LDAP_ENABLED or "ldap" not in settings.AUTH_PROVIDERS.lower():
+        raise HTTPException(status_code=403, detail="LDAP authentication is not enabled")
+
+    client_ip = _get_client_ip(request)
+
+    if await is_ip_locked(client_ip):
+        await _handle_ldap_ip_lockout(client_ip)
+
+    from app.services.ldap_auth import get_ldap_service
+    ldap_svc = get_ldap_service()
+
+    if not ldap_svc.is_configured:
+        raise HTTPException(status_code=500, detail="LDAP is not properly configured")
+
+    ldap_user = ldap_svc.authenticate(username, password)
+    if not ldap_user:
+        await _handle_ldap_auth_failure(client_ip)
+
+    if not _validate_email_domain(ldap_user["email"]):
+        raise HTTPException(status_code=403, detail="Your email domain is not allowed")
+
+    user = _find_or_create_ldap_user(db, ldap_user)
+
+    return _create_ldap_login_response(user, request, response, db)
+
+
+# ─── LDAP LOGIN HELPER FUNCTIONS ─────────────────────────────────────────────
+
+
+def _create_ldap_login_response(user: User, request: Request, response: Response, db: Session) -> LoginSuccessResponse:
+    """Create LDAP login success response with tokens."""
+    from app.core.security import create_access_token, create_refresh_token
+
+    access_token = create_access_token({"sub": str(user.id), "role": user.role})
+    refresh_token_str = create_refresh_token({"sub": str(user.id)})
+
+    rt = RefreshToken(
+        user_id=user.id,
+        token=refresh_token_str,
+        expires_at=datetime.now(timezone.utc) + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
+    )
+    db.add(rt)
+
+    user.last_login = datetime.now(timezone.utc)
+    user.last_seen_at = datetime.now(timezone.utc)
+    user.is_online = True
+    user.is_enabled = True
+
+    db.add(create_audit_log(
+        user_id=user.id,
+        user_email=user.email,
+        action="login_ldap",
+        resource_type="user",
+        resource_id=user.id,
+        request=request,
+    ))
+    db.commit()
+
+    _set_refresh_cookie(response, refresh_token_str, settings.REFRESH_TOKEN_EXPIRE_DAYS)
+
+    return LoginSuccessResponse(
+        status="success",
+        access_token=access_token,
+        token_type="bearer",
+        user=UserResponse.model_validate(user),
+        refresh_token=refresh_token_str,
+    )
+
+
+# ─── LDAP LOGIN HELPER FUNCTIONS ─────────────────────────────────────────────
+
+
+def _validate_email_domain(email: str) -> bool:
+    """Check if email domain is allowed. Returns True if allowed."""
+    if not settings.ALLOWED_EMAIL_DOMAINS:
+        return True
+
+    allowed = [d.strip().lower() for d in settings.ALLOWED_EMAIL_DOMAINS.split(",") if d.strip()]
+    email_domain = email.split("@")[-1]
+    return not allowed or email_domain in allowed
+
+
+def _provision_ldap_user(db: Session, ldap_user: dict) -> User:
+    """Create a new user from LDAP data with JIT provisioning."""
+    user = User(
+        email=ldap_user["email"],
+        hashed_password=None,
+        first_name=ldap_user["first_name"] or "User",
+        last_name=ldap_user["last_name"] or ".",
+        role=UserRole.VIEWER,
+        auth_provider="ldap",
+        external_id=ldap_user["dn"],
+        is_verified=True,
+    )
+    db.add(user)
+    db.flush()
+    logger.info(f"JIT provisioned LDAP user: {user.email}")
+    return user
+
+
+def _sync_ldap_user_attributes(user: User, ldap_user: dict) -> None:
+    """Sync user attributes from LDAP data."""
+    if user.auth_provider != "ldap":
+        user.auth_provider = "ldap"
+        user.external_id = ldap_user["dn"]
+    if ldap_user["first_name"]:
+        user.first_name = ldap_user["first_name"]
+    if ldap_user["last_name"]:
+        user.last_name = ldap_user["last_name"]
+
+
+def _find_or_create_ldap_user(db: Session, ldap_user: dict) -> User:
+    """Find existing user or create new one from LDAP."""
+    user = db.query(User).filter(func.lower(User.email) == ldap_user["email"].lower()).first()
+
+    if user:
+        _sync_ldap_user_attributes(user, ldap_user)
+        return user
+
+    if not settings.AUTO_PROVISION_USERS:
+        raise HTTPException(status_code=403, detail="Account not found. Contact your administrator.")
+
+    return _provision_ldap_user(db, ldap_user)
+
+
+async def _handle_ldap_ip_lockout(client_ip: str) -> None:
+    """Handle IP lockout for LDAP login and raise HTTPException."""
+    logger.warning(f"IP lockout for LDAP login from {client_ip}")
+
+    from app.services.rate_limiter import _ip_lock_key, _get_client
+    r = _get_client()
+    ttl_seconds = await r.ttl(_ip_lock_key(client_ip))
+
+    raise HTTPException(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        detail={
+            "message": IP_LOCKOUT_MSG,
+            "retry_after_seconds": max(0, ttl_seconds),
+            "retry_after": format_lockout_time(max(0, ttl_seconds))
+        },
+        headers={"Retry-After": str(max(0, ttl_seconds))}
+    )
+
+
+async def _handle_ldap_auth_failure(client_ip: str) -> None:
+    """Handle failed LDAP authentication with rate limiting."""
+    await record_ip_failure(client_ip)
+
+    from app.services.rate_limiter import _ip_fail_key, _get_client
+    r = _get_client()
+    ip_fail_count = await r.get(_ip_fail_key(client_ip)) or 0
+    ip_remaining = max(0, IP_RATE_LIMIT_MAX_ATTEMPTS - int(ip_fail_count))
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail={
+            "message": INVALID_CREDENTIALS_MSG,
+            "remaining_attempts": ip_remaining,
+            "lockout_threshold": IP_RATE_LIMIT_MAX_ATTEMPTS
+        }
+    )
+
+
+async def _handle_login_mfa(user, request, db, client_ip) -> object:
+    """
+    Handle MFA check during login. Returns a response object if MFA is pending,
+    or None if authentication can proceed to token issuance.
+    """
+    from app.core.security import encrypt_mfa_secret, decrypt_mfa_secret
+
+    # Check if MFA is required for this user (by role or explicit enablement)
+    if not user_requires_mfa(user):
+        return None
+
+    # Check if user has MFA secret configured (even if not explicitly enabled)
+    has_mfa_secret = user.mfa_secret and user.mfa_secret.strip()
+    
+    # For privileged roles without MFA setup, force enrollment
+    if not has_mfa_secret:
+        # MFA required but not set up — initiate setup
+        temp_secret = generate_mfa_secret()
+        qr_code_uri = generate_mfa_qr_code_uri(user.email, temp_secret)
+        user.mfa_secret = encrypt_mfa_secret(temp_secret)
+        user.mfa_enabled = False  # Will be set to True after first successful verification
+        db.add(user)
+        db.commit()
+        challenge_token = _generate_challenge_token(user.id)
+        logger.info(f"MFA setup initiated for privileged user {_log_user_identity(user.id, user.email)}")
+        return LoginMFASetupResponse(
+            status="mfa_required",
+            mfa_required=True,
+            mfa_configured=False,
+            challenge_token=challenge_token,
+            qr_code_uri=qr_code_uri,
+            secret=temp_secret,
+            message="MFA is required for your account role. Please scan the QR code with your authenticator app and enter the code to complete login."
+        )
+
+    # User has MFA secret - verify code
+    if not request.mfa_code:
+        # MFA configured but code not provided — issue challenge
+        challenge_token = _generate_challenge_token(user.id)
+        logger.info(f"MFA challenge issued for {_log_user_identity(user.id, user.email)}")
+        return LoginMFAChallengeResponse(
+            status="mfa_required",
+            mfa_required=True,
+            mfa_configured=True,
+            challenge_token=challenge_token,
+            message="Enter your authentication code to continue."
+        )
+
+    # Verify TOTP code
+    plain_secret = decrypt_mfa_secret(user.mfa_secret) or user.mfa_secret
+    if not verify_totp_code(plain_secret, request.mfa_code):
+        await redis_record_failed_login(user.id)
+        await record_ip_failure(client_ip)
+        if request.device_fingerprint:
+            await record_device_failure(request.device_fingerprint)
+        logger.warning(f"Invalid MFA code for {_log_user_identity(user.id, user.email)}")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=INVALID_CREDENTIALS_MFA_MSG)
+
+    if is_totp_replay(user, request.mfa_code):
+        logger.warning(f"TOTP replay attempt detected for {_log_user_identity(user.id, user.email)}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="TOTP code already used. Please wait for the next code."
+        )
+
+    # Mark TOTP code as used
+    user.last_used_totp_code = request.mfa_code
+    user.last_used_totp_at = datetime.now(timezone.utc)
+    db.add(user)
+    return None  # Proceed to token issuance
+
+
+# ─── LOGIN HELPER FUNCTIONS ──────────────────────────────────────────────────
+
+async def _check_ip_rate_limit(client_ip: str) -> None:
+    """Check IP-based rate limit and raise HTTPException if locked."""
+    if await is_ip_locked(client_ip):
+        logger.warning(f"IP lockout for {client_ip}")
+        from app.services.rate_limiter import _ip_lock_key, _get_client
+        r = _get_client()
+        ttl_seconds = await r.ttl(_ip_lock_key(client_ip))
+
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={
+                "message": IP_LOCKOUT_MSG,
+                "retry_after_seconds": max(0, ttl_seconds),
+                "retry_after": format_lockout_time(max(0, ttl_seconds))
+            },
+            headers={"Retry-After": str(max(0, ttl_seconds))}
+        )
+
+
+async def _check_account_lockout(user: User, client_ip: str) -> None:
+    """Check account lockout and raise HTTPException if locked."""
+    if await is_account_locked(user.id):
+        await record_ip_failure(client_ip)
+        logger.warning(f"Account lockout for user {user.id}")
+        
+        from app.services.rate_limiter import _account_lock_key, _get_client
+        r = _get_client()
+        ttl_seconds = await r.ttl(_account_lock_key(user.id))
+        
+        raise HTTPException(
+            status_code=status.HTTP_423_LOCKED,
+            detail={
+                "message": "Account temporarily locked due to too many failed attempts.",
+                "retry_after_seconds": max(0, ttl_seconds),
+                "retry_after": format_lockout_time(max(0, ttl_seconds))
+            },
+        )
+
+
+async def _handle_invalid_credentials(client_ip: str) -> None:
+    """Handle invalid credentials (user not found) case."""
+    await record_ip_failure(client_ip)
+    
+    from app.services.rate_limiter import _ip_fail_key, _get_client
+    r = _get_client()
+    ip_fail_count = await r.get(_ip_fail_key(client_ip)) or 0
+    ip_remaining = max(0, IP_RATE_LIMIT_MAX_ATTEMPTS - int(ip_fail_count))
+    
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail={
+            "message": INVALID_CREDENTIALS_MSG,
+            "remaining_attempts": ip_remaining,
+            "lockout_threshold": IP_RATE_LIMIT_MAX_ATTEMPTS
+        }
+    )
+
+
+async def _handle_invalid_password(
+    user: User, 
+    client_ip: str, 
+    device_fingerprint: Optional[str]
+) -> None:
+    """Handle invalid password case with rate limiting and notifications."""
+    count = await redis_record_failed_login(user.id)
+    await record_ip_failure(client_ip)
+    
+    if device_fingerprint:
+        await record_device_failure(device_fingerprint)
+    
+    # Send security notification at first lockout threshold (5 failures)
+    if count == 5:
+        await notify_suspicious_login(
+            email=user.email,
+            attempt_count=count,
+            ip_address=client_ip,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        )
+    
+    remaining_attempts = max(0, ACCOUNT_LOCKOUT_THRESHOLD - count)
+    
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail={
+            "message": INVALID_CREDENTIALS_MSG,
+            "remaining_attempts": remaining_attempts,
+            "lockout_threshold": ACCOUNT_LOCKOUT_THRESHOLD
+        }
+    )
+
+
+async def _handle_device_fingerprint(device_fingerprint: Optional[str]) -> None:
+    """Check device fingerprint rate limit."""
+    if device_fingerprint:
+        device_count = await get_device_failure_count(device_fingerprint)
+        if device_count >= 50:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Too many attempts from this device."
+            )
+
+
+async def _create_login_success_response(
+    user: User,
+    normalized_email: str,
+    client_ip: str,
+    req: Request,
+    db: Session,
+    response: Response
+) -> LoginSuccessResponse:
+    """Create login success response with tokens."""
+    # Clear account failures on success
+    await clear_account_failures(user.id)
+    
+    # Log successful attempt in database (for audit)
+    db.add(LoginAttempt(
+        email=normalized_email,
+        ip_address=client_ip,
+        success=True
+    ))
+    
+    # Issue tokens
+    access_token = create_access_token({"sub": str(user.id), "role": user.role})
+    refresh_token_str = create_refresh_token({"sub": str(user.id)})
+    
+    # Save refresh token
+    rt = RefreshToken(
+        user_id=user.id,
+        token=refresh_token_str,
+        expires_at=datetime.now(timezone.utc) + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
+    )
+    db.add(rt)
+    
     # Update last login and mark user as online
     user.last_login = datetime.now(timezone.utc)
     user.last_seen_at = datetime.now(timezone.utc)
-    user.is_active = True
-
+    user.is_online = True
+    user.is_enabled = True
+    
     # Audit log
     db.add(create_audit_log(
         user_id=user.id,
@@ -619,22 +1097,100 @@ async def login(request: LoginRequest, req: Request, response: Response, db: Ses
         resource_id=user.id,
         request=req,
     ))
+    
     db.commit()
-
-    # Set refresh token as HttpOnly cookie (for same-origin fallback)
+    
+    # Set refresh token cookie
     _set_refresh_cookie(response, refresh_token_str, settings.REFRESH_TOKEN_EXPIRE_DAYS)
-
+    
     return LoginSuccessResponse(
         status="success",
         access_token=access_token,
         token_type="bearer",
+        expires_in=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,  # Convert minutes to seconds
         user=UserResponse.model_validate(user),
-        refresh_token=refresh_token_str  # For cross-origin deployments (Vercel + Railway)
+        refresh_token=refresh_token_str,
     )
 
 
-@router.post("/refresh", response_model=TokenResponse)
-async def refresh_token(req: Request, response: Response, db: Session = Depends(get_db)):
+# ─── LOGIN ENDPOINT ──────────────────────────────────────────────────────────
+
+
+@router.post(
+    "/login",
+    responses={
+        403: {"description": "Forbidden - Email/password login is disabled"},
+        429: {"description": "Too Many Requests - Rate limit exceeded (IP or account locked)"},
+    }
+)
+async def login(request: LoginRequest, req: Request, response: Response, db: Annotated[Session, Depends(get_db)] = None):
+    """
+    Authenticate user with email and password.
+
+    Response varies based on MFA status:
+    - LoginSuccessResponse: Authentication complete, tokens issued
+    - LoginMFASetupResponse: MFA required but not configured, setup needed
+    - LoginMFAChallengeResponse: MFA required and configured, OTP needed
+
+    No tokens are issued until MFA verification completes (if required).
+    """
+    # Check if local auth is enabled
+    if "local" not in settings.AUTH_PROVIDERS.lower():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Email/password login is disabled. Please use SSO."
+        )
+
+    client_ip = _get_client_ip(req)
+    normalized_email = request.email.strip().lower()
+
+    # STEP 1: Check IP-based rate limit
+    await _check_ip_rate_limit(client_ip)
+
+    # STEP 2: Look up user by email
+    user = db.query(User).filter(func.lower(User.email) == normalized_email).first()
+
+    # STEP 3: Check account lockout (if user exists)
+    if user:
+        await _check_account_lockout(user, client_ip)
+
+    # STEP 4: Validate credentials (user not found case)
+    if not user:
+        await _handle_invalid_credentials(client_ip)
+
+    # STEP 5: Check device fingerprint
+    await _handle_device_fingerprint(request.device_fingerprint)
+
+    # STEP 6: Verify password
+    if not verify_password(request.password, user.hashed_password):
+        await _handle_invalid_password(user, client_ip, request.device_fingerprint)
+
+    # STEP 7: Handle MFA verification
+    mfa_response = await _handle_login_mfa(
+        user=user, request=request, db=db, client_ip=client_ip
+    )
+    if mfa_response is not None:
+        return mfa_response
+
+    # STEP 8: Successful authentication - issue tokens
+    return await _create_login_success_response(
+        user=user,
+        normalized_email=normalized_email,
+        client_ip=client_ip,
+        req=req,
+        db=db,
+        response=response,
+    )
+
+
+@router.post(
+    "/refresh",
+    response_model=TokenResponse,
+    responses={
+        401: {"description": "Unauthorized - Invalid, expired, or missing refresh token"},
+    }
+)
+async def refresh_token(req: Request, response: Response, db: Annotated[Session, Depends(get_db)] = None):
     """
     Refresh access token using the refresh token from HttpOnly cookie or request body.
 
@@ -651,7 +1207,6 @@ async def refresh_token(req: Request, response: Response, db: Session = Depends(
         try:
             content_type = req.headers.get("content-type", "")
             if "application/json" in content_type:
-                # Read body asynchronously
                 import json
                 body_bytes = await req.body()
                 body_data = json.loads(body_bytes.decode())
@@ -714,17 +1269,23 @@ async def refresh_token(req: Request, response: Response, db: Session = Depends(
     return TokenResponse(
         access_token=new_access,
         token_type="bearer",
+        expires_in=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,  # Convert minutes to seconds
         user=UserResponse.model_validate(user),
         refresh_token=new_refresh_str  # For cross-origin deployments (Vercel + Railway)
     )
 
 
-@router.post("/logout")
+@router.post(
+    "/logout",
+    responses={
+        401: {"description": "Unauthorized - No valid authentication token provided"},
+    }
+)
 def logout(
     req: Request,
     response: Response,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    current_user: Annotated[User, Depends(get_current_user)] = None,
+    db: Annotated[Session, Depends(get_db)] = None
 ):
     """
     Logout user by revoking refresh token and clearing cookie.
@@ -746,8 +1307,8 @@ def logout(
         if rt:
             rt.revoked = True
 
-    # Mark user as offline
-    current_user.is_active = False
+    # Mark user as offline (does NOT affect is_enabled)
+    current_user.is_online = False
     db.commit()
 
     # Clear the HttpOnly cookie
@@ -762,8 +1323,14 @@ def logout(
     return {"message": "Logged out successfully"}
 
 
-@router.post("/forgot-password")
-def forgot_password(request: PasswordResetRequest, req: Request, db: Session = Depends(get_db)):
+@router.post(
+    "/forgot-password",
+    responses={
+        403: {"description": "Forbidden - Password reset is disabled (SSO-only deployment)"},
+        429: {"description": "Too Many Requests - Rate limit exceeded (1 request per minute per email)"},
+    }
+)
+def forgot_password(request: PasswordResetRequest, req: Request, db: Annotated[Session, Depends(get_db)] = None):
     """
     Request a password reset email.
 
@@ -773,6 +1340,13 @@ def forgot_password(request: PasswordResetRequest, req: Request, db: Session = D
     - Token hashing: Password reset tokens are hashed before storage (SHA-256)
       Even if the database is compromised, attackers cannot use stolen tokens
     """
+    # Prevent password reset for SSO-only deployments
+    if "local" not in settings.AUTH_PROVIDERS.lower():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Password reset is disabled. Your organization uses Single Sign-On (SSO) for authentication. Please contact your administrator if you need access."
+        )
+
     # Normalize email for rate limiting
     email_normalized = request.email.strip().lower()
 
@@ -781,7 +1355,7 @@ def forgot_password(request: PasswordResetRequest, req: Request, db: Session = D
     last_request = _password_reset_rate_limit.get(email_normalized)
     if last_request and (current_time - last_request) < PASSWORD_RESET_RATE_LIMIT_SECONDS:
         # Still within rate limit window - return success anyway to prevent enumeration
-        return {"message": "If that email exists, we've sent a password reset link."}
+        return {"message": PASSWORD_RESET_SENT_MSG}
 
     # Find user (case-insensitive email lookup)
     user = db.query(User).filter(
@@ -792,6 +1366,11 @@ def forgot_password(request: PasswordResetRequest, req: Request, db: Session = D
     if not user:
         # Update rate limit even for non-existent emails
         _password_reset_rate_limit[email_normalized] = current_time
+        return {"message": PASSWORD_RESET_SENT_MSG}
+
+    # Don't send reset emails for SSO users
+    if user.auth_provider != "local":
+        # Return success message anyway (don't reveal that user exists or is SSO)
         return {"message": "If that email exists, we've sent a password reset link."}
 
     # Generate reset token (plaintext - sent to user via email)
@@ -810,11 +1389,17 @@ def forgot_password(request: PasswordResetRequest, req: Request, db: Session = D
     # Update rate limit
     _password_reset_rate_limit[email_normalized] = current_time
 
-    return {"message": "If that email exists, we've sent a password reset link."}
+    return {"message": PASSWORD_RESET_SENT_MSG}
 
 
-@router.post("/reset-password")
-def reset_password(request: PasswordResetConfirm, db: Session = Depends(get_db)):
+@router.post(
+    "/reset-password",
+    responses={
+        400: {"description": "Bad Request - Invalid or expired reset token"},
+        403: {"description": "Forbidden - Password reset not available for SSO accounts"},
+    }
+)
+def reset_password(request: PasswordResetConfirm, db: Annotated[Session, Depends(get_db)] = None):
     """
     Reset password using a valid reset token.
 
@@ -851,6 +1436,13 @@ def reset_password(request: PasswordResetConfirm, db: Session = Depends(get_db))
         # Generic error to prevent enumeration of whether token exists
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired reset token")
 
+    # Don't allow password reset for SSO users
+    if matched_user.auth_provider != "local":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Password reset is not available for SSO accounts. Please use your identity provider."
+        )
+
     matched_user.hashed_password = hash_password(request.new_password)
     matched_user.password_reset_token = None
     matched_user.password_reset_expires = None
@@ -868,12 +1460,26 @@ def reset_password(request: PasswordResetConfirm, db: Session = Depends(get_db))
     return {"message": "Password reset successfully"}
 
 
-@router.post("/change-password")
+@router.post(
+    "/change-password",
+    responses={
+        400: {"description": "Bad Request - Current password is incorrect"},
+        401: {"description": "Unauthorized - No valid authentication token provided"},
+        403: {"description": "Forbidden - Password change not available for SSO accounts"},
+    }
+)
 def change_password(
     request: ChangePasswordRequest,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    current_user: Annotated[User, Depends(get_current_user)] = None,
+    db: Annotated[Session, Depends(get_db)] = None
 ):
+    # Prevent password change for SSO users
+    if current_user.auth_provider != "local":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Password change is not available for SSO accounts. Manage your password through your identity provider."
+        )
+
     if not verify_password(request.current_password, current_user.hashed_password):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Current password is incorrect")
 
@@ -894,16 +1500,28 @@ def change_password(
     return {"message": "Password changed successfully"}
 
 
-@router.get("/me", response_model=UserResponse)
-def get_me(current_user: User = Depends(get_current_user)):
+@router.get(
+    "/me",
+    response_model=UserResponse,
+    responses={
+        401: {"description": "Unauthorized - No valid authentication token provided"},
+    }
+)
+def get_me(current_user: Annotated[User, Depends(get_current_user)] = None):
     return current_user
 
 
-@router.put("/me", response_model=UserResponse)
+@router.put(
+    "/me",
+    response_model=UserResponse,
+    responses={
+        401: {"description": "Unauthorized - No valid authentication token provided"},
+    }
+)
 def update_my_profile(
     data: UserProfileUpdate,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    current_user: Annotated[User, Depends(get_current_user)] = None,
+    db: Annotated[Session, Depends(get_db)] = None,
     req: Request = None,
 ):
     """Update your own profile.
@@ -925,17 +1543,34 @@ def update_my_profile(
         details={"updated_fields": list(data.model_dump(exclude_unset=True).keys())},
         request=req,
     ))
+    
+    # Sync location changes between users.location_id and user_locations table
+    if data.location_id is not None:
+        from app.api.location_audience import _sync_user_location_primary
+        _sync_user_location_primary(db, current_user.id, data.location_id)
+    
     db.commit()
     db.refresh(current_user)
     return current_user
 
 
+
+def _format_login_attempt(attempt) -> dict:
+    """Serialize a LoginAttempt record to a response dict."""
+    return {
+        "id": attempt.id,
+        "email": attempt.email,
+        "ip_address": attempt.ip_address,
+        "success": attempt.success,
+        "attempted_at": attempt.attempted_at,
+    }
+
 @router.get("/login-attempts")
 def get_login_attempts(
-    limit: int = Query(default=50, ge=1, le=500),
-    offset: int = Query(default=0, ge=0),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin)
+    limit: Annotated[int, Query(ge=1, le=500)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+    db: Annotated[Session, Depends(get_db)] = None,
+    current_user: Annotated[User, Depends(require_admin)] = None
 ):
     """View recent login attempts (for security monitoring).
 
@@ -945,23 +1580,14 @@ def get_login_attempts(
         desc(LoginAttempt.attempted_at)
     ).offset(offset).limit(limit).all()
 
-    return [
-        {
-            "id": a.id,
-            "email": a.email,
-            "ip_address": a.ip_address,
-            "success": a.success,
-            "attempted_at": a.attempted_at
-        }
-        for a in attempts
-    ]
+    return [_format_login_attempt(a) for a in attempts]
 
 
 @router.post("/debug/reset-rate-limits")
 def reset_rate_limits(
     request: Request,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin)
+    db: Annotated[Session, Depends(get_db)] = None,
+    current_user: Annotated[User, Depends(require_admin)] = None
 ):
     """Debug endpoint to reset all rate limits. ADMIN only.
 
@@ -984,8 +1610,8 @@ def reset_rate_limits(
 @router.post("/mfa/enroll/start", response_model=MFAEnrollStartResponse)
 def start_mfa_enrollment(
     request: MFAEnrollStartRequest,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    db: Annotated[Session, Depends(get_db)] = None,
+    current_user: Annotated[User, Depends(get_current_user)] = None
 ):
     """
     Start MFA enrollment for the current user.
@@ -1042,8 +1668,8 @@ def start_mfa_enrollment(
 @router.post("/mfa/enroll/complete", response_model=MFAEnrollConfirmResponse)
 def complete_mfa_enrollment(
     request: MFAEnrollConfirmRequest,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    db: Annotated[Session, Depends(get_db)] = None,
+    current_user: Annotated[User, Depends(get_current_user)] = None
 ):
     """
     Complete MFA enrollment by verifying OTP code.
@@ -1088,8 +1714,8 @@ def complete_mfa_enrollment(
 @router.post("/mfa/disable", response_model=MFADisableResponse)
 def disable_mfa(
     request: MFADisableRequest,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    db: Annotated[Session, Depends(get_db)] = None,
+    current_user: Annotated[User, Depends(get_current_user)] = None
 ):
     """
     Disable MFA for the current user.
@@ -1136,8 +1762,8 @@ def disable_mfa(
 @router.post("/mfa/reset/start", response_model=MFAEnrollStartResponse)
 def start_mfa_reset(
     request: MFAResetStartRequest,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    db: Annotated[Session, Depends(get_db)] = None,
+    current_user: Annotated[User, Depends(get_current_user)] = None
 ):
     """
     Start MFA reset/replacement flow.
@@ -1187,8 +1813,8 @@ def start_mfa_reset(
 @router.post("/mfa/reset/complete", response_model=MFAResetConfirmResponse)
 def complete_mfa_reset(
     request: MFAResetConfirmRequest,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    db: Annotated[Session, Depends(get_db)] = None,
+    current_user: Annotated[User, Depends(get_current_user)] = None
 ):
     """
     Complete MFA reset by verifying new OTP code.
@@ -1234,8 +1860,8 @@ def complete_mfa_reset(
 async def regenerate_recovery_codes_endpoint(
     request: MFARegenerateRecoveryCodesRequest,
     req: Request,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    db: Annotated[Session, Depends(get_db)] = None,
+    current_user: Annotated[User, Depends(get_current_user)] = None
 ):
     """
     Regenerate recovery codes for the authenticated user with dual-proof verification.
@@ -1329,8 +1955,8 @@ async def regenerate_recovery_codes_endpoint(
 
 @router.get("/mfa/status", response_model=MFAStatusDetailResponse)
 def get_mfa_status(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    db: Annotated[Session, Depends(get_db)] = None,
+    current_user: Annotated[User, Depends(get_current_user)] = None
 ):
     """
     Get the current MFA status for the authenticated user.
@@ -1353,132 +1979,145 @@ def get_mfa_status(
     return MFAStatusDetailResponse(**status_data)
 
 
-@router.post("/mfa/verify-login", response_model=LoginSuccessResponse)
-async def verify_mfa_and_complete_login(
-    request: MFAVerifyLoginRequest,
-    req: Request,
-    response: Response,
-    db: Session = Depends(get_db)
-):
-    """
-    Complete MFA verification and issue auth tokens.
-    
-    Use this endpoint after receiving a challenge token from /login:
-    1. Call /login with credentials
-    2. Receive challenge token (and QR code if setup needed)
-    3. User scans QR and gets OTP from authenticator app
-    4. Call this endpoint with challenge_token + OTP code
-    5. Receive full auth tokens on success
-    
-    Security:
-    - Challenge token must be valid and not expired
-    - OTP code must match user's TOTP secret
-    - No tokens issued until both verifications pass
-    - Failed attempts counted toward rate limiting
-    """
-    client_ip = _get_client_ip(req)
+# ─── MFA LOGIN VERIFICATION HELPER FUNCTIONS ─────────────────────────────────
 
-    # Check IP-based rate limit FIRST (before processing challenge token)
-    # This prevents brute-force attacks on the TOTP code (6 digits = 1M combinations)
-    if await is_ip_locked(client_ip):
-        logger.warning(f"IP lockout for {client_ip} at MFA verify")
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Too many failed attempts. Please try again later.",
-        )
 
-    # Verify JWT challenge token — signature, expiry, and type all checked in one call
-    is_valid, user_id = _verify_challenge_token(request.challenge_token)
-    if not is_valid:
-        logger.warning(f"Invalid or expired MFA challenge token from IP {client_ip}")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials or MFA code"
-        )
+def _verify_mfa_challenge_token(token: str) -> tuple[bool, int]:
+    """Verify MFA challenge token and return user_id. Returns (is_valid, user_id)."""
+    return _verify_challenge_token(token)
 
-    # Fetch user from database
-    user = db.query(User).filter(User.id == user_id).first()
+
+async def _handle_mfa_ip_lockout(client_ip: str) -> None:
+    """Handle IP lockout during MFA verification."""
+    logger.warning(f"IP lockout for {client_ip} at MFA verify")
+
+    from app.services.rate_limiter import _ip_lock_key, _get_client
+    r = _get_client()
+    ttl_seconds = await r.ttl(_ip_lock_key(client_ip))
+
+    raise HTTPException(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        detail={
+            "message": "Too many failed attempts. Please try again later.",
+            "retry_after_seconds": max(0, ttl_seconds),
+            "retry_after": format_lockout_time(max(0, ttl_seconds))
+        },
+        headers={"Retry-After": str(max(0, ttl_seconds))}
+    )
+
+
+def _validate_user_mfa_state(user: User, user_id: int) -> None:
+    """Validate user exists and MFA is still required."""
     if not user:
         logger.warning(f"User {user_id} not found")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials or MFA code"
+            detail=INVALID_CREDENTIALS_MFA_MSG
         )
 
-    # Verify MFA is still required (user might have completed setup in another session)
     if not user_requires_mfa(user):
         logger.warning(f"MFA no longer required for user {user_id}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="MFA not required"
         )
-    
-    # Verify OTP code
+
     if not user.mfa_secret:
         logger.warning(f"No MFA secret for user {user_id}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials or MFA code"
+            detail=INVALID_CREDENTIALS_MFA_MSG
         )
 
+
+async def _verify_totp_and_record_failure(
+    user: User,
+    code: str,
+    client_ip: str
+) -> None:
+    """Verify TOTP code and record failure if invalid. Raises HTTPException on failure."""
     _plain_secret_for_totp_verify = decrypt_mfa_secret(user.mfa_secret) or user.mfa_secret
-    if not verify_totp_code(_plain_secret_for_totp_verify, request.code):
-        # Invalid MFA code - record as failed attempt
+
+    if not verify_totp_code(_plain_secret_for_totp_verify, code):
         try:
             count = await redis_record_failed_login(user.id)
             await record_ip_failure(client_ip)
         except Exception as e:
             logger.error(f"Error recording failed login: {e}")
 
-        logger.warning(f"Invalid MFA code for user {user_id}")
+        logger.warning(f"Invalid MFA code for user {user.id}")
+        remaining_attempts = max(0, ACCOUNT_LOCKOUT_THRESHOLD - count)
+
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials or MFA code"
+            detail={
+                "message": INVALID_CREDENTIALS_MFA_MSG,
+                "remaining_attempts": remaining_attempts,
+                "lockout_threshold": ACCOUNT_LOCKOUT_THRESHOLD
+            }
         )
 
-    # Replay protection — reject reuse within the same 30-second window
-    if is_totp_replay(user, request.code):
-        logger.warning(f"TOTP replay attempt detected for user {user_id}")
+
+def _check_totp_replay(user: User, code: str) -> None:
+    """Check if TOTP code was already used. Raises HTTPException on replay."""
+    if is_totp_replay(user, code):
+        logger.warning(f"TOTP replay attempt detected for user {user.id}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="TOTP code already used. Please wait for the next code."
         )
 
-    # Record this code as used — will be committed with the final db.commit()
-    user.last_used_totp_code = request.code
+
+def _record_totp_usage(user: User, code: str, db: Session) -> None:
+    """Record TOTP code usage to prevent replay."""
+    user.last_used_totp_code = code
     user.last_used_totp_at = datetime.now(timezone.utc)
     db.add(user)
+
+
+def _enable_mfa_and_generate_recovery_codes(user: User, db: Session) -> tuple[bool, Optional[list[str]]]:
+    """Enable MFA and generate recovery codes if not already enabled.
     
-    # MFA verified successfully - enable MFA if not already enabled
-    was_new_mfa = False
+    Returns:
+        tuple: (was_new_mfa, recovery_codes)
+    """
+    if user.mfa_enabled:
+        return False, None
+
+    user.mfa_enabled = True
     recovery_codes = None
-    if not user.mfa_enabled:
-        user.mfa_enabled = True
-        was_new_mfa = True
 
-        # Generate initial recovery codes for new MFA users
-        try:
-            plaintext_codes, batch_id = generate_recovery_codes(
-                db=db,
-                user_id=user.id,
-                generated_by_user_id=user.id,
-                reason='initial_setup'
-            )
-            recovery_codes = plaintext_codes
-            logger.info(f"Generated {len(plaintext_codes)} recovery codes for user {user_id}")
-        except Exception as e:
-            logger.error(f"Failed to generate recovery codes: {e}")
-            # Don't fail the login, but log the issue
+    try:
+        plaintext_codes, batch_id = generate_recovery_codes(
+            db=db,
+            user_id=user.id,
+            generated_by_user_id=user.id,
+            reason='initial_setup'
+        )
+        recovery_codes = plaintext_codes
+        logger.info(f"Generated {len(plaintext_codes)} recovery codes for user {user.id}")
+    except Exception as e:
+        logger.error(f"Failed to generate recovery codes: {e}")
 
-        logger.info(f"MFA enabled for user {user_id} during login")
-    
-    # Issue tokens (same as successful login)
+    logger.info(f"MFA enabled for user {user.id} during login")
+    return True, recovery_codes
+
+
+async def _finalize_mfa_login(
+    user: User,
+    client_ip: str,
+    req: Request,
+    response: Response,
+    db: Session,
+    was_new_mfa: bool,
+    recovery_codes: Optional[list[str]]
+) -> LoginSuccessResponse:
+    """Issue tokens and complete MFA login flow."""
     try:
         await clear_account_failures(user.id)
     except Exception as e:
         logger.error(f"Error clearing account failures: {e}")
 
-    # Log successful attempt
     db.add(LoginAttempt(
         email=user.email,
         ip_address=client_ip,
@@ -1488,7 +2127,6 @@ async def verify_mfa_and_complete_login(
     access_token = create_access_token({"sub": str(user.id), "role": user.role})
     refresh_token_str = create_refresh_token({"sub": str(user.id)})
 
-    # Save refresh token
     rt = RefreshToken(
         user_id=user.id,
         token=refresh_token_str,
@@ -1496,12 +2134,11 @@ async def verify_mfa_and_complete_login(
     )
     db.add(rt)
 
-    # Mark user as online (same as successful login)
     user.last_login = datetime.now(timezone.utc)
     user.last_seen_at = datetime.now(timezone.utc)
-    user.is_active = True
+    user.is_online = True
+    user.is_enabled = True
 
-    # Audit log
     db.add(create_audit_log(
         user_id=user.id,
         user_email=user.email,
@@ -1512,19 +2149,16 @@ async def verify_mfa_and_complete_login(
     ))
     db.commit()
 
-    logger.info(f"MFA verification complete, login successful for user {user_id}")
+    logger.info(f"MFA verification complete, login successful for user {user.id}")
 
-    # Set refresh token as HttpOnly cookie
     _set_refresh_cookie(response, refresh_token_str, settings.REFRESH_TOKEN_EXPIRE_DAYS)
 
-    # Build response with recovery codes if this was first MFA setup
-    # Include refresh_token in body for cross-origin deployments (Vercel + Railway)
     response_data = {
         "status": "success",
         "access_token": access_token,
         "token_type": "bearer",
         "user": UserResponse.model_validate(user),
-        "refresh_token": refresh_token_str,  # For cross-origin deployments
+        "refresh_token": refresh_token_str,
     }
 
     if was_new_mfa and recovery_codes:
@@ -1534,6 +2168,64 @@ async def verify_mfa_and_complete_login(
     return LoginSuccessResponse(**response_data)
 
 
+# ─── MFA LOGIN VERIFICATION ENDPOINT ─────────────────────────────────────────
+
+@router.post("/mfa/verify-login", response_model=LoginSuccessResponse)
+async def verify_mfa_and_complete_login(
+    request: MFAVerifyLoginRequest,
+    req: Request,
+    response: Response,
+    db: Annotated[Session, Depends(get_db)] = None
+):
+    """
+    Complete MFA verification and issue auth tokens.
+
+    Use this endpoint after receiving a challenge token from /login:
+    1. Call /login with credentials
+    2. Receive challenge token (and QR code if setup needed)
+    3. User scans QR and gets OTP from authenticator app
+    4. Call this endpoint with challenge_token + OTP code
+    5. Receive full auth tokens on success
+
+    Security:
+    - Challenge token must be valid and not expired
+    - OTP code must match user's TOTP secret
+    - No tokens issued until both verifications pass
+    - Failed attempts counted toward rate limiting
+    """
+    client_ip = _get_client_ip(req)
+
+    if await is_ip_locked(client_ip):
+        await _handle_mfa_ip_lockout(client_ip)
+
+    is_valid, user_id = _verify_mfa_challenge_token(request.challenge_token)
+    if not is_valid:
+        logger.warning(f"Invalid or expired MFA challenge token from IP {client_ip}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=INVALID_CREDENTIALS_MFA_MSG
+        )
+
+    user = db.query(User).filter(User.id == user_id).first()
+    _validate_user_mfa_state(user, user_id)
+
+    _verify_totp_and_record_failure(user, request.code, client_ip)
+    _check_totp_replay(user, request.code)
+    _record_totp_usage(user, request.code, db)
+
+    was_new_mfa, recovery_codes = _enable_mfa_and_generate_recovery_codes(user, db)
+
+    return await _finalize_mfa_login(
+        user=user,
+        client_ip=client_ip,
+        req=req,
+        response=response,
+        db=db,
+        was_new_mfa=was_new_mfa,
+        recovery_codes=recovery_codes
+    )
+
+
 # ─── MFA RECOVERY CODE ENDPOINTS ──────────────────────────────────────────────
 
 @router.post("/mfa/recovery-code/verify", response_model=LoginSuccessResponse)
@@ -1541,7 +2233,7 @@ async def verify_recovery_code_and_login(
     request: MFARecoveryCodeVerifyRequest,
     req: Request,
     response: Response,
-    db: Session = Depends(get_db)
+    db: Annotated[Session, Depends(get_db)] = None
 ):
     """
     Complete login using a recovery code.
@@ -1578,16 +2270,18 @@ async def verify_recovery_code_and_login(
         logger.warning(f"Invalid or expired MFA challenge token from IP {client_ip}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials or recovery code"
+            detail=INVALID_CREDENTIALS_RECOVERY_MSG
         )
 
     # Fetch user from database
+    # Check is_enabled (account status) NOT is_online (presence)
+    # Users can use recovery codes even if currently offline
     user = db.query(User).filter(User.id == user_id).first()
-    if not user or not user.is_active:
-        logger.warning(f"User {user_id} not found or inactive")
+    if not user or not user.is_enabled:
+        logger.warning(f"User {user_id} not found or account disabled")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials or recovery code"
+            detail=INVALID_CREDENTIALS_RECOVERY_MSG
         )
     
     # Verify and consume recovery code
@@ -1623,7 +2317,7 @@ async def verify_recovery_code_and_login(
         logger.warning(f"Invalid recovery code for user {user_id}: {error}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials or recovery code"
+            detail=INVALID_CREDENTIALS_RECOVERY_MSG
         )
     
     # Recovery code verified - issue tokens
@@ -1674,8 +2368,8 @@ async def verify_recovery_code_and_login(
 
 @router.get("/account/mfa/recovery-codes/status", response_model=MFARecoveryCodeStatus)
 def get_recovery_codes_status(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    db: Annotated[Session, Depends(get_db)] = None,
+    current_user: Annotated[User, Depends(get_current_user)] = None
 ):
     """
     Get the current status of recovery codes for the authenticated user.
@@ -1690,8 +2384,8 @@ def get_recovery_codes_status(
 @router.post("/account/mfa/recovery-codes/regenerate", response_model=MFARecoveryCodesResponse)
 def regenerate_recovery_codes(
     request: MFARegenerateRecoveryCodesRequest,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    db: Annotated[Session, Depends(get_db)] = None,
+    current_user: Annotated[User, Depends(get_current_user)] = None
 ):
     """
     Regenerate recovery codes for the authenticated user.
@@ -1744,8 +2438,8 @@ def regenerate_recovery_codes(
 
 @router.post("/account/mfa/recovery-codes/generate-initial", response_model=MFARecoveryCodesResponse)
 def generate_initial_recovery_codes(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    db: Annotated[Session, Depends(get_db)] = None,
+    current_user: Annotated[User, Depends(get_current_user)] = None
 ):
     """
     Generate initial recovery codes for a user who just enabled MFA.

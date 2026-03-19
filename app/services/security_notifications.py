@@ -5,9 +5,13 @@ All sends are fire-and-forget — failures are logged but never block auth flow.
 
 import asyncio
 import logging
+from typing import Set
 from app.services.email_service import send_email
 
 logger = logging.getLogger(__name__)
+
+# Keep strong references to background tasks to prevent premature GC
+_background_tasks: Set[asyncio.Task] = set()
 
 LOCKOUT_SUBJECT = "Suspicious login activity on your account"
 
@@ -67,10 +71,10 @@ async def notify_suspicious_login(
         timestamp=timestamp,
     )
 
-    # Fire and forget — don't await in the request path
-    asyncio.create_task(
-        _safe_send(email, LOCKOUT_SUBJECT, body)
-    )
+    # Fire and forget — store reference to prevent premature garbage collection
+    task = asyncio.create_task(_safe_send(email, LOCKOUT_SUBJECT, body))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
 
 async def notify_recovery_codes_regenerated(
@@ -92,10 +96,10 @@ async def notify_recovery_codes_regenerated(
         timestamp=timestamp,
     )
 
-    # Fire and forget — don't await in the request path
-    asyncio.create_task(
-        _safe_send(email, RECOVERY_CODES_REGENERATED_SUBJECT, body)
-    )
+    # Fire and forget — store reference to prevent premature garbage collection
+    task = asyncio.create_task(_safe_send(email, RECOVERY_CODES_REGENERATED_SUBJECT, body))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
 
 async def _safe_send(to: str, subject: str, body: str):

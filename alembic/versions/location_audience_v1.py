@@ -9,6 +9,9 @@ from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
+USERS_ID_FK = "users.id"
+
+
 # revision identifiers, used by Alembic.
 revision = 'location_audience_v1'
 down_revision = None
@@ -45,9 +48,9 @@ def upgrade() -> None:
             sa.Column('assigned_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
             sa.Column('expires_at', sa.DateTime(timezone=True), nullable=True),
             sa.Column('updated_at', sa.DateTime(timezone=True), nullable=True),
-            sa.ForeignKeyConstraint(['assigned_by_id'], ['users.id'], ),
+            sa.ForeignKeyConstraint(['assigned_by_id'], [USERS_ID_FK], ),
             sa.ForeignKeyConstraint(['location_id'], ['locations.id'], ondelete='CASCADE'),
-            sa.ForeignKeyConstraint(['user_id'], ['users.id'], ondelete='CASCADE'),
+            sa.ForeignKeyConstraint(['user_id'], [USERS_ID_FK], ondelete='CASCADE'),
             sa.PrimaryKeyConstraint('id')
         )
         op.create_index(op.f('ix_user_locations_id'), 'user_locations', ['id'], unique=False)
@@ -76,8 +79,8 @@ def upgrade() -> None:
             sa.Column('extra_data', postgresql.JSON(astext_type=sa.Text()), nullable=True),
             sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
             sa.ForeignKeyConstraint(['location_id'], ['locations.id'], ondelete='CASCADE'),
-            sa.ForeignKeyConstraint(['triggered_by_user_id'], ['users.id'], ),
-            sa.ForeignKeyConstraint(['user_id'], ['users.id'], ondelete='CASCADE'),
+            sa.ForeignKeyConstraint(['triggered_by_user_id'], [USERS_ID_FK], ),
+            sa.ForeignKeyConstraint(['user_id'], [USERS_ID_FK], ondelete='CASCADE'),
             sa.ForeignKeyConstraint(['user_location_id'], ['user_locations.id'], ondelete='CASCADE'),
             sa.PrimaryKeyConstraint('id')
         )

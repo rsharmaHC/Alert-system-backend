@@ -11,6 +11,7 @@ COPY requirements-prod.txt .
 RUN pip install --no-cache-dir --prefix=/install -r requirements-prod.txt
 
 # --- Production image ---
+
 FROM python:3.11-slim
 
 WORKDIR /app
@@ -29,12 +30,16 @@ COPY --from=builder /install /usr/local
 COPY --chown=appuser:appgroup . .
 
 # 3. Make startup script executable
-RUN sed -i 's/\r$//' start.sh
+RUN sed -i 's/\r$//' start.sh && \     
+    chmod +x start.sh
 
 # 4. Create tmp directory for celerybeat schedule with proper permissions
 RUN mkdir -p /tmp && chown appuser:appgroup /tmp
 
-# 5. Switch to non-root user BEFORE CMD
+# 5. Create secrets directory for bootstrap password
+RUN mkdir -p /run/secrets && chmod 1777 /run/secrets
+
+# 6. Switch to non-root user BEFORE CMD
 USER appuser
 
 EXPOSE 8000

@@ -1,3 +1,33 @@
+"""
+Messaging Services for Multi-Channel Notifications.
+
+This module provides services for sending notifications via multiple channels:
+- SMS (Twilio)
+- Email (SMTP)
+- Voice calls (Twilio)
+- Webhooks (Slack, Teams)
+
+Features:
+- Check-in link generation for safety responses
+- HTML email templates with check-in buttons
+- SSRF protection for webhook URLs
+- Mock mode for development/testing
+
+Security:
+- Webhook URLs validated against private IP ranges (SSRF protection)
+- DNS rebinding protection via IP resolution checks
+- Credentials loaded from environment variables
+
+Usage:
+    from app.services.messaging import twilio_service, email_service, webhook_service
+    
+    # Send SMS
+    result = twilio_service.send_sms("+1234567890", "Alert message")
+    
+    # Send email with check-in link
+    html = build_checkin_email_html(base_html, checkin_url, deadline_minutes=15)
+    result = email_service.send_email(to, subject, body, html)
+"""
 import logging
 from typing import Optional
 from app.config import settings
@@ -37,7 +67,7 @@ def build_checkin_email_html(base_html: str, checkin_url: str, deadline_minutes:
         HTML with check-in button added
     """
     deadline_text = f" within {deadline_minutes} minutes" if deadline_minutes else ""
-    
+
     # Create check-in button HTML
     checkin_section = f"""
     <div style="background: #fef3c7; border-left: 4px solid #f59e0b; padding: 20px; margin: 20px 0; border-radius: 4px; text-align: center;">
@@ -52,7 +82,7 @@ def build_checkin_email_html(base_html: str, checkin_url: str, deadline_minutes:
         </p>
     </div>
     """
-    
+
     # Insert before closing body tag
     if "</body>" in base_html:
         return base_html.replace("</body>", f"{checkin_section}</body>")
@@ -333,86 +363,70 @@ def _escape_xml(text: str) -> str:
     return xml_escape(str(text))
 
 
+_BLOCKED_INTERNAL_HOSTNAMES = frozenset([
+    'localhost', 'internal', 'metadata', '169.254.169.254', '127.0.0.1', '::1'
+])
+_DEVELOPMENT_LOCAL_HOSTNAMES = frozenset(['localhost', '127.0.0.1', '::1'])
+
+
+def _is_private_ip(hostname: str) -> bool:
+    """Return True if hostname is a private/reserved IP address."""
+    try:
+        ip = ipaddress.ip_address(hostname)
+        return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+    except ValueError:
+        return False  # Not a bare IP address
+
+
+def _has_private_resolved_ip(hostname: str) -> bool:
+    """Return True if hostname resolves to any private/reserved IP."""
+    try:
+        addr_info = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+    except socket.gaierror:
+        logger.warning(f"Webhook URL blocked: DNS resolution failed for '{hostname}'")
+        return True  # Treat unresolvable as unsafe
+    for info in addr_info:
+        ip_str = info[4][0]
+        try:
+            ip = ipaddress.ip_address(ip_str)
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+                logger.warning(f"Webhook URL blocked: hostname resolves to private IP '{ip_str}'")
+                return True
+        except ValueError:
+            continue
+    return False
+
+
 def _is_safe_url(url: str) -> bool:
     """Validate webhook URL to prevent SSRF attacks.
-    
-    Blocks:
-    - Non-HTTP/HTTPS schemes
-    - Private IP addresses (10.x.x.x, 172.16-31.x.x, 192.168.x.x)
-    - Localhost (127.x.x.x, ::1) - except in development
-    - Link-local addresses (169.254.x.x)
-    - AWS metadata endpoint (169.254.169.254)
-    - Internal hostnames (localhost, internal, etc.) - except in development
-    
-    Args:
-        url: The webhook URL to validate
-        
-    Returns:
-        True if URL is safe, False otherwise
+
+    Blocks non-HTTP/HTTPS schemes, private/loopback/link-local IPs,
+    and internal hostnames (except localhost in development mode).
     """
     if not url:
         return False
-    
     try:
         parsed = urlparse(url)
-        
-        # Only allow HTTP and HTTPS schemes
         if parsed.scheme not in ('http', 'https'):
             logger.warning(f"Webhook URL blocked: invalid scheme '{parsed.scheme}'")
             return False
-        
         hostname = parsed.hostname
         if not hostname:
             logger.warning("Webhook URL blocked: missing hostname")
             return False
-        
-        # Allow localhost in development mode
-        is_development = settings.APP_ENV == "development"
-        if is_development and hostname.lower() in ['localhost', '127.0.0.1', '::1']:
+        # Allow localhost in development mode only
+        if settings.APP_ENV == "development" and hostname.lower() in _DEVELOPMENT_LOCAL_HOSTNAMES:
             logger.info(f"Webhook URL allowed (development): {url}")
             return True
-        
-        # Block localhost and common internal hostnames in production
-        blocked_hostnames = ['localhost', 'internal', 'metadata', '169.254.169.254', '127.0.0.1', '::1']
-        if hostname.lower() in blocked_hostnames or hostname.endswith('.internal'):
+        if hostname.lower() in _BLOCKED_INTERNAL_HOSTNAMES or hostname.endswith('.internal'):
             logger.warning(f"Webhook URL blocked: internal hostname '{hostname}'")
             return False
-        
-        # Check if hostname is an IP address
-        try:
-            # Handle IPv4
-            ip = ipaddress.ip_address(hostname)
-            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-                logger.warning(f"Webhook URL blocked: private/internal IP '{hostname}'")
-                return False
-            return True  # Valid public IP
-        except ValueError:
-            pass  # Not an IP address, continue to DNS resolution check
-        
-        # Resolve hostname and check IP addresses
-        # Use getaddrinfo to handle both IPv4 and IPv6
-        try:
-            # Resolve both IPv4 (AF_INET) and IPv6 (AF_INET6) addresses
-            addr_info = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
-        except socket.gaierror:
-            logger.warning(f"Webhook URL blocked: DNS resolution failed for '{hostname}'")
+        # Bare IP address check
+        if _is_private_ip(hostname):
+            logger.warning(f"Webhook URL blocked: private/internal IP '{hostname}'")
             return False
-
-        for info in addr_info:
-            ip_str = info[4][0]
-            try:
-                ip = ipaddress.ip_address(ip_str)
-                # Block private, loopback, link-local, and reserved addresses
-                # IPv4: 10.x.x.x, 172.16-31.x.x, 192.168.x.x, 127.x.x.x, 169.254.x.x
-                # IPv6: ::1, fc00::/7 (unique local), fe80::/10 (link-local)
-                if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-                    logger.warning(f"Webhook URL blocked: hostname resolves to private IP '{ip_str}'")
-                    return False
-            except ValueError:
-                continue
-
-        return True  # All resolved IPs are public
-
+        # DNS-resolved IP check
+        return not _has_private_resolved_ip(hostname)
     except Exception as e:
         logger.warning(f"Webhook URL blocked: validation error '{url}' - {e}")
         return False
@@ -428,7 +442,7 @@ class WebhookService:
         
         # Validate URL to prevent SSRF attacks
         if not _is_safe_url(webhook_url):
-            logger.error(f"Slack webhook blocked: SSRF protection triggered for URL")
+            logger.error("Slack webhook blocked: SSRF protection triggered for URL")
             return {"status": "blocked", "error": "Invalid webhook URL"}
         
         try:
@@ -454,7 +468,7 @@ class WebhookService:
         
         # Validate URL to prevent SSRF attacks
         if not _is_safe_url(webhook_url):
-            logger.error(f"Teams webhook blocked: SSRF protection triggered for URL")
+            logger.error("Teams webhook blocked: SSRF protection triggered for URL")
             return {"status": "blocked", "error": "Invalid webhook URL"}
         
         try:

@@ -14,6 +14,11 @@ _SAFE_IDENTIFIER_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
 
 # Allowed SQL column types — whitelist approach for column_type since it cannot
 # be parameterized and has a much wider surface area than simple identifiers.
+# Column type constants
+COLUMN_TYPE_VARCHAR_255 = 'VARCHAR(255)'
+COLUMN_TYPE_VARCHAR_512 = 'VARCHAR(512)'
+
+# Allowed column types for validation (using constants for maintainability)
 _ALLOWED_COLUMN_TYPES = {
     'DOUBLE PRECISION',
     'FLOAT',
@@ -22,8 +27,8 @@ _ALLOWED_COLUMN_TYPES = {
     'SMALLINT',
     'BOOLEAN',
     'TEXT',
-    'VARCHAR(255)',
-    'VARCHAR(512)',
+    COLUMN_TYPE_VARCHAR_255,
+    COLUMN_TYPE_VARCHAR_512,
     'TIMESTAMP WITH TIME ZONE',
     'TIMESTAMP WITHOUT TIME ZONE',
     'DATE',
@@ -183,10 +188,10 @@ def ensure_table_exists(table_name: str):
 def ensure_mfa_secret_column_expanded():
     """
     Ensure the mfa_secret column in users table is VARCHAR(255) for Fernet encryption.
-    
+
     Fernet-encrypted secrets are ~120+ characters, but the original column was VARCHAR(32).
     This expands the column if it's still at the old size.
-    
+
     Returns:
         bool: True if column was altered, False if already correct size
     """
@@ -201,18 +206,18 @@ def ensure_mfa_secret_column_expanded():
                 AND column_name = 'mfa_secret'
             """)
         ).fetchone()
-        
+
         if not result:
             logger.error("mfa_secret column not found in users table")
             return False
-        
+
         max_length, data_type = result
-        
+
         # Check if already expanded to 255
         if max_length == 255:
             logger.info("mfa_secret column already expanded to VARCHAR(255)")
             return False
-        
+
         # Expand the column
         db.execute(
             text("""
@@ -223,10 +228,45 @@ def ensure_mfa_secret_column_expanded():
         db.commit()
         logger.info("Expanded mfa_secret column from VARCHAR(32) to VARCHAR(255)")
         return True
-        
+
     except Exception as e:
         logger.error(f"Error expanding mfa_secret column: {e}")
         db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def ensure_sso_columns():
+    """
+    Ensure SSO-related columns exist in the users table.
+
+    These columns are required for Entra ID and LDAP authentication:
+    - auth_provider: Authentication provider (local, entra, ldap)
+    - external_id: External identity provider ID (Entra OID or LDAP DN)
+    - is_enabled: Account enabled status (separate from is_online presence)
+    - is_online: Real-time online presence indicator
+
+    This function is idempotent - safe to call multiple times.
+    """
+    db = SessionLocal()
+    try:
+        # Ensure auth_provider column
+        ensure_column_exists('users', 'auth_provider', COLUMN_TYPE_VARCHAR_255, nullable=False)
+
+        # Ensure external_id column
+        ensure_column_exists('users', 'external_id', COLUMN_TYPE_VARCHAR_255, nullable=True)
+        
+        # Ensure is_enabled column
+        ensure_column_exists('users', 'is_enabled', 'BOOLEAN', nullable=False)
+        
+        # Ensure is_online column
+        ensure_column_exists('users', 'is_online', 'BOOLEAN', nullable=True)
+        
+        logger.info("SSO columns verified/created successfully")
+        
+    except Exception as e:
+        logger.error(f"Error ensuring SSO columns: {e}")
         raise
     finally:
         db.close()

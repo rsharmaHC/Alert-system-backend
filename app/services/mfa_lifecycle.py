@@ -34,6 +34,11 @@ from app.services.mfa_recovery import (
     invalidate_all_recovery_codes,
 )
 
+# ─── ERROR MESSAGE CONSTANTS ──────────────────────────────────────────────────
+TOTP_REPLAY_MSG = "This TOTP code was already used. Please enter a fresh code from your authenticator app."
+INVALID_CURRENT_PASSWORD_MSG = "The current password you entered is incorrect."
+
+
 logger = logging.getLogger(__name__)
 
 # Reauthentication token TTL (5 minutes)
@@ -98,7 +103,7 @@ class MFAService:
         # Verify current password (reauthentication)
         if not verify_password(current_password, user.hashed_password):
             logger.warning(f"Invalid password during MFA enrollment start for user {user.id}")
-            raise ValueError("Current password is incorrect")
+            raise ValueError(INVALID_CURRENT_PASSWORD_MSG)
 
         # Generate new secret
         secret = generate_mfa_secret()
@@ -156,7 +161,7 @@ class MFAService:
         # Replay protection — reject reuse within the same 30-second window
         if is_totp_replay(user, code):
             logger.warning(f"TOTP replay attempt detected during MFA enrollment for user {user.id}")
-            raise ValueError("TOTP code already used. Please wait for the next code.")
+            raise ValueError(TOTP_REPLAY_MSG)
 
         # Record this code as used
         user.last_used_totp_code = code
@@ -224,7 +229,7 @@ class MFAService:
         # Verify current password
         if not verify_password(current_password, user.hashed_password):
             logger.warning(f"Invalid password during MFA disable for user {user.id}")
-            raise ValueError("Current password is incorrect")
+            raise ValueError(INVALID_CURRENT_PASSWORD_MSG)
 
         # Verify current MFA code or recovery code
         if not self._verify_mfa_or_recovery_code(user, mfa_code):
@@ -287,7 +292,7 @@ class MFAService:
         # Verify current password
         if not verify_password(current_password, user.hashed_password):
             logger.warning(f"Invalid password during MFA reset for user {user.id}")
-            raise ValueError("Current password is incorrect")
+            raise ValueError(INVALID_CURRENT_PASSWORD_MSG)
 
         # Verify current MFA code if provided
         # For locked-out users, this may be None (recovery path)
@@ -361,7 +366,7 @@ class MFAService:
         # Replay protection — reject reuse within the same 30-second window
         if is_totp_replay(user, code):
             logger.warning(f"TOTP replay attempt detected during MFA reset for user {user.id}")
-            raise ValueError("TOTP code already used. Please wait for the next code.")
+            raise ValueError(TOTP_REPLAY_MSG)
 
         # Record this code as used
         user.last_used_totp_code = code
@@ -394,6 +399,58 @@ class MFAService:
         logger.info(f"MFA reset completed for user {user.id}")
 
         return plaintext_codes, batch_id
+
+    def _verify_totp_for_regeneration(self, user: User, mfa_code: Optional[str]) -> None:
+        """Verify TOTP code for recovery code regeneration."""
+        if not mfa_code:
+            logger.warning(f"Missing TOTP code for user {user.id} during regeneration")
+            raise ValueError("TOTP code is required")
+        if not verify_totp_code(user.mfa_secret, mfa_code):
+            logger.warning(f"Invalid TOTP code during regeneration for user {user.id}")
+            raise ValueError("Invalid TOTP code")
+        if is_totp_replay(user, mfa_code):
+            logger.warning(f"TOTP replay attempt detected during regeneration for user {user.id}")
+            raise ValueError(TOTP_REPLAY_MSG)
+        user.last_used_totp_code = mfa_code
+        user.last_used_totp_at = datetime.now(timezone.utc)
+
+    def _verify_recovery_code_for_regeneration(
+        self, user: User, recovery_code: Optional[str],
+        policy: dict, ip_address: Optional[str], user_agent: Optional[str]
+    ) -> None:
+        """Verify recovery code fallback for recovery code regeneration."""
+        if not policy["allows_recovery_code_fallback"]:
+            logger.warning(f"Privileged user {user.id} attempted recovery code fallback - denied")
+            raise PermissionError(
+                "Recovery code fallback is not allowed for privileged accounts. "
+                "Please use your authenticator app or contact an administrator."
+            )
+        if not recovery_code:
+            logger.warning(f"Missing recovery code for user {user.id} during regeneration")
+            raise ValueError("Recovery code is required")
+        is_valid, error = verify_recovery_code(
+            db=self.db, user_id=user.id, code=recovery_code,
+            ip_address=ip_address, user_agent=user_agent
+        )
+        if not is_valid:
+            logger.warning(f"Invalid recovery code during regeneration for user {user.id}: {error}")
+            raise ValueError(error or "Invalid recovery code")
+
+    def _verify_mfa_proof_for_regeneration(
+        self, user: User, method: str, mfa_code: Optional[str],
+        recovery_code: Optional[str], policy: dict,
+        ip_address: Optional[str], user_agent: Optional[str]
+    ) -> None:
+        """Verify MFA proof (TOTP or recovery code) for recovery code regeneration."""
+        if method == "totp":
+            self._verify_totp_for_regeneration(user, mfa_code)
+        elif method == "recovery_code":
+            self._verify_recovery_code_for_regeneration(
+                user, recovery_code, policy, ip_address, user_agent
+            )
+        else:
+            logger.warning(f"Invalid method for user {user.id} during regeneration: {method}")
+            raise ValueError(f"Invalid verification method: {method}")
 
     def regenerate_recovery_codes(
         self,
@@ -450,62 +507,19 @@ class MFAService:
         # STEP 1: Verify password (knowledge factor)
         if not verify_password(current_password, user.hashed_password):
             logger.warning(f"Invalid password during recovery code regeneration for user {user.id}")
-            raise ValueError("Current password is incorrect")
+            raise ValueError(INVALID_CURRENT_PASSWORD_MSG)
 
         # STEP 2: Verify MFA proof (possession factor)
         if policy["requires_mfa_proof"]:
-            if method == "totp":
-                # Verify TOTP code
-                if not mfa_code:
-                    logger.warning(f"Missing TOTP code for user {user.id} during regeneration")
-                    raise ValueError("TOTP code is required")
-
-                if not verify_totp_code(user.mfa_secret, mfa_code):
-                    logger.warning(f"Invalid TOTP code during regeneration for user {user.id}")
-                    raise ValueError("Invalid TOTP code")
-
-                # Replay protection — reject reuse within the same 30-second window
-                if is_totp_replay(user, mfa_code):
-                    logger.warning(f"TOTP replay attempt detected during regeneration for user {user.id}")
-                    raise ValueError("TOTP code already used. Please wait for the next code.")
-
-                # Record this code as used
-                user.last_used_totp_code = mfa_code
-                user.last_used_totp_at = datetime.now(timezone.utc)
-
-            elif method == "recovery_code":
-                # Check if recovery code fallback is allowed for this user
-                if not policy["allows_recovery_code_fallback"]:
-                    logger.warning(
-                        f"Privileged user {user.id} attempted recovery code fallback - denied"
-                    )
-                    raise PermissionError(
-                        "Recovery code fallback is not allowed for privileged accounts. "
-                        "Please use your authenticator app or contact an administrator."
-                    )
-
-                # Verify and consume recovery code
-                if not recovery_code:
-                    logger.warning(f"Missing recovery code for user {user.id} during regeneration")
-                    raise ValueError("Recovery code is required")
-
-                is_valid, error = verify_recovery_code(
-                    db=self.db,
-                    user_id=user.id,
-                    code=recovery_code,
-                    ip_address=ip_address,
-                    user_agent=user_agent
-                )
-
-                if not is_valid:
-                    logger.warning(
-                        f"Invalid recovery code during regeneration for user {user.id}: {error}"
-                    )
-                    raise ValueError(error or "Invalid recovery code")
-
-            else:
-                logger.warning(f"Invalid method for user {user.id} during regeneration: {method}")
-                raise ValueError(f"Invalid verification method: {method}")
+            self._verify_mfa_proof_for_regeneration(
+                user=user,
+                method=method,
+                mfa_code=mfa_code,
+                recovery_code=recovery_code,
+                policy=policy,
+                ip_address=ip_address,
+                user_agent=user_agent
+            )
 
         # STEP 3: Count old codes before invalidation (for audit and response)
         old_codes = self.db.query(MFARecoveryCode).filter(

@@ -7,6 +7,12 @@ from sqlalchemy.sql import func
 from app.database import Base
 import enum
 
+# ─── FOREIGN KEY REFERENCE CONSTANTS ─────────────────────────────────────────
+USERS_ID_FK = "users.id"
+NOTIFICATIONS_ID_FK = "notifications.id"
+LOCATIONS_ID_FK = "locations.id"
+
+
 
 # ─── ENUMS ────────────────────────────────────────────────────────────────────
 
@@ -76,21 +82,21 @@ group_members = Table(
     "group_members",
     Base.metadata,
     Column("group_id", Integer, ForeignKey("groups.id", ondelete="CASCADE"), primary_key=True),
-    Column("user_id", Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True),
+    Column("user_id", Integer, ForeignKey(USERS_ID_FK, ondelete="CASCADE"), primary_key=True),
 )
 
 notification_groups = Table(
     "notification_groups",
     Base.metadata,
-    Column("notification_id", Integer, ForeignKey("notifications.id", ondelete="CASCADE"), primary_key=True),
+    Column("notification_id", Integer, ForeignKey(NOTIFICATIONS_ID_FK, ondelete="CASCADE"), primary_key=True),
     Column("group_id", Integer, ForeignKey("groups.id", ondelete="CASCADE"), primary_key=True),
 )
 
 notification_users = Table(
     "notification_users",
     Base.metadata,
-    Column("notification_id", Integer, ForeignKey("notifications.id", ondelete="CASCADE"), primary_key=True),
-    Column("user_id", Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True),
+    Column("notification_id", Integer, ForeignKey(NOTIFICATIONS_ID_FK, ondelete="CASCADE"), primary_key=True),
+    Column("user_id", Integer, ForeignKey(USERS_ID_FK, ondelete="CASCADE"), primary_key=True),
 )
 
 
@@ -101,15 +107,17 @@ class User(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     email = Column(String(255), unique=True, index=True, nullable=False)
-    hashed_password = Column(String(255), nullable=False)
+    hashed_password = Column(String(255), nullable=True)  # Nullable for SSO/LDAP users
     first_name = Column(String(100), nullable=False)
     last_name = Column(String(100), nullable=False)
-    phone = Column(String(20))
+    phone = Column(String(20), unique=True, index=True, nullable=True)  # Unique phone number per user
     department = Column(String(100))
     title = Column(String(100))
     employee_id = Column(String(50), unique=True)
-    role = Column(Enum(UserRole), default=UserRole.VIEWER, nullable=False)
-    is_active = Column(Boolean, default=False)  # Tracks real-time online presence
+    role = Column(Enum(UserRole, values_callable=lambda x: [e.value for e in x]), default=UserRole.VIEWER, nullable=False)
+    is_enabled = Column(Boolean, default=True, nullable=False)  # Account status - admin controlled
+    is_active = Column(Boolean, default=False)  # DEPRECATED: use is_online instead
+    is_online = Column(Boolean, default=False)  # Real-time online presence (heartbeat)
     is_verified = Column(Boolean, default=False)
     mfa_enabled = Column(Boolean, default=False)
     mfa_secret = Column(String(255))  # Increased from 32 to store Fernet-encrypted secrets
@@ -119,13 +127,15 @@ class User(Base):
     preferred_channels = Column(JSON, default=["sms", "email"])
     latitude = Column(Float, nullable=True)   # Last known latitude
     longitude = Column(Float, nullable=True)  # Last known longitude
-    location_id = Column(Integer, ForeignKey("locations.id"), nullable=True)
+    location_id = Column(Integer, ForeignKey(LOCATIONS_ID_FK), nullable=True)
     last_login = Column(DateTime(timezone=True))
     last_seen_at = Column(DateTime(timezone=True), nullable=True)  # Last heartbeat timestamp
     password_reset_token = Column(String(100))
     password_reset_expires = Column(DateTime(timezone=True))
     token_valid_after = Column(DateTime(timezone=True), nullable=True)
     force_password_change = Column(Boolean, default=False, nullable=False)
+    auth_provider = Column(String(20), default="local", nullable=False, server_default="local")  # "local", "entra", "ldap"
+    external_id = Column(String(255), nullable=True, unique=True, index=True)  # Entra OID or LDAP DN
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
@@ -166,11 +176,11 @@ class Group(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(200), nullable=False)
     description = Column(Text)
-    type = Column(Enum(GroupType), default=GroupType.STATIC, nullable=False)
-    location_id = Column(Integer, ForeignKey("locations.id"), nullable=True)
+    type = Column(Enum(GroupType, values_callable=lambda x: [e.value for e in x]), default=GroupType.STATIC, nullable=False)
+    location_id = Column(Integer, ForeignKey(LOCATIONS_ID_FK), nullable=True)
     dynamic_filter = Column(JSON)  # e.g. {"department": "IT", "location_id": 1}
     is_active = Column(Boolean, default=True)
-    created_by_id = Column(Integer, ForeignKey("users.id"))
+    created_by_id = Column(Integer, ForeignKey(USERS_ID_FK))
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
@@ -195,7 +205,7 @@ class NotificationTemplate(Base):
     channels = Column(JSON, default=["sms", "email"])
     variables = Column(JSON)  # list of {name, description} placeholders
     is_active = Column(Boolean, default=True)
-    created_by_id = Column(Integer, ForeignKey("users.id"))
+    created_by_id = Column(Integer, ForeignKey(USERS_ID_FK))
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
@@ -211,10 +221,10 @@ class Incident(Base):
     severity = Column(Enum(IncidentSeverity, values_callable=lambda x: [e.value for e in x]), default=IncidentSeverity.MEDIUM)
     status = Column(Enum(IncidentStatus, values_callable=lambda x: [e.value for e in x]), default=IncidentStatus.ACTIVE)
     description = Column(Text)
-    location_id = Column(Integer, ForeignKey("locations.id"), nullable=True)
-    created_by_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    location_id = Column(Integer, ForeignKey(LOCATIONS_ID_FK), nullable=True)
+    created_by_id = Column(Integer, ForeignKey(USERS_ID_FK), nullable=False)
     resolved_at = Column(DateTime(timezone=True))
-    resolved_by_id = Column(Integer, ForeignKey("users.id"))
+    resolved_by_id = Column(Integer, ForeignKey(USERS_ID_FK))
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
@@ -234,7 +244,7 @@ class Notification(Base):
     message = Column(Text, nullable=False)
     subject = Column(String(500))  # for email
     channels = Column(JSON, nullable=False)  # ["sms","email","voice","slack","teams"]
-    status = Column(Enum(NotificationStatus), default=NotificationStatus.DRAFT)
+    status = Column(Enum(NotificationStatus, values_callable=lambda x: [e.value for e in x]), default=NotificationStatus.DRAFT)
     target_all = Column(Boolean, default=False)
     scheduled_at = Column(DateTime(timezone=True))
     scheduled_timezone = Column(String(100))  # Original timezone (e.g., "America/New_York")
@@ -248,7 +258,7 @@ class Notification(Base):
     deadline_escalated = Column(Boolean, default=False)  # Track if deadline escalation was sent
     slack_webhook_url = Column(String(500))
     teams_webhook_url = Column(String(500))
-    created_by_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    created_by_id = Column(Integer, ForeignKey(USERS_ID_FK), nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
@@ -268,11 +278,11 @@ class DeliveryLog(Base):
     )
 
     id = Column(Integer, primary_key=True, index=True)
-    notification_id = Column(Integer, ForeignKey("notifications.id", ondelete="CASCADE"), nullable=False)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    notification_id = Column(Integer, ForeignKey(NOTIFICATIONS_ID_FK, ondelete="CASCADE"), nullable=False)
+    user_id = Column(Integer, ForeignKey(USERS_ID_FK, ondelete="CASCADE"), nullable=False)
     user_email = Column(String(255), nullable=True)  # Preserved after user deletion
-    channel = Column(Enum(AlertChannel), nullable=False)
-    status = Column(Enum(DeliveryStatus), default=DeliveryStatus.PENDING)
+    channel = Column(Enum(AlertChannel, values_callable=lambda x: [e.value for e in x]), nullable=False)
+    status = Column(Enum(DeliveryStatus, values_callable=lambda x: [e.value for e in x]), default=DeliveryStatus.PENDING)
     external_id = Column(String(200))  # Twilio SID, SES MessageId, etc.
     to_address = Column(String(255))  # phone or email
     error_message = Column(Text)
@@ -289,11 +299,11 @@ class NotificationResponse(Base):
     __tablename__ = "notification_responses"
 
     id = Column(Integer, primary_key=True, index=True)
-    notification_id = Column(Integer, ForeignKey("notifications.id", ondelete="CASCADE"), nullable=False)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    notification_id = Column(Integer, ForeignKey(NOTIFICATIONS_ID_FK, ondelete="CASCADE"), nullable=False)
+    user_id = Column(Integer, ForeignKey(USERS_ID_FK, ondelete="CASCADE"), nullable=False)
     user_email = Column(String(255), nullable=True)  # Preserved after user deletion
-    channel = Column(Enum(AlertChannel))
-    response_type = Column(Enum(ResponseType), nullable=False)
+    channel = Column(Enum(AlertChannel, values_callable=lambda x: [e.value for e in x]))
+    response_type = Column(Enum(ResponseType, values_callable=lambda x: [e.value for e in x]), nullable=False)
     message = Column(Text)
     latitude = Column(Float)
     longitude = Column(Float)
@@ -311,10 +321,10 @@ class IncomingMessage(Base):
     from_number = Column(String(20), nullable=False)
     to_number = Column(String(20))
     body = Column(Text)
-    channel = Column(Enum(AlertChannel), default=AlertChannel.SMS)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    channel = Column(Enum(AlertChannel, values_callable=lambda x: [e.value for e in x]), default=AlertChannel.SMS)
+    user_id = Column(Integer, ForeignKey(USERS_ID_FK, ondelete="CASCADE"), nullable=False)
     user_email = Column(String(255), nullable=True)  # Preserved after user deletion
-    notification_id = Column(Integer, ForeignKey("notifications.id"), nullable=True)
+    notification_id = Column(Integer, ForeignKey(NOTIFICATIONS_ID_FK), nullable=True)
     is_processed = Column(Boolean, default=False)
     received_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -326,7 +336,7 @@ class AuditLog(Base):
     __tablename__ = "audit_logs"
 
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    user_id = Column(Integer, ForeignKey(USERS_ID_FK, ondelete="SET NULL"), nullable=True)
     user_email = Column(String(255), nullable=True)  # Preserved after user deletion
     action = Column(String(200), nullable=False)
     resource_type = Column(String(100))
@@ -343,7 +353,7 @@ class RefreshToken(Base):
     __tablename__ = "refresh_tokens"
 
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    user_id = Column(Integer, ForeignKey(USERS_ID_FK, ondelete="CASCADE"), nullable=False)
     token = Column(String(500), unique=True, nullable=False)
     expires_at = Column(DateTime(timezone=True), nullable=False)
     revoked = Column(Boolean, default=False)
@@ -385,10 +395,10 @@ class UserLocation(Base):
     __tablename__ = "user_locations"
 
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
-    location_id = Column(Integer, ForeignKey("locations.id", ondelete="CASCADE"), nullable=False, index=True)
-    assignment_type = Column(Enum(UserLocationAssignmentType), nullable=False, default=UserLocationAssignmentType.MANUAL)
-    status = Column(Enum(UserLocationStatus), nullable=False, default=UserLocationStatus.ACTIVE)
+    user_id = Column(Integer, ForeignKey(USERS_ID_FK, ondelete="CASCADE"), nullable=False, index=True)
+    location_id = Column(Integer, ForeignKey(LOCATIONS_ID_FK, ondelete="CASCADE"), nullable=False, index=True)
+    assignment_type = Column(Enum(UserLocationAssignmentType, values_callable=lambda x: [e.value for e in x]), nullable=False, default=UserLocationAssignmentType.MANUAL)
+    status = Column(Enum(UserLocationStatus, values_callable=lambda x: [e.value for e in x]), nullable=False, default=UserLocationStatus.ACTIVE)
     
     # For geofence assignments: track the coordinates that triggered the assignment
     detected_latitude = Column(Float, nullable=True)
@@ -396,7 +406,7 @@ class UserLocation(Base):
     distance_from_center_miles = Column(Float, nullable=True)  # Distance when assigned
     
     # Metadata
-    assigned_by_id = Column(Integer, ForeignKey("users.id"), nullable=True)  # Admin who manually assigned (if manual)
+    assigned_by_id = Column(Integer, ForeignKey(USERS_ID_FK), nullable=True)  # Admin who manually assigned (if manual)
     notes = Column(Text, nullable=True)
     
     # Timestamps
@@ -425,18 +435,18 @@ class UserLocationHistory(Base):
     __tablename__ = "user_location_history"
 
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
-    location_id = Column(Integer, ForeignKey("locations.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey(USERS_ID_FK, ondelete="CASCADE"), nullable=False, index=True)
+    location_id = Column(Integer, ForeignKey(LOCATIONS_ID_FK, ondelete="CASCADE"), nullable=False, index=True)
     user_location_id = Column(Integer, ForeignKey("user_locations.id", ondelete="CASCADE"), nullable=True)  # Reference to current record
     
     # Action taken
     action = Column(String(50), nullable=False)  # assigned, removed, entered_geofence, exited_geofence, status_changed
-    assignment_type = Column(Enum(UserLocationAssignmentType), nullable=True)
-    previous_status = Column(Enum(UserLocationStatus), nullable=True)
-    new_status = Column(Enum(UserLocationStatus), nullable=True)
+    assignment_type = Column(Enum(UserLocationAssignmentType, values_callable=lambda x: [e.value for e in x]), nullable=True)
+    previous_status = Column(Enum(UserLocationStatus, values_callable=lambda x: [e.value for e in x]), nullable=True)
+    new_status = Column(Enum(UserLocationStatus, values_callable=lambda x: [e.value for e in x]), nullable=True)
     
     # Context
-    triggered_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)  # Admin who triggered (if manual)
+    triggered_by_user_id = Column(Integer, ForeignKey(USERS_ID_FK), nullable=True)  # Admin who triggered (if manual)
     reason = Column(Text, nullable=True)
     
     # Location data at time of action
@@ -485,7 +495,7 @@ class MFARecoveryCode(Base):
     __tablename__ = "mfa_recovery_codes"
     
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey(USERS_ID_FK, ondelete="CASCADE"), nullable=False, index=True)
     
     # Hashed code (bcrypt or SHA256 with salt)
     # Never store plaintext recovery codes
@@ -505,7 +515,7 @@ class MFARecoveryCode(Base):
     used_user_agent = Column(String(500), nullable=True)
     
     # Optional: track which admin/generated context
-    generated_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    generated_by_user_id = Column(Integer, ForeignKey(USERS_ID_FK, ondelete="SET NULL"), nullable=True)
     generation_reason = Column(String(100), nullable=True)  # 'initial_setup', 'regenerated', 'admin_reset'
     
     # Relationships

@@ -15,8 +15,11 @@ branch_labels = None
 depends_on = None
 
 def upgrade():
+    # This is a merge migration — no schema changes needed.
+    # Merges heads: 20260312_121931 and add_scheduled_timezone.
     pass
 
 
 def downgrade():
+    # Merge migrations have no downgrade operation.
     pass
