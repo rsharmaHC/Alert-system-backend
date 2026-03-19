@@ -435,16 +435,14 @@ def _is_safe_url(url: str) -> bool:
 class WebhookService:
     def send_slack(self, webhook_url: str, message: str, title: str = "") -> dict:
         if not webhook_url:
-            webhook_url = settings.SLACK_DEFAULT_WEBHOOK_URL
-        if not webhook_url:
-            logger.warning(f"[MOCK SLACK] Title: {title} | Message: {message[:50]}...")
-            return {"status": "mock"}
-        
+            logger.warning(f"[SLACK] No webhook URL provided | Message: {message[:50]}...")
+            return {"status": "skipped", "error": "No webhook URL provided"}
+
         # Validate URL to prevent SSRF attacks
         if not _is_safe_url(webhook_url):
             logger.error("Slack webhook blocked: SSRF protection triggered for URL")
             return {"status": "blocked", "error": "Invalid webhook URL"}
-        
+
         try:
             import httpx
             payload = {
@@ -461,16 +459,14 @@ class WebhookService:
 
     def send_teams(self, webhook_url: str, message: str, title: str = "") -> dict:
         if not webhook_url:
-            webhook_url = settings.TEAMS_DEFAULT_WEBHOOK_URL
-        if not webhook_url:
-            logger.warning(f"[MOCK TEAMS] Title: {title} | Message: {message[:50]}...")
-            return {"status": "mock"}
-        
+            logger.warning(f"[TEAMS] No webhook URL provided | Message: {message[:50]}...")
+            return {"status": "skipped", "error": "No webhook URL provided"}
+
         # Validate URL to prevent SSRF attacks
         if not _is_safe_url(webhook_url):
             logger.error("Teams webhook blocked: SSRF protection triggered for URL")
             return {"status": "blocked", "error": "Invalid webhook URL"}
-        
+
         try:
             import httpx
             payload = {

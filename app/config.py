@@ -44,9 +44,6 @@ class Settings(BaseSettings):
     # LocationIQ API key (optional - for geocoding fallback)
     LOCATIONIQ_API_KEY: str = ""
 
-    SLACK_DEFAULT_WEBHOOK_URL: str = ""
-    TEAMS_DEFAULT_WEBHOOK_URL: str = ""
-
     # MFA/2FA settings
     # TOTP valid window: 0 = current step only (most secure), 1 = allow one step for clock skew
     # RFC 6237 recommends at most one time step; 0 is preferred for security

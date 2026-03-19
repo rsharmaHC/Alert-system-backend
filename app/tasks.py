@@ -43,10 +43,21 @@ def _should_skip_notification(notification: Notification) -> tuple[bool, str]:
 
 
 def _create_delivery_logs(db, notification: Notification, recipients: List[User]) -> List[tuple]:
-    """Create delivery logs for all recipients and channels. Returns dispatch list."""
+    """Create delivery logs for all recipients and channels. Returns dispatch list.
+    
+    Note: Slack and Teams are webhook-based channels sent once per notification,
+    not per-user. They don't create individual delivery logs.
+    """
+    # Webhook channels are sent once per notification, not per-user
+    webhook_channels = {AlertChannel.SLACK, AlertChannel.TEAMS}
+    
     dispatch_list = []
     for user in recipients:
         for channel in notification.channels:
+            # Skip webhook channels - they don't have per-user delivery logs
+            if channel in webhook_channels:
+                continue
+                
             existing_log = db.query(DeliveryLog).filter(
                 DeliveryLog.notification_id == notification.id,
                 DeliveryLog.user_id == user.id,
@@ -66,32 +77,74 @@ def _create_delivery_logs(db, notification: Notification, recipients: List[User]
     return dispatch_list
 
 
-def _send_webhooks(notification: Notification) -> List[str]:
-    """Send notifications to webhooks. Returns list of errors."""
+def _send_webhooks(db, notification: Notification, triggered_by_user_id: int = None) -> List[str]:
+    """Send notifications to webhooks and create delivery log entries. Returns list of errors.
+    
+    Args:
+        db: Database session
+        notification: Notification object
+        triggered_by_user_id: ID of user who triggered the notification (for delivery logs)
+    """
     webhook_errors = []
     
+    # Get the user email for delivery logs
+    user_email = None
+    if triggered_by_user_id:
+        user = db.query(User).filter(User.id == triggered_by_user_id).first()
+        if user:
+            user_email = user.email
+
     if AlertChannel.SLACK in notification.channels and notification.slack_webhook_url:
         try:
-            webhook_service.send_slack(
+            result = webhook_service.send_slack(
                 notification.slack_webhook_url,
                 notification.message,
                 notification.title
             )
+            # Create a delivery log entry for Slack webhook
+            # Use the triggered_by_user_id (admin who sent the notification)
+            log = DeliveryLog(
+                notification_id=notification.id,
+                user_id=triggered_by_user_id,
+                user_email=user_email,
+                channel=AlertChannel.SLACK,
+                status=DeliveryStatus.SENT if result.get("status") == "sent" else DeliveryStatus.FAILED,
+                to_address="webhook",
+                error_message=result.get("error") if result.get("status") != "sent" else None,
+                sent_at=datetime.now(timezone.utc)
+            )
+            db.add(log)
+            if result.get("status") != "sent":
+                webhook_errors.append(f"Slack: {result.get('error', 'Unknown error')}")
         except Exception as e:
             logger.error(f"Slack webhook failed for notification {notification.id}: {e}")
             webhook_errors.append(f"Slack: {e}")
 
     if AlertChannel.TEAMS in notification.channels and notification.teams_webhook_url:
         try:
-            webhook_service.send_teams(
+            result = webhook_service.send_teams(
                 notification.teams_webhook_url,
                 notification.message,
                 notification.title
             )
+            # Create a delivery log entry for Teams webhook
+            log = DeliveryLog(
+                notification_id=notification.id,
+                user_id=triggered_by_user_id,
+                user_email=user_email,
+                channel=AlertChannel.TEAMS,
+                status=DeliveryStatus.SENT if result.get("status") == "sent" else DeliveryStatus.FAILED,
+                to_address="webhook",
+                error_message=result.get("error") if result.get("status") != "sent" else None,
+                sent_at=datetime.now(timezone.utc)
+            )
+            db.add(log)
+            if result.get("status") != "sent":
+                webhook_errors.append(f"Teams: {result.get('error', 'Unknown error')}")
         except Exception as e:
             logger.error(f"Teams webhook failed for notification {notification.id}: {e}")
             webhook_errors.append(f"Teams: {e}")
-    
+
     return webhook_errors
 
 
@@ -227,7 +280,8 @@ def send_notification_task(self, notification_id: int, triggered_by_user_id: int
 
         logger.info(f"Notification {notification_id}: dispatched {len(dispatch_list)} subtasks to {len(recipients)} recipients")
 
-        webhook_errors = _send_webhooks(notification)
+        webhook_errors = _send_webhooks(db, notification, triggered_by_user_id)
+        db.commit()  # Commit webhook delivery logs
         if webhook_errors:
             logger.warning(f"Notification {notification_id} sent successfully but webhooks failed: {webhook_errors}")
 
