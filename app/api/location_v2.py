@@ -522,7 +522,7 @@ async def health_check():
 
 @router.delete("/cache")
 async def clear_cache(
-    pattern: Optional[str] = Query(default=None),
+    pattern: Annotated[Optional[str], Query()] = None,
 ):
     """Admin endpoint to flush location cache."""
     try:

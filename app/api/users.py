@@ -694,7 +694,7 @@ def _process_csv_row(
 
 @router.post("/import/csv", response_model=CSVImportResponse)
 async def import_users_csv(
-    file: UploadFile = File(...),
+    file: Annotated[UploadFile, File(...)],
     db: Annotated[Session, Depends(get_db)] = None,
     current_user: Annotated[User, Depends(require_admin)] = None,
     request: Request = None,
