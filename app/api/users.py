@@ -206,30 +206,26 @@ def list_users(
     return UserListResponse(total=total, page=page, page_size=page_size, items=users)
 
 
-@router.post("", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
-def create_user(
-    data: UserCreate,
-    db: Annotated[Session, Depends(get_db)] = None,
-    current_user: Annotated[User, Depends(require_admin)] = None,
-    request: Request = None,
-):
-    # Check email uniqueness
+# ─── USER CREATION HELPERS ───────────────────────────────────────────────────
+
+def _check_user_uniqueness(db: Session, data: UserCreate) -> None:
+    """Validate uniqueness of email, phone, and employee_id."""
     if db.query(User).filter(User.email == data.email).first():
         raise HTTPException(status_code=400, detail="Email already registered")
 
-    # Check phone uniqueness (if provided)
-    if data.phone:
-        if db.query(User).filter(User.phone == data.phone).first():
-            raise HTTPException(status_code=400, detail="Phone number already registered. Each user must have a unique phone number.")
+    if data.phone and db.query(User).filter(User.phone == data.phone).first():
+        raise HTTPException(
+            status_code=400,
+            detail="Phone number already registered. Each user must have a unique phone number."
+        )
 
-    if data.employee_id:
-        if db.query(User).filter(User.employee_id == data.employee_id).first():
-            raise HTTPException(status_code=400, detail="Employee ID already exists")
+    if data.employee_id and db.query(User).filter(User.employee_id == data.employee_id).first():
+        raise HTTPException(status_code=400, detail="Employee ID already exists")
 
-    # Prevent privilege escalation: ADMIN cannot create SUPER_ADMIN users
-    _prevent_privilege_escalation(current_user, data.role)
 
-    user = User(
+def _create_user_record(data: UserCreate, current_user: User) -> User:
+    """Create a User ORM object from validated data."""
+    return User(
         email=data.email,
         hashed_password=hash_password(data.password),
         first_name=data.first_name,
@@ -243,6 +239,92 @@ def create_user(
         preferred_channels=data.preferred_channels,
         is_active=True
     )
+
+
+def _handle_user_creation_error(e: Exception, data: UserCreate) -> None:
+    """Handle database errors during user creation."""
+    error_msg = str(e).lower()
+    if "unique" in error_msg or "duplicate" in error_msg:
+        if "phone" in error_msg or "phone" in str(data):
+            raise HTTPException(
+                status_code=400,
+                detail="Phone number already registered. Each user must have a unique phone number."
+            )
+        raise HTTPException(
+            status_code=400,
+            detail="A user with this email or employee ID already exists"
+        )
+    raise HTTPException(status_code=500, detail="Failed to create user")
+
+
+# ─── USER ENDPOINTS ──────────────────────────────────────────────────────────
+
+@router.post(
+    "",
+    response_model=UserResponse,
+    status_code=status.HTTP_201_CREATED,
+    responses={
+        400: {
+            "description": "Bad Request - Duplicate email, phone, or employee_id",
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "email": {"summary": "Email already registered", "value": {"detail": "Email already registered"}},
+                        "phone": {"summary": "Phone already registered", "value": {"detail": "Phone number already registered..."}},
+                        "employee_id": {"summary": "Employee ID exists", "value": {"detail": "Employee ID already exists"}},
+                    }
+                }
+            }
+        },
+        403: {
+            "description": "Forbidden - ADMIN cannot create SUPER_ADMIN users",
+            "content": {
+                "application/json": {
+                    "example": {"detail": "Only SUPER_ADMIN can create or update SUPER_ADMIN users"}
+                }
+            }
+        },
+        500: {
+            "description": "Internal Server Error - Database error during creation",
+            "content": {
+                "application/json": {
+                    "example": {"detail": "Failed to create user"}
+                }
+            }
+        },
+    }
+)
+def create_user(
+    data: UserCreate,
+    db: Annotated[Session, Depends(get_db)] = None,
+    current_user: Annotated[User, Depends(require_admin)] = None,
+    request: Request = None,
+):
+    """Create a new user account.
+
+    Args:
+        data: User creation data
+        db: Database session
+        current_user: Authenticated admin user
+        request: HTTP request for audit logging
+
+    Returns:
+        Created user account
+
+    Raises:
+        HTTPException: 400 - Duplicate email, phone, or employee_id
+        HTTPException: 403 - ADMIN cannot create SUPER_ADMIN users
+        HTTPException: 500 - Database error during creation
+    """
+    # Validate uniqueness constraints
+    _check_user_uniqueness(db, data)
+
+    # Prevent privilege escalation
+    _prevent_privilege_escalation(current_user, data.role)
+
+    # Create user record
+    user = _create_user_record(data, current_user)
+
     db.add(user)
     db.add(create_audit_log(
         user_id=current_user.id,
@@ -252,21 +334,15 @@ def create_user(
         details={"email": data.email, "phone": data.phone},
         request=request,
     ))
+
     try:
         db.commit()
         db.refresh(user)
-
-        # Refresh dynamic group memberships for the new user
         refresh_dynamic_groups_for_user(db, user)
-
     except Exception as e:
         db.rollback()
-        error_msg = str(e).lower()
-        if "unique" in error_msg or "duplicate" in error_msg:
-            if "phone" in error_msg or "phone" in str(data):
-                raise HTTPException(status_code=400, detail="Phone number already registered. Each user must have a unique phone number.")
-            raise HTTPException(status_code=400, detail="A user with this email or employee ID already exists")
-        raise HTTPException(status_code=500, detail="Failed to create user")
+        _handle_user_creation_error(e, data)
+
     return user
 
 
@@ -425,6 +501,39 @@ def _check_phone_unique(db: Session, phone: str, exclude_user_id: int) -> None:
         )
 
 
+def _validate_super_admin_access(user: User, current_user: User) -> None:
+    """Validate that only SUPER_ADMIN can modify SUPER_ADMIN users."""
+    if user.role == UserRole.SUPER_ADMIN and current_user.role != UserRole.SUPER_ADMIN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only SUPER_ADMIN can modify SUPER_ADMIN users",
+        )
+
+
+def _update_user_fields(user: User, data: UserUpdate) -> None:
+    """Apply update data to user object, handling empty employee_id."""
+    for field, value in data.model_dump(exclude_unset=True).items():
+        if field == 'user_id':
+            continue
+        if field == 'employee_id' and value == '':
+            value = None
+        setattr(user, field, value)
+
+
+@router.put(
+    "/{user_id}",
+    response_model=UserResponse,
+    responses={
+        404: {
+            "description": "Not Found - User does not exist",
+            "content": {
+                "application/json": {
+                    "example": {"detail": "User not found"}
+                }
+            }
+        },
+    }
+)
 def update_user(
     user_id: int,
     data: UserUpdate,
@@ -432,33 +541,30 @@ def update_user(
     current_user: Annotated[User, Depends(require_admin)] = None,
     request: Request = None,
 ):
+    """Update a user account (admin endpoint).
+
+    Args:
+        user_id: ID of user to update
+        data: User update data
+        db: Database session
+        current_user: Authenticated admin user
+        request: HTTP request for audit logging
+
+    Returns:
+        Updated user account
+
+    Raises:
+        HTTPException: 404 - User not found
+        HTTPException: 403 - Insufficient permissions
+    """
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail=USER_NOT_FOUND_MSG)
 
-    if user.role == UserRole.SUPER_ADMIN and current_user.role != UserRole.SUPER_ADMIN:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only SUPER_ADMIN can modify SUPER_ADMIN users",
-        )
-    if data.role is not None:
-        _prevent_privilege_escalation(current_user, data.role)
-
-    if data.employee_id is not None:
-        employee_id_value = data.employee_id if data.employee_id != '' else None
-        if employee_id_value:
-            _check_employee_id_unique(db, employee_id_value, user_id)
-
-    if data.email is not None and data.email != user.email:
-        _check_email_unique(db, data.email, user_id)
-
-    if data.phone is not None and data.phone != user.phone:
-        _check_phone_unique(db, data.phone, user_id)
-
-    for field, value in data.model_dump(exclude_unset=True).items():
-        if field == 'employee_id' and value == '':
-            value = None
-        setattr(user, field, value)
+    _validate_super_admin_access(user, current_user)
+    _prevent_privilege_escalation(current_user, data.role)
+    _validate_user_uniqueness(db, user, data)
+    _update_user_fields(user, data)
 
     db.add(create_audit_log(
         user_id=current_user.id,
@@ -745,36 +851,13 @@ def _process_csv_row(
         return {"status": "error", "error": f"Row {row_num}: {str(e)}"}
 
 
-@router.post("/import/csv", response_model=CSVImportResponse)
-async def import_users_csv(
-    file: Annotated[UploadFile, File(...)],
-    db: Annotated[Session, Depends(get_db)] = None,
-    current_user: Annotated[User, Depends(require_admin)] = None,
-    request: Request = None,
-):
-    """
-    Import users from CSV. Expected columns:
-    first_name, last_name, email, phone, department, title, employee_id, role
+# ─── CSV IMPORT HELPERS ──────────────────────────────────────────────────────
 
-    Sends welcome emails with login credentials to newly created users.
-    """
-    # Rate limiting: Check API rate limit for state-changing operations
-    is_allowed, retry_after = await check_api_rate_limit(current_user.id, "import_users_csv")
-    if not is_allowed:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=f"Rate limit exceeded. Maximum {API_RATE_LIMIT_MAX} requests per minute for this endpoint.",
-            headers={"Retry-After": str(retry_after)}
-        )
-    
-    # Record the API request for rate limiting
-    await record_api_request(current_user.id, "import_users_csv")
-    
-    # Validate file extension
+def _validate_csv_file(file: UploadFile) -> None:
+    """Validate CSV file extension and MIME type."""
     if not file.filename.endswith('.csv'):
         raise HTTPException(status_code=400, detail="File must be a CSV")
 
-    # Validate MIME type (not just extension) to prevent file type spoofing
     allowed_mime_types = ['text/csv', 'application/vnd.ms-excel', 'application/csv']
     if file.content_type and file.content_type not in allowed_mime_types:
         raise HTTPException(
@@ -782,32 +865,34 @@ async def import_users_csv(
             detail=f"Invalid file type. Expected CSV (text/csv), got {file.content_type}"
         )
 
-    # Validate file size to prevent DoS attacks (max 5MB)
-    content = await file.read()
+
+def _read_and_validate_csv_content(content: bytes) -> List[dict]:
+    """Read CSV content and validate size/row count."""
     if len(content) > MAX_CSV_FILE_SIZE:
         raise HTTPException(
             status_code=413,
             detail=f"File size exceeds maximum allowed size of {MAX_CSV_FILE_SIZE // (1024 * 1024)}MB"
         )
-    
-    # Parse CSV content
+
     reader = csv.DictReader(io.StringIO(content.decode('utf-8-sig')))
-    
-    # Convert to list to validate row count
     rows = list(reader)
-    
-    # Validate row count (max 1,000 rows per request)
+
     if len(rows) > MAX_CSV_ROWS:
         raise HTTPException(
             status_code=400,
             detail=f"CSV file exceeds maximum allowed rows of {MAX_CSV_ROWS}. Please split your import into smaller batches."
         )
 
+    return rows
+
+
+def _process_csv_rows(
+    rows: List[dict], db: Session, current_user: User,
+    created_users: list, valid_users: list
+) -> tuple:
+    """Process all CSV rows and return counts."""
     created, updated, failed = 0, 0, 0
     errors = []
-    created_users = []  # Track new users for email sending
-    email_failures = []
-    valid_users = []  # Track successfully processed users for batch commit
 
     for i, row in enumerate(rows, start=2):
         result = _process_csv_row(
@@ -825,8 +910,15 @@ async def import_users_csv(
             errors.append(result["error"])
             failed += 1
 
-    # Commit all valid rows in a single transaction
-    # Invalid rows are skipped but don't affect valid rows
+    return created, updated, failed, errors
+
+
+def _commit_csv_import(
+    db: Session, current_user: User, request: Request,
+    created: int, updated: int, failed: int,
+    valid_users: list, errors: list
+) -> None:
+    """Commit CSV import and create audit log."""
     if valid_users:
         db.add(create_audit_log(
             user_id=current_user.id,
@@ -844,13 +936,10 @@ async def import_users_csv(
         ))
         db.commit()
         logger.info(f"CSV import committed: {created} created, {updated} updated, {failed} failed")
-        
-        # Refresh dynamic group memberships for all imported/updated users
+
         for action_type, user_obj in valid_users:
             refresh_dynamic_groups_for_user(db, user_obj)
     else:
-        # No valid rows to commit - still log the failed import attempt
-        # Store all errors (no truncation) for complete audit trail
         db.add(create_audit_log(
             user_id=current_user.id,
             user_email=current_user.email,
@@ -859,19 +948,24 @@ async def import_users_csv(
             details={
                 "failed": failed,
                 "total_rows": failed,
-                "errors": errors  # Include all errors for complete audit trail
+                "errors": errors
             },
             request=request,
         ))
         db.commit()
         logger.warning(f"CSV import had no valid rows to commit, {failed} rows failed")
 
-    # Track email sending results for audit log
-    emails_sent = 0
-    emails_failed = 0
 
-    # Send welcome emails to newly created users (after commit)
+def _send_welcome_emails(
+    db: Session, current_user: User, request: Request,
+    created_users: list
+) -> tuple:
+    """Send welcome emails to newly created users."""
     from app.services.messaging import email_service
+    
+    emails_sent, emails_failed = 0, 0
+    email_failures = []
+
     for user_data in created_users:
         try:
             full_name = f"{user_data['first_name']} {user_data['last_name']}"
@@ -883,16 +977,15 @@ async def import_users_csv(
             if result.get('status') == 'failed':
                 emails_failed += 1
                 email_failures.append(f"Email to {_scrub_email(user_data['email'])} failed: {result.get('error', 'Unknown error')}")
-                logger.error(f"Welcome email failed for user_id={user_data.get('id', 'N/A')}, email={_scrub_email(user_data['email'])}: {result.get('error')}")
+                logger.error(f"Welcome email failed for {user_data.get('email')}: {result.get('error')}")
             else:
                 emails_sent += 1
-                logger.info(f"Welcome email sent to user_id={user_data.get('id', 'N/A')}, email={_scrub_email(user_data['email'])}")
+                logger.info(f"Welcome email sent to {user_data.get('email')}")
         except Exception as e:
             emails_failed += 1
             email_failures.append(f"Email to {_scrub_email(user_data['email'])} error: {str(e)}")
-            logger.error(f"Exception sending welcome email to user_id={user_data.get('id', 'N/A')}, email={_scrub_email(user_data['email'])}: {e}")
+            logger.error(f"Exception sending welcome email to {user_data.get('email')}: {e}")
 
-    # Add secondary audit log for email results if there were newly created users
     if created_users and (emails_sent > 0 or emails_failed > 0):
         db.add(create_audit_log(
             user_id=current_user.id,
@@ -908,22 +1001,113 @@ async def import_users_csv(
         ))
         db.commit()
 
-    # Add errors to response if any
-    all_errors = errors + email_failures
+    return emails_sent, emails_failed, email_failures
 
-    # Return created users WITHOUT passwords for security
-    # Passwords are only sent via email to the users
-    created_users_public = [
-        {"email": u["email"], "first_name": u["first_name"], "last_name": u["last_name"]}
-        for u in created_users
-    ]
+
+# ─── CSV IMPORT ENDPOINT ─────────────────────────────────────────────────────
+
+@router.post(
+    "/import/csv",
+    response_model=CSVImportResponse,
+    responses={
+        400: {
+            "description": "Bad Request - Invalid file format or too many rows",
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "format": {"summary": "Invalid file format", "value": {"detail": "File must be a CSV"}},
+                        "rows": {"summary": "Too many rows", "value": {"detail": "CSV file exceeds maximum allowed rows..."}},
+                    }
+                }
+            }
+        },
+        413: {
+            "description": "Payload Too Large - File size exceeds 5MB limit",
+            "content": {
+                "application/json": {
+                    "example": {"detail": "File size exceeds maximum allowed size of 5MB"}
+                }
+            }
+        },
+        429: {
+            "description": "Too Many Requests - Rate limit exceeded",
+            "content": {
+                "application/json": {
+                    "example": {"detail": "Rate limit exceeded. Maximum 10 requests per minute."}
+                }
+            }
+        },
+    }
+)
+async def import_users_csv(
+    file: Annotated[UploadFile, File(...)],
+    db: Annotated[Session, Depends(get_db)] = None,
+    current_user: Annotated[User, Depends(require_admin)] = None,
+    request: Request = None,
+):
+    """Import users from CSV file.
+
+    Expected columns: first_name, last_name, email, phone, department, title, employee_id, role
+
+    Args:
+        file: CSV file to import
+        db: Database session
+        current_user: Authenticated admin user
+        request: HTTP request for audit logging
+
+    Returns:
+        Import results with created, updated, failed counts and created user list
+
+    Raises:
+        HTTPException: 400 - Invalid file format or too many rows
+        HTTPException: 413 - File size exceeds 5MB
+        HTTPException: 429 - Rate limit exceeded
+    """
+    # Rate limiting
+    is_allowed, retry_after = await check_api_rate_limit(current_user.id, "import_users_csv")
+    if not is_allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Rate limit exceeded. Maximum {API_RATE_LIMIT_MAX} requests per minute for this endpoint.",
+            headers={"Retry-After": str(retry_after)}
+        )
+
+    await record_api_request(current_user.id, "import_users_csv")
+
+    # Validate file
+    _validate_csv_file(file)
+
+    # Read and validate content
+    content = await file.read()
+    rows = _read_and_validate_csv_content(content)
+
+    # Process rows
+    created_users = []
+    valid_users = []
+    created, updated, failed, errors = _process_csv_rows(
+        rows, db, current_user, created_users, valid_users
+    )
+
+    # Commit import
+    _commit_csv_import(db, current_user, request, created, updated, failed, valid_users, errors)
+
+    # Send welcome emails
+    emails_sent, emails_failed, email_failures = _send_welcome_emails(
+        db, current_user, request, created_users
+    )
+
+    # Return results (without passwords for security)
+    all_errors = errors + email_failures
 
     return CSVImportResponse(
         created=created,
         updated=updated,
         failed=failed,
-        errors=all_errors[:20],  # Return first 20 errors
-        created_users=created_users_public
+        errors=all_errors if all_errors else None,
+        created_users=[
+            {"email": u["email"], "first_name": u["first_name"], "last_name": u["last_name"]}
+            for u in created_users
+        ]
     )
 
 
