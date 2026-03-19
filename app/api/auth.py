@@ -667,9 +667,9 @@ async def entra_callback(
 async def ldap_login(
     request: Request,
     response: Response,
+    username: Annotated[str, Body(...)],
+    password: Annotated[str, Body(...)],
     db: Annotated[Session, Depends(get_db)] = None,
-    username: str = Body(...),
-    password: str = Body(...),
 ):
     """Authenticate with on-prem Active Directory via LDAP."""
     if not settings.LDAP_ENABLED or "ldap" not in settings.AUTH_PROVIDERS.lower():
