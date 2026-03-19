@@ -869,6 +869,174 @@ async def _handle_login_mfa(user, request, db, client_ip) -> object:
     return None  # Proceed to token issuance
 
 
+# ─── LOGIN HELPER FUNCTIONS ──────────────────────────────────────────────────
+
+async def _check_ip_rate_limit(client_ip: str) -> None:
+    """Check IP-based rate limit and raise HTTPException if locked."""
+    if await is_ip_locked(client_ip):
+        logger.warning(f"IP lockout for {client_ip}")
+        from app.services.rate_limiter import _ip_lock_key, _get_client
+        r = _get_client()
+        ttl_seconds = await r.ttl(_ip_lock_key(client_ip))
+        
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={
+                "message": "Too many login attempts from this IP. Please try again later.",
+                "retry_after_seconds": max(0, ttl_seconds),
+                "retry_after": format_lockout_time(max(0, ttl_seconds))
+            },
+            headers={"Retry-After": str(max(0, ttl_seconds))}
+        )
+
+
+async def _check_account_lockout(user: User, client_ip: str) -> None:
+    """Check account lockout and raise HTTPException if locked."""
+    if await is_account_locked(user.id):
+        await record_ip_failure(client_ip)
+        logger.warning(f"Account lockout for user {user.id}")
+        
+        from app.services.rate_limiter import _account_lock_key, _get_client
+        r = _get_client()
+        ttl_seconds = await r.ttl(_account_lock_key(user.id))
+        
+        raise HTTPException(
+            status_code=status.HTTP_423_LOCKED,
+            detail={
+                "message": "Account temporarily locked due to too many failed attempts.",
+                "retry_after_seconds": max(0, ttl_seconds),
+                "retry_after": format_lockout_time(max(0, ttl_seconds))
+            },
+        )
+
+
+async def _handle_invalid_credentials(client_ip: str) -> None:
+    """Handle invalid credentials (user not found) case."""
+    await record_ip_failure(client_ip)
+    
+    from app.services.rate_limiter import _ip_fail_key, _get_client
+    r = _get_client()
+    ip_fail_count = await r.get(_ip_fail_key(client_ip)) or 0
+    ip_remaining = max(0, IP_RATE_LIMIT_MAX_ATTEMPTS - int(ip_fail_count))
+    
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail={
+            "message": INVALID_CREDENTIALS_MSG,
+            "remaining_attempts": ip_remaining,
+            "lockout_threshold": IP_RATE_LIMIT_MAX_ATTEMPTS
+        }
+    )
+
+
+async def _handle_invalid_password(
+    user: User, 
+    client_ip: str, 
+    device_fingerprint: Optional[str]
+) -> None:
+    """Handle invalid password case with rate limiting and notifications."""
+    count = await redis_record_failed_login(user.id)
+    await record_ip_failure(client_ip)
+    
+    if device_fingerprint:
+        await record_device_failure(device_fingerprint)
+    
+    # Send security notification at first lockout threshold (5 failures)
+    if count == 5:
+        await notify_suspicious_login(
+            email=user.email,
+            attempt_count=count,
+            ip_address=client_ip,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        )
+    
+    remaining_attempts = max(0, ACCOUNT_LOCKOUT_THRESHOLD - count)
+    
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail={
+            "message": INVALID_CREDENTIALS_MSG,
+            "remaining_attempts": remaining_attempts,
+            "lockout_threshold": ACCOUNT_LOCKOUT_THRESHOLD
+        }
+    )
+
+
+async def _handle_device_fingerprint(device_fingerprint: Optional[str]) -> None:
+    """Check device fingerprint rate limit."""
+    if device_fingerprint:
+        device_count = await get_device_failure_count(device_fingerprint)
+        if device_count >= 50:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Too many attempts from this device."
+            )
+
+
+async def _create_login_success_response(
+    user: User,
+    normalized_email: str,
+    client_ip: str,
+    req: Request,
+    db: Session,
+    response: Response
+) -> LoginSuccessResponse:
+    """Create login success response with tokens."""
+    # Clear account failures on success
+    await clear_account_failures(user.id)
+    
+    # Log successful attempt in database (for audit)
+    db.add(LoginAttempt(
+        email=normalized_email,
+        ip_address=client_ip,
+        success=True
+    ))
+    
+    # Issue tokens
+    access_token = create_access_token({"sub": str(user.id), "role": user.role})
+    refresh_token_str = create_refresh_token({"sub": str(user.id)})
+    
+    # Save refresh token
+    rt = RefreshToken(
+        user_id=user.id,
+        token=refresh_token_str,
+        expires_at=datetime.now(timezone.utc) + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
+    )
+    db.add(rt)
+    
+    # Update last login and mark user as online
+    user.last_login = datetime.now(timezone.utc)
+    user.last_seen_at = datetime.now(timezone.utc)
+    user.is_online = True
+    user.is_enabled = True
+    
+    # Audit log
+    db.add(create_audit_log(
+        user_id=user.id,
+        user_email=user.email,
+        action="login",
+        resource_type="user",
+        resource_id=user.id,
+        request=req,
+    ))
+    
+    db.commit()
+    
+    # Set refresh token cookie
+    _set_refresh_cookie(response, refresh_token_str, settings.REFRESH_TOKEN_EXPIRE_DAYS)
+    
+    return LoginSuccessResponse(
+        status="success",
+        access_token=access_token,
+        token_type="bearer",
+        user=UserResponse.model_validate(user),
+        refresh_token=refresh_token_str,
+    )
+
+
+# ─── LOGIN ENDPOINT ──────────────────────────────────────────────────────────
+
+
 @router.post("/login")
 async def login(request: LoginRequest, req: Request, response: Response, db: Annotated[Session, Depends(get_db)] = None):
     """
@@ -889,181 +1057,44 @@ async def login(request: LoginRequest, req: Request, response: Response, db: Ann
         )
 
     client_ip = _get_client_ip(req)
-
-    # Normalize email to prevent case-based lockout bypass
-    # e.g., "Admin@Site.com" vs "admin@site.com" must hit the same lockout counter
     normalized_email = request.email.strip().lower()
 
-    # STEP 1: Check IP-based rate limit FIRST (before any user lookup)
-    # This prevents enumeration attacks and applies across ALL accounts
-    if await is_ip_locked(client_ip):
-        logger.warning(f"IP lockout for {client_ip}")
+    # STEP 1: Check IP-based rate limit
+    await _check_ip_rate_limit(client_ip)
 
-        # Get remaining lockout time
-        from app.services.rate_limiter import _ip_lock_key
-        from app.services.rate_limiter import _get_client
-        r = _get_client()
-        ttl_seconds = await r.ttl(_ip_lock_key(client_ip))
+    # STEP 2: Look up user by email
+    user = db.query(User).filter(func.lower(User.email) == normalized_email).first()
 
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail={
-                "message": "Too many login attempts from this IP. Please try again later.",
-                "retry_after_seconds": max(0, ttl_seconds),
-                "retry_after": format_lockout_time(max(0, ttl_seconds))
-            },
-            headers={"Retry-After": str(max(0, ttl_seconds))}
-        )
-
-    # STEP 2: Look up user by email (case-insensitive)
-    # Use func.lower for case-insensitive comparison to match normalized_email
-    user = db.query(User).filter(
-        func.lower(User.email) == normalized_email
-    ).first()
-
-    # STEP 3: If user exists, check account lockout
-    # If user doesn't exist, skip account lockout but IP limit still applies
+    # STEP 3: Check account lockout (if user exists)
     if user:
-        if await is_account_locked(user.id):
-            # Record this failed attempt for IP tracking
-            await record_ip_failure(client_ip)
-            logger.warning(f"Account lockout for user {user.id}")
-            
-            # Get remaining lockout time
-            from app.services.rate_limiter import _account_lock_key
-            from app.services.rate_limiter import _get_client
-            r = _get_client()
-            ttl_seconds = await r.ttl(_account_lock_key(user.id))
-            
-            raise HTTPException(
-                status_code=status.HTTP_423_LOCKED,
-                detail={
-                    "message": "Account temporarily locked due to too many failed attempts.",
-                    "retry_after_seconds": max(0, ttl_seconds),
-                    "retry_after": format_lockout_time(max(0, ttl_seconds))
-                },
-            )
+        await _check_account_lockout(user, client_ip)
 
-    # STEP 4: Validate credentials
-    # If user doesn't exist, treat as invalid credentials (don't reveal)
+    # STEP 4: Validate credentials (user not found case)
     if not user:
-        # Record failed attempt for IP tracking
-        await record_ip_failure(client_ip)
-        
-        # Get current IP failure count for remaining attempts estimate
-        from app.services.rate_limiter import _ip_fail_key
-        from app.services.rate_limiter import _get_client
-        r = _get_client()
-        ip_fail_count = await r.get(_ip_fail_key(client_ip)) or 0
-        ip_remaining = max(0, IP_RATE_LIMIT_MAX_ATTEMPTS - int(ip_fail_count))
+        await _handle_invalid_credentials(client_ip)
 
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={
-                "message": INVALID_CREDENTIALS_MSG,
-                "remaining_attempts": ip_remaining,
-                "lockout_threshold": IP_RATE_LIMIT_MAX_ATTEMPTS
-            }
-        )
-
-    # STEP 5: Device fingerprint tracking (if provided)
-    # Track failures per device to detect automated attacks
-    if request.device_fingerprint:
-        device_count = await get_device_failure_count(request.device_fingerprint)
-        if device_count >= 50:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Too many attempts from this device."
-            )
+    # STEP 5: Check device fingerprint
+    await _handle_device_fingerprint(request.device_fingerprint)
 
     # STEP 6: Verify password
     if not verify_password(request.password, user.hashed_password):
-        # Record failed attempt for account lockout escalation and IP tracking
-        count = await redis_record_failed_login(user.id)
-        await record_ip_failure(client_ip)
+        await _handle_invalid_password(user, client_ip, request.device_fingerprint)
 
-        # Track device failures if fingerprint provided
-        if request.device_fingerprint:
-            await record_device_failure(request.device_fingerprint)
-
-        # Send security notification email at first lockout threshold (5 failures)
-        # Only send once at count == 5 to avoid spamming user's inbox
-        if count == 5:
-            await notify_suspicious_login(
-                email=user.email,
-                attempt_count=count,
-                ip_address=client_ip,
-                timestamp=datetime.now(timezone.utc).isoformat(),
-            )
-
-        # Calculate remaining attempts before lockout
-        remaining_attempts = max(0, ACCOUNT_LOCKOUT_THRESHOLD - count)
-
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={
-                "message": INVALID_CREDENTIALS_MSG,
-                "remaining_attempts": remaining_attempts,
-                "lockout_threshold": ACCOUNT_LOCKOUT_THRESHOLD
-            }
-        )
-
-    # STEP 7: Check if MFA is required and handle MFA verification
+    # STEP 7: Handle MFA verification
     mfa_response = await _handle_login_mfa(
-        user=user, request=request, db=db,
-        client_ip=client_ip
+        user=user, request=request, db=db, client_ip=client_ip
     )
     if mfa_response is not None:
         return mfa_response
 
     # STEP 8: Successful authentication - issue tokens
-    await clear_account_failures(user.id)
-    # Note: Do NOT record IP attempt on success - only failures count toward rate limit
-
-    # Log successful attempt in database (for audit)
-    db.add(LoginAttempt(
-        email=normalized_email,
-        ip_address=client_ip,
-        success=True
-    ))
-
-    access_token = create_access_token({"sub": str(user.id), "role": user.role})
-    refresh_token_str = create_refresh_token({"sub": str(user.id)})
-
-    # Save refresh token
-    rt = RefreshToken(
-        user_id=user.id,
-        token=refresh_token_str,
-        expires_at=datetime.now(timezone.utc) + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
-    )
-    db.add(rt)
-
-    # Update last login and mark user as online
-    user.last_login = datetime.now(timezone.utc)
-    user.last_seen_at = datetime.now(timezone.utc)
-    user.is_online = True  # Mark as online on login
-    user.is_enabled = True  # Ensure account is enabled
-
-    # Audit log
-    db.add(create_audit_log(
-        user_id=user.id,
-        user_email=user.email,
-        action="login",
-        resource_type="user",
-        resource_id=user.id,
-        request=req,
-    ))
-    db.commit()
-
-    # Set refresh token as HttpOnly cookie (for same-origin fallback)
-    _set_refresh_cookie(response, refresh_token_str, settings.REFRESH_TOKEN_EXPIRE_DAYS)
-
-    return LoginSuccessResponse(
-        status="success",
-        access_token=access_token,
-        token_type="bearer",
-        user=UserResponse.model_validate(user),
-        refresh_token=refresh_token_str  # For cross-origin deployments (Vercel + Railway)
+    return await _create_login_success_response(
+        user=user,
+        normalized_email=normalized_email,
+        client_ip=client_ip,
+        req=req,
+        db=db,
+        response=response,
     )
 
 
