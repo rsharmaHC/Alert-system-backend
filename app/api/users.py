@@ -427,6 +427,7 @@ def _apply_user_update(user: User, data: UserUpdate) -> None:
     "/{user_id}",
     response_model=UserResponse,
     responses={
+        400: {"description": "Bad Request - Duplicate email, phone, or employee_id"},
         403: {"description": "Forbidden - Insufficient permissions to update user"},
         404: {"description": "Not Found - User does not exist"},
     }
@@ -537,6 +538,8 @@ def _update_user_fields(user: User, data: UserUpdate) -> None:
     "/{user_id}",
     response_model=UserResponse,
     responses={
+        400: {"description": "Bad Request - Duplicate email, phone, or employee_id"},
+        403: {"description": "Forbidden - ADMIN cannot create/update SUPER_ADMIN users"},
         404: {
             "description": "Not Found - User does not exist",
             "content": {
@@ -734,7 +737,12 @@ def _delete_single_user(db, user: User, current_user: User, request: Request) ->
         return False
 
 
-@router.post("/bulk-delete")
+@router.post(
+    "/bulk-delete",
+    responses={
+        400: {"description": "Bad Request - No user IDs provided or attempting to delete yourself"},
+    }
+)
 def bulk_delete_users(
     user_ids: List[int],
     db: Annotated[Session, Depends(get_db)] = None,
@@ -750,7 +758,7 @@ def bulk_delete_users(
     """
     if not user_ids:
         raise HTTPException(status_code=400, detail="No user IDs provided")
-    
+
     if current_user.id in user_ids:
         raise HTTPException(status_code=400, detail="Cannot delete yourself")
     
@@ -1142,7 +1150,14 @@ def get_departments(db: Annotated[Session, Depends(get_db)] = None, current_user
 
 # ─── ADMIN MFA MANAGEMENT ENDPOINTS ─────────────────────────────────────────
 
-@router.get("/{user_id}/mfa/status", response_model=AdminMFAStatusResponse)
+@router.get(
+    "/{user_id}/mfa/status",
+    response_model=AdminMFAStatusResponse,
+    responses={
+        403: {"description": "Forbidden - ADMIN cannot view MFA status of SUPER_ADMIN users"},
+        404: {"description": "Not Found - User does not exist"},
+    }
+)
 def admin_get_user_mfa_status(
     user_id: int,
     db: Annotated[Session, Depends(get_db)] = None,
@@ -1202,7 +1217,15 @@ def admin_get_user_mfa_status(
     )
 
 
-@router.post("/{user_id}/mfa/reset", response_model=AdminMFAResetResponse)
+@router.post(
+    "/{user_id}/mfa/reset",
+    response_model=AdminMFAResetResponse,
+    responses={
+        400: {"description": "Bad Request - Cannot reset your own MFA via this endpoint"},
+        403: {"description": "Forbidden - ADMIN cannot reset MFA for SUPER_ADMIN users"},
+        404: {"description": "Not Found - User does not exist"},
+    }
+)
 def admin_reset_user_mfa(
     user_id: int,
     request_data: AdminMFAResetRequest,
