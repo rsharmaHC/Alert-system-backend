@@ -53,7 +53,7 @@ def get_current_user(
 ) -> User:
     """
     Get current authenticated user from JWT access token.
-    
+
     Security checks:
     - Token must be valid and not expired
     - Token type must be 'access'
@@ -67,14 +67,15 @@ def get_current_user(
     # Check account status (is_enabled), NOT online presence (is_online)
     # is_enabled = admin-controlled account status (enabled/disabled)
     # is_online = real-time presence via heartbeat (changes every 30s)
+    # Note: Use is_not(False) to include both True and NULL values for backward compatibility
     user = db.query(User).filter(
         User.id == int(user_id),
-        User.is_enabled == True
+        User.is_enabled.isnot(False)  # Accepts True or NULL (backward compatible)
     ).first()
 
     if not user:
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, 
+            status_code=status.HTTP_401_UNAUTHORIZED,
             detail="User not found or account disabled"
         )
 

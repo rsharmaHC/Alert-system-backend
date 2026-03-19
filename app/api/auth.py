@@ -1061,6 +1061,7 @@ async def login(request: LoginRequest, req: Request, response: Response, db: Ann
         status="success",
         access_token=access_token,
         token_type="bearer",
+        expires_in=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,  # Convert minutes to seconds
         user=UserResponse.model_validate(user),
         refresh_token=refresh_token_str  # For cross-origin deployments (Vercel + Railway)
     )
@@ -1146,6 +1147,7 @@ async def refresh_token(req: Request, response: Response, db: Annotated[Session,
     return TokenResponse(
         access_token=new_access,
         token_type="bearer",
+        expires_in=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,  # Convert minutes to seconds
         user=UserResponse.model_validate(user),
         refresh_token=new_refresh_str  # For cross-origin deployments (Vercel + Railway)
     )
