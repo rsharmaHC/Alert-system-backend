@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import secrets
+import anyio
 
 # Request size limit constants (in bytes)
 MAX_REQUEST_SIZE = 10 * 1024 * 1024  # 10 MB max request body size
@@ -208,11 +209,8 @@ def _ensure_notifications_deadline_escalated():
     ensure_column_exists('notifications', 'deadline_escalated', 'BOOLEAN', nullable=False)
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # ── Startup secret validation ─────────────────────────────────────────
-    # Fail fast: refuse to start if critical signing keys are absent or weak.
-    # An empty or short key would allow token forgery.
+def _validate_secrets():
+    """Validate that critical secret keys are configured and meet minimum length."""
     _secret_errors = []
     if not settings.SECRET_KEY or len(settings.SECRET_KEY) < 32:
         _secret_errors.append("SECRET_KEY is missing or shorter than 32 characters")
@@ -225,13 +223,10 @@ async def lifespan(app: FastAPI):
             "Application cannot start — critical secret key(s) not configured:\n" +
             "\n".join(f"  • {e}" for e in _secret_errors)
         )
-    # ─────────────────────────────────────────────────────────────────────
 
-    # Re-apply logging config AFTER uvicorn's dictConfig has run.
-    # Without this, uvicorn overwrites our formatters/handlers on startup.
-    setup_logging()
-    
-    # Initialize Redis cache for location autocomplete
+
+async def _init_location_cache():
+    """Initialize Redis cache for location autocomplete."""
     logger.info("Initializing location cache...")
     try:
         await init_location_cache(settings.REDIS_URL)
@@ -239,8 +234,9 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to initialize location cache: {e}")
 
-    # Note: Database tables are created by app.db_init during startup
-    # No Alembic migrations needed for fresh deployments
+
+def _ensure_database_schema():
+    """Ensure all database tables and columns exist."""
     logger.info("Database schema initialized (using db_init)")
 
     # Ensure alertchannel enum has 'web' value
@@ -256,19 +252,19 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to ensure user location columns: {e}")
 
-    # Ensure User table has token_valid_after column (session invalidation on password change)
+    # Ensure User table has token_valid_after column
     try:
         ensure_column_exists('users', 'token_valid_after', 'TIMESTAMP WITH TIME ZONE', nullable=True)
     except Exception as e:
         logger.error(f"Failed to ensure token_valid_after column: {e}")
 
-    # Ensure mfa_secret column is expanded for Fernet encryption (VARCHAR(32) -> VARCHAR(255))
+    # Ensure mfa_secret column is expanded
     try:
         ensure_mfa_secret_column_expanded()
     except Exception as e:
         logger.error(f"Failed to expand mfa_secret column: {e}")
 
-    # Ensure SSO-related columns exist (auth_provider, external_id, is_enabled, is_online)
+    # Ensure SSO-related columns exist
     logger.info("Ensuring SSO columns exist...")
     try:
         ensure_sso_columns()
@@ -282,7 +278,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to ensure audit_logs user_email column: {e}")
 
-    # Ensure delivery_logs and notification_responses tables have user_email column
+    # Ensure delivery_logs and notification_responses have user_email column
     logger.info("Ensuring delivery_logs and notification_responses tables have user_email column...")
     try:
         _ensure_delivery_log_user_email()
@@ -303,12 +299,13 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to ensure notifications deadline_escalated column: {e}")
 
-    # Seed default super admin if no users exist
+
+async def _seed_default_admin():
+    """Seed default super admin if no users exist."""
     try:
         db = SessionLocal()
         try:
             if db.query(User).count() == 0:
-                # Generate secure random password
                 bootstrap_pw = secrets.token_urlsafe(32)
                 admin = User(
                     email="admin@tmalert.com",
@@ -321,22 +318,43 @@ async def lifespan(app: FastAPI):
                 )
                 db.add(admin)
                 db.commit()
-                # Write password to protected file (NOT stdout/logs)
-                try:
-                    with open("/run/secrets/bootstrap_pw", "w") as f:
-                        f.write(bootstrap_pw)
-                    logger.info("Default admin created: admin@tmalert.com (password written to /run/secrets/bootstrap_pw)")
-                except (IOError, OSError):
-                    # Fallback for environments without /run/secrets
-                    logger.warning("Default admin created: admin@tmalert.com - retrieve password from secure logs on first boot only")
+                await _write_bootstrap_password(bootstrap_pw)
         finally:
             db.close()
     except Exception as e:
         logger.error(f"Failed to seed default admin: {e}")
 
+
+async def _write_bootstrap_password(bootstrap_pw: str):
+    """Write bootstrap password to secure file using async file API."""
+    try:
+        async with await anyio.open_file("/run/secrets/bootstrap_pw", "w") as f:
+            await f.write(bootstrap_pw)
+        logger.info("Default admin created: admin@tmalert.com (password written to /run/secrets/bootstrap_pw)")
+    except (IOError, OSError):
+        logger.warning("Default admin created: admin@tmalert.com - retrieve password from secure logs on first boot only")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup secret validation
+    _validate_secrets()
+
+    # Re-apply logging config AFTER uvicorn's dictConfig has run
+    setup_logging()
+
+    # Initialize location cache
+    await _init_location_cache()
+
+    # Ensure database schema
+    _ensure_database_schema()
+
+    # Seed default admin
+    await _seed_default_admin()
+
     logger.info("Application startup complete")
     yield
-    
+
     # Cleanup: close Redis cache connection
     logger.info("Closing location cache...")
     await close_location_cache()

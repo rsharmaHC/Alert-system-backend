@@ -181,90 +181,116 @@ def batch_geofence_check_task(
 ) -> Dict[str, Any]:
     """
     Process geofence checks for multiple users in batch.
-    
+
     Optimized for processing many users efficiently.
-    
+
     Args:
         user_locations: List of {user_id, latitude, longitude} dicts
-    
+
     Returns:
         Summary of changes
     """
     db = SessionLocal()
-    total_changes = 0
     results_summary = {
         "processed": 0,
         "success": 0,
         "failed": 0,
         "total_changes": 0
     }
-    
+
     try:
         # Get all active locations once (shared across all users)
-        locations = db.query(Location).filter(
-            Location.is_active == True,
-            Location.latitude.isnot(None),
-            Location.longitude.isnot(None)
-        ).all()
-        
+        locations = _get_active_locations(db)
+
         for user_loc in user_locations:
+            user_id = user_loc.get("user_id")
             try:
-                user_id = user_loc["user_id"]
                 latitude = user_loc["latitude"]
                 longitude = user_loc["longitude"]
-                
+
                 # Validate
                 is_valid, _ = validate_coordinates(latitude, longitude)
                 if not is_valid:
                     results_summary["failed"] += 1
                     continue
-                
-                # Batch check
-                results = check_geofences_batch(latitude, longitude, locations)
-                
-                # Process assignments
-                for result in results:
-                    if result.is_inside:
-                        if _assign_user_to_location(
-                            db=db,
-                            user_id=user_id,
-                            location_id=result.location_id,
-                            assignment_type=UserLocationAssignmentType.GEOFENCE,
-                            detected_latitude=latitude,
-                            detected_longitude=longitude,
-                            distance_miles=result.distance_miles,
-                            action="entered_geofence"
-                        ):
-                            total_changes += 1
-                    else:
-                        if _remove_user_from_location(
-                            db=db,
-                            user_id=user_id,
-                            location_id=result.location_id,
-                            reason="User exited geofence",
-                            action="exited_geofence"
-                        ):
-                            total_changes += 1
-                
+
+                # Batch check and process assignments
+                changes = _process_user_geofence_batch(
+                    db=db,
+                    user_id=user_id,
+                    latitude=latitude,
+                    longitude=longitude,
+                    locations=locations
+                )
+                results_summary["total_changes"] += changes
                 results_summary["success"] += 1
-                
+
             except Exception as e:
-                logger.error(f"Batch geofence failed for user {_scrub_user_id(user_loc.get('user_id'))}: {type(e).__name__}")
+                logger.error(f"Batch geofence failed for user {_scrub_user_id(user_id)}: {type(e).__name__}")
                 results_summary["failed"] += 1
-        
+
         results_summary["processed"] = len(user_locations)
-        results_summary["total_changes"] = total_changes
-        
+
         db.commit()
-        
+
         return results_summary
-        
+
     except Exception as e:
         logger.error(f"Batch geofence check failed: {e}")
         db.rollback()
         raise self.retry(exc=e)
     finally:
         db.close()
+
+
+def _get_active_locations(db: Session) -> List[Location]:
+    """Get all active locations with valid coordinates."""
+    return db.query(Location).filter(
+        Location.is_active == True,
+        Location.latitude.isnot(None),
+        Location.longitude.isnot(None)
+    ).all()
+
+
+def _process_user_geofence_batch(
+    db: Session,
+    user_id: int,
+    latitude: float,
+    longitude: float,
+    locations: List[Location]
+) -> int:
+    """
+    Process geofence check for a single user.
+
+    Returns the number of changes made.
+    """
+    total_changes = 0
+    results = check_geofences_batch(latitude, longitude, locations)
+
+    for result in results:
+        if result.is_inside:
+            if _assign_user_to_location(
+                db=db,
+                user_id=user_id,
+                location_id=result.location_id,
+                assignment_type=UserLocationAssignmentType.GEOFENCE,
+                detected_latitude=latitude,
+                detected_longitude=longitude,
+                distance_miles=result.distance_miles,
+                action="entered_geofence"
+            ):
+                total_changes += 1
+        else:
+            if _remove_user_from_location(
+                db=db,
+                user_id=user_id,
+                location_id=result.location_id,
+                reason="User exited geofence",
+                action="exited_geofence"
+            ):
+                total_changes += 1
+
+    return total_changes
 
 
 # ─── HELPER FUNCTIONS ─────────────────────────────────────────────────────────

@@ -160,6 +160,7 @@ _assignment_limiter = RateLimiter(max_requests=100, window_seconds=60)  # 100/mi
         400: {"description": "Bad Request - User is already assigned to this location"},
         403: {"description": "Forbidden - User can only assign themselves (unless manager+)"},
         404: {"description": "Not Found - User or location does not exist"},
+        429: {"description": "Too Many Requests - Rate limit exceeded (100 requests/min)"},
     }
 )
 def assign_user_to_location(
