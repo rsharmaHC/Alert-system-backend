@@ -437,7 +437,13 @@ def get_auth_providers():
     return result
 
 
-@router.get("/entra/login")
+@router.get(
+    "/entra/login",
+    responses={
+        403: {"description": "Forbidden - Entra ID authentication is not enabled"},
+        500: {"description": "Internal Server Error - Entra ID is not properly configured"},
+    }
+)
 async def entra_login():
     """Redirect user to Microsoft Entra ID login page.
 
@@ -1183,7 +1189,13 @@ async def _create_login_success_response(
 # ─── LOGIN ENDPOINT ──────────────────────────────────────────────────────────
 
 
-@router.post("/login")
+@router.post(
+    "/login",
+    responses={
+        403: {"description": "Forbidden - Email/password login is disabled"},
+        429: {"description": "Too Many Requests - Rate limit exceeded (IP or account locked)"},
+    }
+)
 async def login(request: LoginRequest, req: Request, response: Response, db: Annotated[Session, Depends(get_db)] = None):
     """
     Authenticate user with email and password.
@@ -1244,7 +1256,13 @@ async def login(request: LoginRequest, req: Request, response: Response, db: Ann
     )
 
 
-@router.post("/refresh", response_model=TokenResponse)
+@router.post(
+    "/refresh",
+    response_model=TokenResponse,
+    responses={
+        401: {"description": "Unauthorized - Invalid, expired, or missing refresh token"},
+    }
+)
 async def refresh_token(req: Request, response: Response, db: Annotated[Session, Depends(get_db)] = None):
     """
     Refresh access token using the refresh token from HttpOnly cookie or request body.
@@ -1330,7 +1348,12 @@ async def refresh_token(req: Request, response: Response, db: Annotated[Session,
     )
 
 
-@router.post("/logout")
+@router.post(
+    "/logout",
+    responses={
+        401: {"description": "Unauthorized - No valid authentication token provided"},
+    }
+)
 def logout(
     req: Request,
     response: Response,
@@ -1373,7 +1396,13 @@ def logout(
     return {"message": "Logged out successfully"}
 
 
-@router.post("/forgot-password")
+@router.post(
+    "/forgot-password",
+    responses={
+        403: {"description": "Forbidden - Password reset is disabled (SSO-only deployment)"},
+        429: {"description": "Too Many Requests - Rate limit exceeded (1 request per minute per email)"},
+    }
+)
 def forgot_password(request: PasswordResetRequest, req: Request, db: Annotated[Session, Depends(get_db)] = None):
     """
     Request a password reset email.
@@ -1436,7 +1465,13 @@ def forgot_password(request: PasswordResetRequest, req: Request, db: Annotated[S
     return {"message": PASSWORD_RESET_SENT_MSG}
 
 
-@router.post("/reset-password")
+@router.post(
+    "/reset-password",
+    responses={
+        400: {"description": "Bad Request - Invalid or expired reset token"},
+        403: {"description": "Forbidden - Password reset not available for SSO accounts"},
+    }
+)
 def reset_password(request: PasswordResetConfirm, db: Annotated[Session, Depends(get_db)] = None):
     """
     Reset password using a valid reset token.
@@ -1498,7 +1533,14 @@ def reset_password(request: PasswordResetConfirm, db: Annotated[Session, Depends
     return {"message": "Password reset successfully"}
 
 
-@router.post("/change-password")
+@router.post(
+    "/change-password",
+    responses={
+        400: {"description": "Bad Request - Current password is incorrect"},
+        401: {"description": "Unauthorized - No valid authentication token provided"},
+        403: {"description": "Forbidden - Password change not available for SSO accounts"},
+    }
+)
 def change_password(
     request: ChangePasswordRequest,
     current_user: Annotated[User, Depends(get_current_user)] = None,
@@ -1531,12 +1573,24 @@ def change_password(
     return {"message": "Password changed successfully"}
 
 
-@router.get("/me", response_model=UserResponse)
+@router.get(
+    "/me",
+    response_model=UserResponse,
+    responses={
+        401: {"description": "Unauthorized - No valid authentication token provided"},
+    }
+)
 def get_me(current_user: Annotated[User, Depends(get_current_user)] = None):
     return current_user
 
 
-@router.put("/me", response_model=UserResponse)
+@router.put(
+    "/me",
+    response_model=UserResponse,
+    responses={
+        401: {"description": "Unauthorized - No valid authentication token provided"},
+    }
+)
 def update_my_profile(
     data: UserProfileUpdate,
     current_user: Annotated[User, Depends(get_current_user)] = None,

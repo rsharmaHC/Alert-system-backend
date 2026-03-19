@@ -346,7 +346,13 @@ def create_user(
     return user
 
 
-@router.get("/{user_id}", response_model=UserResponse)
+@router.get(
+    "/{user_id}",
+    response_model=UserResponse,
+    responses={
+        404: {"description": "Not Found - User does not exist"},
+    }
+)
 def get_user(
     user_id: int,
     db: Annotated[Session, Depends(get_db)] = None,
@@ -417,7 +423,14 @@ def _apply_user_update(user: User, data: UserUpdate) -> None:
         setattr(user, field, value)
 
 
-@router.put("/{user_id}", response_model=UserResponse)
+@router.put(
+    "/{user_id}",
+    response_model=UserResponse,
+    responses={
+        403: {"description": "Forbidden - Insufficient permissions to update user"},
+        404: {"description": "Not Found - User does not exist"},
+    }
+)
 def update_user_endpoint(
     user_id: int,
     data: UserUpdate,
@@ -580,7 +593,13 @@ def update_user(
     return user
 
 
-@router.delete("/{user_id}")
+@router.delete(
+    "/{user_id}",
+    responses={
+        400: {"description": "Bad Request - Cannot delete yourself"},
+        404: {"description": "Not Found - User does not exist"},
+    }
+)
 def delete_user(
     user_id: int,
     db: Annotated[Session, Depends(get_db)] = None,

@@ -191,7 +191,14 @@ def create_incident(
     return incident
 
 
-@incidents_router.put("/{incident_id}", response_model=IncidentResponse)
+@incidents_router.put(
+    "/{incident_id}",
+    response_model=IncidentResponse,
+    responses={
+        400: {"description": "Bad Request - Invalid status transition"},
+        404: {"description": "Not Found - Incident does not exist"},
+    }
+)
 def update_incident(
     incident_id: int,
     data: IncidentUpdate,
@@ -225,7 +232,13 @@ def update_incident(
     return incident
 
 
-@incidents_router.get("/{incident_id}", response_model=IncidentResponse)
+@incidents_router.get(
+    "/{incident_id}",
+    response_model=IncidentResponse,
+    responses={
+        404: {"description": "Not Found - Incident does not exist"},
+    }
+)
 def get_incident(
     incident_id: int,
     db: Annotated[Session, Depends(get_db)] = None,
@@ -472,7 +485,14 @@ async def create_notification(
     return notification
 
 
-@notifications_router.post("/{notification_id}/send", response_model=NotificationResponse)
+@notifications_router.post(
+    "/{notification_id}/send",
+    response_model=NotificationResponse,
+    responses={
+        400: {"description": "Bad Request - Cannot send notification in current state"},
+        404: {"description": "Not Found - Notification does not exist"},
+    }
+)
 async def send_notification(
     notification_id: int,
     db: Annotated[Session, Depends(get_db)] = None,
@@ -521,7 +541,13 @@ async def send_notification(
     return notification
 
 
-@notifications_router.post("/{notification_id}/cancel")
+@notifications_router.post(
+    "/{notification_id}/cancel",
+    responses={
+        400: {"description": "Bad Request - Can only cancel draft or scheduled notifications"},
+        404: {"description": "Not Found - Notification does not exist"},
+    }
+)
 def cancel_notification(
     notification_id: int,
     db: Annotated[Session, Depends(get_db)] = None,
@@ -537,7 +563,14 @@ def cancel_notification(
     return {"message": "Notification cancelled"}
 
 
-@notifications_router.get("/{notification_id}", response_model=NotificationDetailResponse)
+@notifications_router.get(
+    "/{notification_id}",
+    response_model=NotificationDetailResponse,
+    responses={
+        403: {"description": "Forbidden - Viewer is not a recipient of this notification"},
+        404: {"description": "Not Found - Notification does not exist"},
+    }
+)
 def get_notification(
     notification_id: int,
     db: Annotated[Session, Depends(get_db)] = None,
@@ -576,7 +609,14 @@ def get_notification(
     return result
 
 
-@notifications_router.get("/{notification_id}/delivery", response_model=List[DeliveryLogResponse])
+@notifications_router.get(
+    "/{notification_id}/delivery",
+    response_model=List[DeliveryLogResponse],
+    responses={
+        403: {"description": "Forbidden - Viewer is not a recipient of this notification"},
+        404: {"description": "Not Found - Notification does not exist"},
+    }
+)
 def get_delivery_logs(
     notification_id: int,
     channel: Annotated[Optional[AlertChannel], Query()] = None,
@@ -641,7 +681,14 @@ def get_delivery_logs(
     return result
 
 
-@notifications_router.get("/{notification_id}/responses", response_model=List[NotificationResponseOut])
+@notifications_router.get(
+    "/{notification_id}/responses",
+    response_model=List[NotificationResponseOut],
+    responses={
+        403: {"description": "Forbidden - Viewer is not a recipient of this notification"},
+        404: {"description": "Not Found - Notification does not exist"},
+    }
+)
 def get_responses(
     notification_id: int,
     limit: Annotated[int, Query(ge=1, le=1000)] = 100,

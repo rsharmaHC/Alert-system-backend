@@ -119,7 +119,14 @@ def create_group(
     )
 
 
-@groups_router.get("/{group_id}", response_model=GroupDetailResponse)
+@groups_router.get(
+    "/{group_id}",
+    response_model=GroupDetailResponse,
+    responses={
+        403: {"description": "Forbidden - User is not a member of the group"},
+        404: {"description": "Not Found - Group does not exist"},
+    }
+)
 def get_group(
     group_id: Annotated[int, Path(..., description="Group ID")],
     db: Annotated[Session, Depends(get_db)] = None,
@@ -146,7 +153,14 @@ def _assert_group_member_access(group, current_user) -> None:
             )
 
 
-@groups_router.put("/{group_id}", response_model=GroupResponse)
+@groups_router.put(
+    "/{group_id}",
+    response_model=GroupResponse,
+    responses={
+        400: {"description": "Bad Request - Invalid user IDs provided"},
+        404: {"description": "Not Found - Group does not exist"},
+    }
+)
 def update_group(
     group_id: Annotated[int, Path(..., description="Group ID")],
     data: GroupUpdate,
@@ -213,7 +227,12 @@ def update_group(
     )
 
 
-@groups_router.delete("/{group_id}")
+@groups_router.delete(
+    "/{group_id}",
+    responses={
+        404: {"description": "Not Found - Group does not exist"},
+    }
+)
 def delete_group(
     group_id: Annotated[int, Path(..., description="Group ID")],
     db: Annotated[Session, Depends(get_db)] = None,
@@ -231,7 +250,13 @@ def delete_group(
     return {"message": "Group deleted"}
 
 
-@groups_router.post("/{group_id}/members")
+@groups_router.post(
+    "/{group_id}/members",
+    responses={
+        403: {"description": "Forbidden - User is not a member of the group"},
+        404: {"description": "Not Found - Group does not exist"},
+    }
+)
 def add_members(
     group_id: Annotated[int, Path(..., description="Group ID")],
     data: GroupMemberAdd,
@@ -260,7 +285,12 @@ def add_members(
     return {"message": f"Added {len(users)} members", "total_members": len(group.members)}
 
 
-@groups_router.delete("/{group_id}/members/{user_id}")
+@groups_router.delete(
+    "/{group_id}/members/{user_id}",
+    responses={
+        404: {"description": "Not Found - Group or user does not exist"},
+    }
+)
 def remove_member(
     group_id: Annotated[int, Path(..., description="Group ID")],
     user_id: Annotated[int, Path(..., description="User ID")],
@@ -281,7 +311,12 @@ def remove_member(
     return {"message": "Member removed"}
 
 
-@groups_router.post("/preview")
+@groups_router.post(
+    "/preview",
+    responses={
+        400: {"description": "Bad Request - Invalid request for preview"},
+    }
+)
 def preview_dynamic_group(
     data: GroupCreate,
     db: Annotated[Session, Depends(get_db)] = None,
@@ -430,7 +465,14 @@ def _build_location_object(sanitized: dict, data: LocationCreate) -> Location:
     )
 
 
-@locations_router.post("", response_model=LocationResponse, status_code=status.HTTP_201_CREATED)
+@locations_router.post(
+    "",
+    response_model=LocationResponse,
+    status_code=status.HTTP_201_CREATED,
+    responses={
+        400: {"description": "Bad Request - Invalid location data (coordinates, radius, or overlap)"},
+    }
+)
 def create_location(
     data: LocationCreate,
     request: Request,
@@ -483,7 +525,14 @@ def create_location(
     return LocationResponse(**{**location.__dict__, "user_count": 0})
 
 
-@locations_router.put("/{location_id}", response_model=LocationResponse)
+@locations_router.put(
+    "/{location_id}",
+    response_model=LocationResponse,
+    responses={
+        400: {"description": "Bad Request - Invalid coordinates or radius"},
+        404: {"description": "Not Found - Location does not exist"},
+    }
+)
 def update_location(
     location_id: Annotated[int, Path(..., description="Location ID")],
     data: LocationUpdate,
@@ -595,7 +644,12 @@ def update_location(
     return LocationResponse(**{**location.__dict__, "user_count": user_count})
 
 
-@locations_router.delete("/{location_id}")
+@locations_router.delete(
+    "/{location_id}",
+    responses={
+        404: {"description": "Not Found - Location does not exist"},
+    }
+)
 def delete_location(
     location_id: Annotated[int, Path(..., description="Location ID")],
     db: Annotated[Session, Depends(get_db)] = None,
@@ -655,7 +709,13 @@ def get_categories(db: Annotated[Session, Depends(get_db)] = None, current_user:
     return [r[0] for r in results if r[0]]
 
 
-@templates_router.put("/{template_id}", response_model=TemplateResponse)
+@templates_router.put(
+    "/{template_id}",
+    response_model=TemplateResponse,
+    responses={
+        404: {"description": "Not Found - Template does not exist"},
+    }
+)
 def update_template(
     template_id: Annotated[int, Path(..., description="Template ID")],
     data: TemplateUpdate,
