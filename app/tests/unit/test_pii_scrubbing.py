@@ -101,7 +101,7 @@ class TestPhoneScrubbing:
 
     def test_none_phone(self):
         """Test None phone value."""
-        assert tasks_scrub_phone(None) == "***"
+        assert tasks_scrub_phone(None) == "***"  # type: ignore[arg-type]
 
     def test_international_phone(self):
         """Test international phone format."""

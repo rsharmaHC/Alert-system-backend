@@ -82,17 +82,17 @@ class TestTOTPVerificationSecurity:
     def test_empty_otp_is_rejected(self):
         """Empty or whitespace-only OTP should be rejected."""
         secret = generate_mfa_secret()
-        
+
         assert verify_totp_code(secret, "") is False
         assert verify_totp_code(secret, "   ") is False
-        assert verify_totp_code(secret, None) is False
+        assert verify_totp_code(secret, None) is False  # type: ignore[arg-type]
 
     def test_invalid_secret_fails_safely(self):
         """Invalid or malformed secret should fail closed."""
         # Invalid base32 secret
         assert verify_totp_code("!!!INVALID!!!", "123456") is False
         assert verify_totp_code("", "123456") is False
-        assert verify_totp_code(None, "123456") is False
+        assert verify_totp_code(None, "123456") is False  # type: ignore[arg-type]
         
         # Test with malformed secret that might cause exceptions
         # verify_totp_code should fail closed (return False) for any exception
