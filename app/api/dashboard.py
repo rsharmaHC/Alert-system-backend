@@ -70,7 +70,10 @@ def get_dashboard_stats(
         desc(Notification.created_at)
     ).limit(5).all()
 
-    recent_incidents = db.query(Incident).order_by(
+    # Only return active incidents for the dashboard
+    recent_incidents = db.query(Incident).filter(
+        Incident.status == IncidentStatus.ACTIVE
+    ).order_by(
         desc(Incident.created_at)
     ).limit(5).all()
 
