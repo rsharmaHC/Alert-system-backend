@@ -88,64 +88,90 @@ def _send_webhooks(db, notification: Notification, triggered_by_user_id: int = N
     webhook_errors = []
     
     # Get the user email for delivery logs
-    user_email = None
-    if triggered_by_user_id:
-        user = db.query(User).filter(User.id == triggered_by_user_id).first()
-        if user:
-            user_email = user.email
-
+    user_email = _get_user_email(db, triggered_by_user_id)
+    
+    # Send to Slack webhook if configured
     if AlertChannel.SLACK in notification.channels and notification.slack_webhook_url:
-        try:
-            result = webhook_service.send_slack(
-                notification.slack_webhook_url,
-                notification.message,
-                notification.title
-            )
-            # Create a delivery log entry for Slack webhook
-            # Use the triggered_by_user_id (admin who sent the notification)
-            log = DeliveryLog(
-                notification_id=notification.id,
-                user_id=triggered_by_user_id,
-                user_email=user_email,
-                channel=AlertChannel.SLACK,
-                status=DeliveryStatus.SENT if result.get("status") == "sent" else DeliveryStatus.FAILED,
-                to_address="webhook",
-                error_message=result.get("error") if result.get("status") != "sent" else None,
-                sent_at=datetime.now(timezone.utc)
-            )
-            db.add(log)
-            if result.get("status") != "sent":
-                webhook_errors.append(f"Slack: {result.get('error', 'Unknown error')}")
-        except Exception as e:
-            logger.error(f"Slack webhook failed for notification {notification.id}: {e}")
-            webhook_errors.append(f"Slack: {e}")
-
+        error = _send_slack_webhook(
+            db, notification, notification.slack_webhook_url, 
+            triggered_by_user_id, user_email
+        )
+        if error:
+            webhook_errors.append(error)
+    
+    # Send to Teams webhook if configured
     if AlertChannel.TEAMS in notification.channels and notification.teams_webhook_url:
-        try:
-            result = webhook_service.send_teams(
-                notification.teams_webhook_url,
-                notification.message,
-                notification.title
-            )
-            # Create a delivery log entry for Teams webhook
-            log = DeliveryLog(
-                notification_id=notification.id,
-                user_id=triggered_by_user_id,
-                user_email=user_email,
-                channel=AlertChannel.TEAMS,
-                status=DeliveryStatus.SENT if result.get("status") == "sent" else DeliveryStatus.FAILED,
-                to_address="webhook",
-                error_message=result.get("error") if result.get("status") != "sent" else None,
-                sent_at=datetime.now(timezone.utc)
-            )
-            db.add(log)
-            if result.get("status") != "sent":
-                webhook_errors.append(f"Teams: {result.get('error', 'Unknown error')}")
-        except Exception as e:
-            logger.error(f"Teams webhook failed for notification {notification.id}: {e}")
-            webhook_errors.append(f"Teams: {e}")
-
+        error = _send_teams_webhook(
+            db, notification, notification.teams_webhook_url, 
+            triggered_by_user_id, user_email
+        )
+        if error:
+            webhook_errors.append(error)
+    
     return webhook_errors
+
+
+def _get_user_email(db, user_id: int) -> Optional[str]:
+    """Fetch user email by ID for delivery logs."""
+    if not user_id:
+        return None
+    user = db.query(User).filter(User.id == user_id).first()
+    return user.email if user else None
+
+
+def _send_slack_webhook(db, notification, webhook_url, user_id, user_email) -> Optional[str]:
+    """Send Slack webhook and create delivery log. Returns error message if failed."""
+    try:
+        result = webhook_service.send_slack(
+            webhook_url, notification.message, notification.title
+        )
+        _create_webhook_log(
+            db, notification.id, user_id, user_email, 
+            AlertChannel.SLACK, result
+        )
+        return f"Slack: {result.get('error', 'Unknown error')}" if result.get("status") != "sent" else None
+    except Exception as e:
+        logger.error(f"Slack webhook failed for notification {notification.id}: {e}")
+        _create_webhook_log(
+            db, notification.id, user_id, user_email, 
+            AlertChannel.SLACK, {"status": "failed", "error": str(e)}
+        )
+        return f"Slack: {e}"
+
+
+def _send_teams_webhook(db, notification, webhook_url, user_id, user_email) -> Optional[str]:
+    """Send Teams webhook and create delivery log. Returns error message if failed."""
+    try:
+        result = webhook_service.send_teams(
+            webhook_url, notification.message, notification.title
+        )
+        _create_webhook_log(
+            db, notification.id, user_id, user_email, 
+            AlertChannel.TEAMS, result
+        )
+        return f"Teams: {result.get('error', 'Unknown error')}" if result.get("status") != "sent" else None
+    except Exception as e:
+        logger.error(f"Teams webhook failed for notification {notification.id}: {e}")
+        _create_webhook_log(
+            db, notification.id, user_id, user_email, 
+            AlertChannel.TEAMS, {"status": "failed", "error": str(e)}
+        )
+        return f"Teams: {e}"
+
+
+def _create_webhook_log(db, notification_id, user_id, user_email, channel, result):
+    """Create a delivery log entry for webhook notification."""
+    log = DeliveryLog(
+        notification_id=notification_id,
+        user_id=user_id,
+        user_email=user_email,
+        channel=channel,
+        status=DeliveryStatus.SENT if result.get("status") == "sent" else DeliveryStatus.FAILED,
+        to_address="webhook",
+        error_message=result.get("error") if result.get("status") != "sent" else None,
+        sent_at=datetime.now(timezone.utc)
+    )
+    db.add(log)
 
 
 def _get_group_member_ids(group, db, notification) -> List[int]:
