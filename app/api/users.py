@@ -439,11 +439,17 @@ def delete_user(
         Group.type == GroupType.DYNAMIC,
         Group.is_active == True
     ).all()
-    
+
     for group in dynamic_groups:
         if user in group.members:
             group.members.remove(user)
+
+    # Delete user_locations entries first (to avoid NOT NULL violation)
+    db.query(UserLocation).filter(UserLocation.user_id == user_id).delete()
     
+    # Delete user_location_history entries
+    db.query(UserLocationHistory).filter(UserLocationHistory.user_id == user_id).delete()
+
     db.delete(user)
     db.add(create_audit_log(
         user_id=current_user.id,
