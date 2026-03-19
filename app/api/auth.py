@@ -56,6 +56,7 @@ from app.utils.audit import create_audit_log
 # ─── ERROR MESSAGE CONSTANTS ──────────────────────────────────────────────────
 INVALID_CREDENTIALS_MFA_MSG = "Invalid credentials or MFA code"
 INVALID_CREDENTIALS_RECOVERY_MSG = "Invalid credentials or recovery code"
+INVALID_CREDENTIALS_MSG = "Invalid credentials"
 PASSWORD_RESET_SENT_MSG = "If an account exists with that email, a password reset link has been sent"
 
 
@@ -715,11 +716,11 @@ async def ldap_login(
         r = _get_client()
         ip_fail_count = await r.get(_ip_fail_key(client_ip)) or 0
         ip_remaining = max(0, IP_RATE_LIMIT_MAX_ATTEMPTS - int(ip_fail_count))
-        
+
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={
-                "message": "Invalid credentials",
+                "message": INVALID_CREDENTIALS_MSG,
                 "remaining_attempts": ip_remaining,
                 "lockout_threshold": IP_RATE_LIMIT_MAX_ATTEMPTS
             }
@@ -955,11 +956,11 @@ async def login(request: LoginRequest, req: Request, response: Response, db: Ann
         r = _get_client()
         ip_fail_count = await r.get(_ip_fail_key(client_ip)) or 0
         ip_remaining = max(0, IP_RATE_LIMIT_MAX_ATTEMPTS - int(ip_fail_count))
-        
+
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={
-                "message": "Invalid credentials",
+                "message": INVALID_CREDENTIALS_MSG,
                 "remaining_attempts": ip_remaining,
                 "lockout_threshold": IP_RATE_LIMIT_MAX_ATTEMPTS
             }
@@ -997,11 +998,11 @@ async def login(request: LoginRequest, req: Request, response: Response, db: Ann
 
         # Calculate remaining attempts before lockout
         remaining_attempts = max(0, ACCOUNT_LOCKOUT_THRESHOLD - count)
-        
+
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={
-                "message": "Invalid credentials",
+                "message": INVALID_CREDENTIALS_MSG,
                 "remaining_attempts": remaining_attempts,
                 "lockout_threshold": ACCOUNT_LOCKOUT_THRESHOLD
             }
