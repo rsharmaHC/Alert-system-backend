@@ -173,50 +173,64 @@ def _ensure_incoming_messages_user_email():
 
 
 def _ensure_user_locations_unique_constraint():
-    """Add unique constraint to user_locations table to prevent duplicate assignments.
+    """Add partial unique index to user_locations table to prevent duplicate active assignments.
     
     This ensures that even on fresh database deployments, duplicate geofence assignments
     are prevented at the database level.
+    
+    Uses PARTIAL UNIQUE INDEX to only prevent duplicate ACTIVE assignments,
+    allowing multiple inactive rows for history tracking.
     """
     db = SessionLocal()
     try:
-        # Check if constraint already exists
+        # Check if partial unique index already exists
         result = db.execute(
             text("""
-                SELECT constraint_name 
-                FROM information_schema.table_constraints 
-                WHERE table_name = 'user_locations' 
-                AND constraint_name = 'uq_user_location_active'
+                SELECT indexname 
+                FROM pg_indexes 
+                WHERE tablename = 'user_locations' 
+                AND indexname = 'uq_user_location_active'
             """)
         ).fetchone()
         
         if not result:
-            # Clean up any existing duplicates first (keep oldest)
+            # First, clean up any existing duplicate ACTIVE assignments (keep oldest)
             db.execute(text("""
                 DELETE FROM user_locations
-                WHERE id NOT IN (
+                WHERE status = 'active'
+                AND id NOT IN (
                     SELECT min_id
                     FROM (
                         SELECT MIN(id) as min_id
                         FROM user_locations
-                        GROUP BY user_id, location_id, status
+                        WHERE status = 'active'
+                        GROUP BY user_id, location_id
                     ) AS keep
                 )
             """))
             
-            # Add the unique constraint
+            # Drop the old unique constraint if it exists (from previous migration)
+            try:
+                db.execute(text("""
+                    ALTER TABLE user_locations
+                    DROP CONSTRAINT IF EXISTS uq_user_location_active
+                """))
+            except Exception:
+                pass  # Constraint might not exist
+            
+            # Create partial unique index (only for active status)
             db.execute(text("""
-                ALTER TABLE user_locations
-                ADD CONSTRAINT uq_user_location_active
-                UNIQUE (user_id, location_id, status)
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_user_location_active
+                ON user_locations (user_id, location_id)
+                WHERE status = 'active'
             """))
             
             db.commit()
-            logger.info("Added unique constraint uq_user_location_active to user_locations table")
+            logger.info("Added partial unique index uq_user_location_active to user_locations table (active only)")
         else:
-            logger.info("user_locations table already has unique constraint uq_user_location_active")
+            logger.info("user_locations table already has partial unique index uq_user_location_active")
     except Exception as e:
-        logger.error(f"Error adding user_locations unique constraint: {e}")
+        logger.error(f"Error adding user_locations unique index: {e}")
         db.rollback()
     finally:
         db.close()

@@ -415,10 +415,12 @@ class UserLocation(Base):
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
     # Unique constraint: one active assignment per user-location pair
+    # Note: We use a partial unique index instead to only prevent duplicate ACTIVE assignments
+    # This allows multiple inactive rows (for history) but only one active at a time
     __table_args__ = (
-        # Prevent duplicate active assignments at database level
-        # This ensures atomicity and prevents race conditions
-        UniqueConstraint('user_id', 'location_id', 'status', name='uq_user_location_active'),
+        # Partial unique index created in _ensure_user_locations_unique_constraint()
+        # CREATE UNIQUE INDEX uq_user_location_active ON user_locations (user_id, location_id) 
+        # WHERE status = 'active'
     )
 
     # Relationships
