@@ -402,7 +402,7 @@ def get_incoming_messages(
 @router.get("/responded")
 async def handle_checkin_response(
     request: Request,
-    db: Session = Depends(get_db),
+    db: Annotated[Session, Depends(get_db)],
 ):
     """
     Handle safety check-in responses from email/SMS links.
