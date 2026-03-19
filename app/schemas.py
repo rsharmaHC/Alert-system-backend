@@ -1,5 +1,5 @@
 import re
-from pydantic import BaseModel, EmailStr, Field, validator, field_validator, constr
+from pydantic import BaseModel, EmailStr, Field, validator, field_validator, constr, ConfigDict
 from typing import Optional, List, Any, Dict, Union
 from datetime import datetime
 from app.models import (
