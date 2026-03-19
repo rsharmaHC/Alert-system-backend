@@ -2209,7 +2209,7 @@ async def verify_mfa_and_complete_login(
     user = db.query(User).filter(User.id == user_id).first()
     _validate_user_mfa_state(user, user_id)
 
-    _verify_totp_and_record_failure(user, request.code, client_ip)
+    await _verify_totp_and_record_failure(user, request.code, client_ip)
     _check_totp_replay(user, request.code)
     _record_totp_usage(user, request.code, db)
 
