@@ -1,5 +1,5 @@
 import logging
-from fastapi import APIRouter, Depends, HTTPException, status, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, status, Query, Request, Path
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
 from typing import Annotated, Optional, List
@@ -120,21 +120,12 @@ def create_group(
 
 
 @groups_router.get("/{group_id}", response_model=GroupDetailResponse)
-def _assert_group_member_access(group, current_user) -> None:
-    """Raise 403 if a non-admin user is not a member of the group."""
-    if current_user.role not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
-        if current_user not in group.members:
-            raise HTTPException(
-                status_code=403,
-                detail="You can only view groups you are a member of",
-            )
-
-
 def get_group(
-    group_id: int,
+    group_id: Annotated[int, Path(..., description="Group ID")],
     db: Annotated[Session, Depends(get_db)] = None,
     current_user: Annotated[User, Depends(get_current_user)] = None
 ):
+    """Get a specific group by ID."""
     group = db.query(Group).filter(
         Group.id == group_id,
         Group.is_active == True
@@ -145,9 +136,19 @@ def get_group(
     return group
 
 
+def _assert_group_member_access(group, current_user) -> None:
+    """Raise 403 if a non-admin user is not a member of the group."""
+    if current_user.role not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
+        if current_user not in group.members:
+            raise HTTPException(
+                status_code=403,
+                detail="You can only view groups you are a member of",
+            )
+
+
 @groups_router.put("/{group_id}", response_model=GroupResponse)
 def update_group(
-    group_id: int,
+    group_id: Annotated[int, Path(..., description="Group ID")],
     data: GroupUpdate,
     db: Annotated[Session, Depends(get_db)] = None,
     current_user: Annotated[User, Depends(require_admin)] = None
@@ -214,7 +215,7 @@ def update_group(
 
 @groups_router.delete("/{group_id}")
 def delete_group(
-    group_id: int,
+    group_id: Annotated[int, Path(..., description="Group ID")],
     db: Annotated[Session, Depends(get_db)] = None,
     current_user: Annotated[User, Depends(require_admin)] = None
 ):
@@ -232,7 +233,7 @@ def delete_group(
 
 @groups_router.post("/{group_id}/members")
 def add_members(
-    group_id: int,
+    group_id: Annotated[int, Path(..., description="Group ID")],
     data: GroupMemberAdd,
     db: Annotated[Session, Depends(get_db)] = None,
     current_user: Annotated[User, Depends(require_manager)] = None
@@ -261,8 +262,8 @@ def add_members(
 
 @groups_router.delete("/{group_id}/members/{user_id}")
 def remove_member(
-    group_id: int,
-    user_id: int,
+    group_id: Annotated[int, Path(..., description="Group ID")],
+    user_id: Annotated[int, Path(..., description="User ID")],
     db: Annotated[Session, Depends(get_db)] = None,
     current_user: Annotated[User, Depends(require_admin)] = None
 ):
@@ -484,7 +485,7 @@ def create_location(
 
 @locations_router.put("/{location_id}", response_model=LocationResponse)
 def update_location(
-    location_id: int,
+    location_id: Annotated[int, Path(..., description="Location ID")],
     data: LocationUpdate,
     request: Request,
     db: Annotated[Session, Depends(get_db)] = None,
@@ -596,7 +597,7 @@ def update_location(
 
 @locations_router.delete("/{location_id}")
 def delete_location(
-    location_id: int,
+    location_id: Annotated[int, Path(..., description="Location ID")],
     db: Annotated[Session, Depends(get_db)] = None,
     current_user: Annotated[User, Depends(require_admin)] = None
 ):
@@ -656,7 +657,7 @@ def get_categories(db: Annotated[Session, Depends(get_db)] = None, current_user:
 
 @templates_router.put("/{template_id}", response_model=TemplateResponse)
 def update_template(
-    template_id: int,
+    template_id: Annotated[int, Path(..., description="Template ID")],
     data: TemplateUpdate,
     db: Annotated[Session, Depends(get_db)] = None,
     current_user: Annotated[User, Depends(require_admin)] = None
@@ -678,7 +679,7 @@ def update_template(
 
 @templates_router.delete("/{template_id}")
 def delete_template(
-    template_id: int,
+    template_id: Annotated[int, Path(..., description="Template ID")],
     db: Annotated[Session, Depends(get_db)] = None,
     current_user: Annotated[User, Depends(require_admin)] = None
 ):
