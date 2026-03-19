@@ -99,7 +99,15 @@ def get_current_user(
     credentials: Annotated[HTTPAuthorizationCredentials, Depends(security)],
     db: Annotated[Session, Depends(get_db)]
 ) -> User:
-    """Extract and validate the current authenticated user from JWT token.
+    """
+    Get current authenticated user from JWT access token.
+
+    Security checks:
+    - Token must be valid and not expired
+    - Token type must be 'access'
+    - User must exist and be enabled (is_enabled=True)
+    - Token must be issued after user's last password change (token_valid_after)
+    Extract and validate the current authenticated user from JWT token.
     
     This is the primary authentication dependency for protected routes.
     
@@ -129,13 +137,17 @@ def get_current_user(
     # Check account status (is_enabled), NOT online presence (is_online)
     # is_enabled = admin-controlled account status (enabled/disabled)
     # is_online = real-time presence via heartbeat (changes every 30s)
+    # Note: Use is_not(False) to include both True and NULL values for backward compatibility
     user = db.query(User).filter(
         User.id == int(user_id),
-        User.is_enabled == True
+        User.is_enabled.isnot(False)  # Accepts True or NULL (backward compatible)
     ).first()
 
     if not user:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found or account disabled")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User not found or account disabled"
+        )
 
     # Session invalidation: reject tokens issued before the last password change.
     # Note: wrapped in try-except for cases where column doesn't exist yet (migration).
@@ -149,7 +161,7 @@ def get_current_user(
             )
         else:
             raise
-
+    
     return user
 
 

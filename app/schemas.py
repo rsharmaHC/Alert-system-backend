@@ -73,6 +73,7 @@ class LoginRequest(BaseModel):
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
+    expires_in: int = 3600  # Token expiry in seconds (default 1 hour)
     user: "UserResponse"
     refresh_token: Optional[str] = None  # For cross-origin deployments (Vercel + Railway)
 
@@ -168,6 +169,7 @@ class LoginSuccessResponse(BaseModel):
     status: str = "success"
     access_token: str
     token_type: str = "bearer"
+    expires_in: int = 3600  # Token expiry in seconds (default 1 hour)
     user: "UserResponse"
     refresh_token: Optional[str] = None  # For cross-origin deployments (Vercel + Railway)
     recovery_codes: Optional[List[str]] = None  # Only present on first MFA setup

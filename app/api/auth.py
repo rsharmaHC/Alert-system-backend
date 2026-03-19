@@ -1107,6 +1107,7 @@ async def _create_login_success_response(
         status="success",
         access_token=access_token,
         token_type="bearer",
+        expires_in=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,  # Convert minutes to seconds
         user=UserResponse.model_validate(user),
         refresh_token=refresh_token_str,
     )
@@ -1206,7 +1207,6 @@ async def refresh_token(req: Request, response: Response, db: Annotated[Session,
         try:
             content_type = req.headers.get("content-type", "")
             if "application/json" in content_type:
-                # Read body asynchronously
                 import json
                 body_bytes = await req.body()
                 body_data = json.loads(body_bytes.decode())
@@ -1269,6 +1269,7 @@ async def refresh_token(req: Request, response: Response, db: Annotated[Session,
     return TokenResponse(
         access_token=new_access,
         token_type="bearer",
+        expires_in=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,  # Convert minutes to seconds
         user=UserResponse.model_validate(user),
         refresh_token=new_refresh_str  # For cross-origin deployments (Vercel + Railway)
     )

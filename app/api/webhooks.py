@@ -397,3 +397,113 @@ def get_incoming_messages(
 
     # Limit results
     return result[:limit]
+
+
+@router.get("/responded")
+async def handle_checkin_response(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """
+    Handle safety check-in responses from email/SMS links.
+    
+    Users click "I'm Safe" or "I Need Help" links in notifications.
+    This endpoint records their response and saves to IncomingMessage table.
+    """
+    try:
+        # Parse query parameters
+        query_params = dict(request.query_params)
+        
+        user_id = query_params.get("user_id")
+        notification_id = query_params.get("notification_id")
+        response_type = query_params.get("response", "safe")  # Default to safe
+        channel = query_params.get("channel", "email")  # email or sms
+        
+        if not user_id or not notification_id:
+            logger.warning(f"Missing user_id or notification_id in check-in response: {query_params}")
+            return PlainTextResponse("Invalid link - missing parameters", status_code=400)
+        
+        # Validate user exists
+        user = db.query(User).filter(User.id == int(user_id)).first()
+        if not user:
+            logger.warning(f"User {user_id} not found for check-in response")
+            return PlainTextResponse("Invalid user", status_code=404)
+        
+        # Validate notification exists
+        notification = db.query(Notification).filter(
+            Notification.id == int(notification_id)
+        ).first()
+        if not notification:
+            logger.warning(f"Notification {notification_id} not found for check-in response")
+            return PlainTextResponse("Invalid notification", status_code=404)
+        
+        # Map response to ResponseType
+        response_type_value = ResponseType.SAFE if response_type.lower() == "safe" else ResponseType.NEED_HELP
+        
+        # Save to NotificationResponse
+        notification_response = NotificationResponse(
+            notification_id=notification.id,
+            user_id=user.id,
+            response_type=response_type_value,
+            channel=AlertChannel(channel.lower()) if channel.lower() in ["sms", "email"] else AlertChannel.EMAIL,
+            responded_at=datetime.now(timezone.utc)
+        )
+        db.add(notification_response)
+        
+        # Also save to IncomingMessage for tracking
+        incoming_message = IncomingMessage(
+            user_id=user.id,
+            user_email=user.email,
+            from_number=user.phone or "",
+            body=f"Check-in response: {response_type_value.value}",
+            channel=AlertChannel(channel.lower()) if channel.lower() in ["sms", "email"] else AlertChannel.EMAIL,
+            notification_id=notification.id,
+            is_processed=True,
+            received_at=datetime.now(timezone.utc)
+        )
+        db.add(incoming_message)
+        
+        # Update notification response counts
+        notification.sent_count = db.query(NotificationResponse).filter(
+            NotificationResponse.notification_id == notification.id
+        ).count()
+        
+        db.commit()
+        
+        response_type_str = "SAFE" if response_type_value == ResponseType.SAFE else "NEED HELP"
+        logger.info(f"Check-in response recorded: User {user.id} ({user.email}) - {response_type_str} for Notification {notification.id}")
+        
+        # Return simple HTML response
+        html_response = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Response Recorded - TM Alert</title>
+            <style>
+                body {{ font-family: Arial, sans-serif; text-align: center; padding: 50px; background: #f0f9ff; }}
+                .container {{ max-width: 500px; margin: 0 auto; background: white; padding: 40px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
+                .icon {{ font-size: 64px; margin-bottom: 20px; }}
+                h1 {{ color: {'#059669' if response_type_value == ResponseType.SAFE else '#dc2626'}; margin-bottom: 10px; }}
+                p {{ color: #64748b; font-size: 18px; }}
+                .timestamp {{ color: #94a3b8; font-size: 14px; margin-top: 30px; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="icon">{'✅' if response_type_value == ResponseType.SAFE else '🆘'}</div>
+                <h1>Response Recorded</h1>
+                <p>You marked yourself as <strong>{response_type_str}</strong></p>
+                <p>Thank you for responding to the TM Alert notification.</p>
+                <div class="timestamp">
+                    {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        
+        return Response(content=html_response, media_type="text/html")
+        
+    except Exception as e:
+        logger.error(f"Error processing check-in response: {e}", exc_info=True)
+        return PlainTextResponse("Error processing response. Please contact support.", status_code=500)
