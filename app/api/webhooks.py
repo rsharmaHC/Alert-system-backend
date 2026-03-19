@@ -189,7 +189,12 @@ def _record_voice_response(db, notification, user, response_type, from_number, d
     db.commit()
 
 
-@router.post("/voice/response")
+@router.post(
+    "/voice/response",
+    responses={
+        401: {"description": "Unauthorized - Invalid Twilio signature"},
+    }
+)
 async def handle_voice_response(
     request: Request,
     db: Annotated[Session, Depends(get_db)],
@@ -257,7 +262,12 @@ async def handle_voice_response(
         return Response(content=_build_twiml_response("", "error"), media_type=XML_CONTENT_TYPE)
 
 
-@router.post("/voice/status")
+@router.post(
+    "/voice/status",
+    responses={
+        401: {"description": "Unauthorized - Invalid Twilio signature"},
+    }
+)
 async def handle_voice_status(
     request: Request,
     db: Annotated[Session, Depends(get_db)],

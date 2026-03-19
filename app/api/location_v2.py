@@ -437,7 +437,13 @@ def _validate_query(q: str) -> tuple[bool, Optional[str]]:
 
 # ─── ENDPOINTS ────────────────────────────────────────────────────────────────
 
-@router.get("/autocomplete", response_model=LocationAutocompleteResponse)
+@router.get(
+    "/autocomplete",
+    response_model=LocationAutocompleteResponse,
+    responses={
+        400: {"description": "Bad Request - Invalid query (must be 3-200 characters, valid characters only)"},
+    }
+)
 async def autocomplete(
     request: Request,
     q: Annotated[str, Query(..., description="Search query (minimum 3 characters)", min_length=3, max_length=200)],
@@ -520,7 +526,12 @@ async def health_check():
     }
 
 
-@router.delete("/cache")
+@router.delete(
+    "/cache",
+    responses={
+        500: {"description": "Internal Server Error - Cache clear failed"},
+    }
+)
 async def clear_cache(
     pattern: Annotated[Optional[str], Query()] = None,
 ):

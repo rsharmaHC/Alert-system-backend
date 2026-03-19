@@ -140,7 +140,12 @@ def get_map_data(
     }
 
 
-@router.get("/notification-activity")
+@router.get(
+    "/notification-activity",
+    responses={
+        400: {"description": "Bad Request - Days parameter must be between 1 and 365"},
+    }
+)
 def get_notification_activity(
     days: int = 7,
     db: Annotated[Session, Depends(get_db)] = None,
@@ -150,7 +155,7 @@ def get_notification_activity(
 
     Args:
         days: Number of days to query (1-365, default 7)
-    
+
     Access Control:
         - Viewer role: Can only see activity for notifications they received
         - Manager/Admin: Can see all notification activity
