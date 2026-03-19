@@ -282,6 +282,65 @@ def get_user(
     return user
 
 
+def _validate_user_update_permissions(current_user: User, user: User, data: UserUpdate) -> None:
+    """Validate permissions for updating a user profile."""
+    # Check permissions: users can update themselves, or managers+ can update anyone
+    if current_user.id != user.id and current_user.role not in [UserRole.SUPER_ADMIN, UserRole.ADMIN, UserRole.MANAGER]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied. You can only update your own profile."
+        )
+    
+    # Prevent privilege escalation: non-admins cannot change role to admin
+    if data.role is not None and data.role != user.role:
+        if current_user.role not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only admins can change user roles"
+            )
+    
+    # Prevent editing sensitive fields for other users
+    if current_user.id != user.id:
+        _validate_sensitive_field_changes(current_user, data)
+
+
+def _validate_sensitive_field_changes(current_user: User, data: UserUpdate) -> None:
+    """Validate that sensitive fields are not being changed by unauthorized users."""
+    fields_being_changed = data.model_dump(exclude_unset=True)
+    sensitive_fields = {'role', 'is_active', 'employee_id'}
+    
+    if sensitive_fields & fields_being_changed.keys():
+        if current_user.role not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only the user themselves can update role, is_active, or employee_id"
+            )
+
+
+def _validate_user_uniqueness(db: Session, user: User, data: UserUpdate) -> None:
+    """Validate uniqueness constraints for user fields."""
+    if data.employee_id is not None:
+        employee_id_value = data.employee_id if data.employee_id != '' else None
+        if employee_id_value:
+            _check_employee_id_unique(db, employee_id_value, user.id)
+    
+    if data.email is not None and data.email != user.email:
+        _check_email_unique(db, data.email, user.id)
+    
+    if data.phone is not None and data.phone != user.phone:
+        _check_phone_unique(db, data.phone, user.id)
+
+
+def _apply_user_update(user: User, data: UserUpdate) -> None:
+    """Apply update data to user object."""
+    for field, value in data.model_dump(exclude_unset=True).items():
+        if field == 'user_id':
+            continue
+        if field == 'employee_id' and value == '':
+            value = None
+        setattr(user, field, value)
+
+
 @router.put("/{user_id}", response_model=UserResponse)
 def update_user_endpoint(
     user_id: int,
@@ -300,55 +359,11 @@ def update_user_endpoint(
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail=USER_NOT_FOUND_MSG)
-
-    # Check permissions: users can update themselves, or managers+ can update anyone
-    if current_user.id != user_id and current_user.role not in [UserRole.SUPER_ADMIN, UserRole.ADMIN, UserRole.MANAGER]:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access denied. You can only update your own profile."
-        )
-
-    # Prevent privilege escalation: non-admins cannot change role to admin
-    # Only check if role is being changed to a different value
-    if data.role is not None and data.role != user.role:
-        if current_user.role not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Only admins can change user roles"
-            )
-
-    # Prevent editing sensitive fields for other users
-    if current_user.id != user_id:
-        # Managers cannot edit these fields for other users (but users can edit their own)
-        # Only block if actually trying to change these fields
-        fields_being_changed = data.model_dump(exclude_unset=True)
-        if 'role' in fields_being_changed or 'is_active' in fields_being_changed or 'employee_id' in fields_being_changed:
-            if current_user.role not in [UserRole.SUPER_ADMIN, UserRole.ADMIN]:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Only the user themselves can update role, is_active, or employee_id"
-                )
-
-    if data.employee_id is not None:
-        employee_id_value = data.employee_id if data.employee_id != '' else None
-        if employee_id_value:
-            _check_employee_id_unique(db, employee_id_value, user_id)
-
-    if data.email is not None and data.email != user.email:
-        _check_email_unique(db, data.email, user_id)
-
-    if data.phone is not None and data.phone != user.phone:
-        _check_phone_unique(db, data.phone, user_id)
-
-    # Update user fields (exclude user_id - never allow changing user_id)
-    for field, value in data.model_dump(exclude_unset=True).items():
-        # Skip user_id - it's the primary key and cannot be changed
-        if field == 'user_id':
-            continue
-        if field == 'employee_id' and value == '':
-            value = None
-        setattr(user, field, value)
-
+    
+    _validate_user_update_permissions(current_user, user, data)
+    _validate_user_uniqueness(db, user, data)
+    _apply_user_update(user, data)
+    
     db.add(create_audit_log(
         user_id=current_user.id,
         user_email=current_user.email,
@@ -357,12 +372,12 @@ def update_user_endpoint(
         resource_id=user_id,
         request=request,
     ))
-
+    
     # Sync location changes between users.location_id and user_locations table
     if data.location_id is not None:
         from app.api.location_audience import _sync_user_location_primary
         _sync_user_location_primary(db, user_id, data.location_id)
-
+    
     db.commit()
     db.refresh(user)
     refresh_dynamic_groups_for_user(db, user)
@@ -504,6 +519,96 @@ def delete_user(
     return {"message": "User permanently deleted"}
 
 
+def _remove_users_from_dynamic_groups(db, users: List[User]) -> None:
+    """Remove users from all dynamic groups before deletion."""
+    dynamic_groups = db.query(Group).filter(
+        Group.type == GroupType.DYNAMIC,
+        Group.is_active == True
+    ).all()
+    
+    for user in users:
+        for group in dynamic_groups:
+            if user in group.members:
+                group.members.remove(user)
+
+
+def _reassign_user_foreign_keys(db, user_ids: List[int], current_user_id: int) -> None:
+    """Reassign all foreign keys that reference users being deleted."""
+    # Reassign groups created by users being deleted
+    db.query(Group).filter(Group.created_by_id.in_(user_ids)).update({
+        Group.created_by_id: current_user_id,
+        Group.updated_at: func.now()
+    }, synchronize_session=False)
+    
+    # Reassign templates created by users being deleted
+    db.query(NotificationTemplate).filter(
+        NotificationTemplate.created_by_id.in_(user_ids)
+    ).update({
+        NotificationTemplate.created_by_id: current_user_id,
+        NotificationTemplate.updated_at: func.now()
+    }, synchronize_session=False)
+    
+    # Reassign incidents created by users being deleted
+    db.query(Incident).filter(Incident.created_by_id.in_(user_ids)).update({
+        Incident.created_by_id: current_user_id,
+        Incident.updated_at: func.now()
+    }, synchronize_session=False)
+    
+    # Reassign incidents resolved by users being deleted
+    db.query(Incident).filter(Incident.resolved_by_id.in_(user_ids)).update({
+        Incident.resolved_by_id: current_user_id,
+        Incident.updated_at: func.now()
+    }, synchronize_session=False)
+    
+    # Reassign notifications created by users being deleted
+    db.query(Notification).filter(Notification.created_by_id.in_(user_ids)).update({
+        Notification.created_by_id: current_user_id,
+        Notification.updated_at: func.now()
+    }, synchronize_session=False)
+    
+    # Reassign user_locations assigned_by_id (manual assignments)
+    db.query(UserLocation).filter(UserLocation.assigned_by_id.in_(user_ids)).update({
+        UserLocation.assigned_by_id: current_user_id,
+        UserLocation.updated_at: func.now()
+    }, synchronize_session=False)
+    
+    # Reassign user_location_history triggered_by_user_id
+    db.query(UserLocationHistory).filter(
+        UserLocationHistory.triggered_by_user_id.in_(user_ids)
+    ).update({
+        UserLocationHistory.triggered_by_user_id: current_user_id,
+    }, synchronize_session=False)
+
+
+def _delete_single_user(db, user: User, current_user: User, request: Request) -> bool:
+    """Delete a single user and related records. Returns True if successful."""
+    try:
+        db.add(create_audit_log(
+            user_id=current_user.id,
+            user_email=current_user.email,
+            action="delete_user",
+            resource_type="user",
+            resource_id=user.id,
+            details={"deleted_email": user.email, "deleted_name": user.full_name},
+            request=request,
+        ))
+        
+        db.query(UserLocation).filter(
+            UserLocation.user_id == user.id
+        ).delete(synchronize_session=False)
+        
+        db.query(UserLocationHistory).filter(
+            UserLocationHistory.user_id == user.id
+        ).delete(synchronize_session=False)
+        
+        db.delete(user)
+        return True
+    except Exception as e:
+        logger.error(f"Failed to delete user {user.id}: {e}")
+        db.rollback()
+        return False
+
+
 @router.post("/bulk-delete")
 def bulk_delete_users(
     user_ids: List[int],
@@ -520,134 +625,32 @@ def bulk_delete_users(
     """
     if not user_ids:
         raise HTTPException(status_code=400, detail="No user IDs provided")
-
+    
     if current_user.id in user_ids:
         raise HTTPException(status_code=400, detail="Cannot delete yourself")
-
-    # Fetch all users to delete
+    
     users = db.query(User).filter(User.id.in_(user_ids)).all()
     found_ids = {u.id for u in users}
-
-    # Check for non-existent users
-    not_found_ids = set(user_ids) - found_ids
-
-    # Remove users from all dynamic groups before deletion
-    # This ensures clean deletion without orphaned references
-    dynamic_groups = db.query(Group).filter(
-        Group.type == GroupType.DYNAMIC,
-        Group.is_active == True
-    ).all()
-
-    for user in users:
-        for group in dynamic_groups:
-            if user in group.members:
-                group.members.remove(user)
-
-    # Reassign all foreign keys that reference users being deleted
-    # This prevents foreign key constraint violations during deletion
-    # We reassign to the current admin who is performing the deletion
     
-    # Reassign groups created by users being deleted
-    db.query(Group).filter(
-        Group.created_by_id.in_(user_ids)
-    ).update({
-        Group.created_by_id: current_user.id,
-        Group.updated_at: func.now()
-    }, synchronize_session=False)
+    _remove_users_from_dynamic_groups(db, users)
+    _reassign_user_foreign_keys(db, user_ids, current_user.id)
     
-    # Reassign templates created by users being deleted
-    db.query(NotificationTemplate).filter(
-        NotificationTemplate.created_by_id.in_(user_ids)
-    ).update({
-        NotificationTemplate.created_by_id: current_user.id,
-        NotificationTemplate.updated_at: func.now()
-    }, synchronize_session=False)
-    
-    # Reassign incidents created by users being deleted
-    db.query(Incident).filter(
-        Incident.created_by_id.in_(user_ids)
-    ).update({
-        Incident.created_by_id: current_user.id,
-        Incident.updated_at: func.now()
-    }, synchronize_session=False)
-    
-    # Reassign incidents resolved by users being deleted
-    db.query(Incident).filter(
-        Incident.resolved_by_id.in_(user_ids)
-    ).update({
-        Incident.resolved_by_id: current_user.id,
-        Incident.updated_at: func.now()
-    }, synchronize_session=False)
-    
-    # Reassign notifications created by users being deleted
-    db.query(Notification).filter(
-        Notification.created_by_id.in_(user_ids)
-    ).update({
-        Notification.created_by_id: current_user.id,
-        Notification.updated_at: func.now()
-    }, synchronize_session=False)
-    
-    # Reassign user_locations assigned_by_id (manual assignments)
-    db.query(UserLocation).filter(
-        UserLocation.assigned_by_id.in_(user_ids)
-    ).update({
-        UserLocation.assigned_by_id: current_user.id,
-        UserLocation.updated_at: func.now()
-    }, synchronize_session=False)
-    
-    # Reassign user_location_history triggered_by_user_id
-    db.query(UserLocationHistory).filter(
-        UserLocationHistory.triggered_by_user_id.in_(user_ids)
-    ).update({
-        UserLocationHistory.triggered_by_user_id: current_user.id,
-    }, synchronize_session=False)
-
-    # Delete users with proper cascade handling
-    # Explicitly delete related records to avoid NOT NULL constraint violations
     deleted_count = 0
-    failed_count = 0
     failed_ids = []
     
     for user in users:
-        try:
-            # Log the deletion action
-            db.add(create_audit_log(
-                user_id=current_user.id,
-                user_email=current_user.email,
-                action="delete_user",
-                resource_type="user",
-                resource_id=user.id,
-                details={"deleted_email": user.email, "deleted_name": user.full_name},
-                request=request,
-            ))
-
-            # Explicitly delete related records that have CASCADE
-            # (others were reassigned above)
-            db.query(UserLocation).filter(
-                UserLocation.user_id == user.id
-            ).delete(synchronize_session=False)
-
-            db.query(UserLocationHistory).filter(
-                UserLocationHistory.user_id == user.id
-            ).delete(synchronize_session=False)
-
-            db.delete(user)
+        if _delete_single_user(db, user, current_user, request):
             deleted_count += 1
-        except Exception as e:
-            logger.error(f"Failed to delete user {user.id}: {e}")
-            failed_count += 1
+        else:
             failed_ids.append(user.id)
-            # Rollback this user's changes but continue with others
-            db.rollback()
-
+    
     db.commit()
-
-    # Separate successful and failed deletions
+    
     successful_ids = found_ids - set(failed_ids)
-
+    
     return UserBulkDeleteResponse(
         deleted=deleted_count,
-        failed=failed_count,
+        failed=len(failed_ids),
         deleted_ids=list(successful_ids),
         failed_ids=failed_ids
     )
