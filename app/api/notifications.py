@@ -34,6 +34,11 @@ NOTIFICATION_NOT_FOUND_MSG = "Notification not found"
 
 logger = logging.getLogger(__name__)
 
+# ─── ROUTERS ──────────────────────────────────────────────────────────────────
+# Define routers first before any route decorators use them
+notifications_router = APIRouter(prefix="/notifications", tags=["Notifications"])
+incidents_router = APIRouter(prefix="/incidents", tags=["Incidents"])
+
 
 def _apply_viewer_notification_filter(query, current_user):
     """Restrict notification query to only records the viewer is a recipient of."""
@@ -142,9 +147,6 @@ def _validate_incident_status_transition(
 
 
 # ─── INCIDENTS ────────────────────────────────────────────────────────────────
-
-incidents_router = APIRouter(prefix="/incidents", tags=["Incidents"])
-
 
 @incidents_router.get("", response_model=List[IncidentResponse])
 def list_incidents(
@@ -368,9 +370,6 @@ def list_notifications(
 
 
 # ─── NOTIFICATIONS ────────────────────────────────────────────────────────────
-
-notifications_router = APIRouter(prefix="/notifications", tags=["Notifications"])
-
 
 @notifications_router.post(
     "",
