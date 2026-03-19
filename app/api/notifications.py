@@ -315,16 +315,16 @@ async def create_notification(
     # Validate timezone if provided
     scheduled_timezone = data.scheduled_timezone
     scheduled_at_utc = data.scheduled_at
-    
+
     if data.scheduled_at and scheduled_timezone:
         # Convert scheduled time from local timezone to UTC
         try:
-            import pytz
-            local_tz = pytz.timezone(scheduled_timezone)
+            from zoneinfo import ZoneInfo
+            local_tz = ZoneInfo(scheduled_timezone)
             # Assume the incoming datetime is naive (no timezone) and localize it
-            local_dt = local_tz.localize(data.scheduled_at)
+            local_dt = data.scheduled_at.replace(tzinfo=local_tz)
             # Convert to UTC
-            scheduled_at_utc = local_dt.astimezone(pytz.UTC)
+            scheduled_at_utc = local_dt.astimezone(timezone.utc)
         except Exception as e:
             logger.warning(f"Invalid timezone '{scheduled_timezone}', using UTC: {e}")
             scheduled_at_utc = data.scheduled_at.replace(tzinfo=timezone.utc)
