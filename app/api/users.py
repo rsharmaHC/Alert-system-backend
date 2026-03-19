@@ -202,8 +202,14 @@ def create_user(
     current_user: Annotated[User, Depends(require_admin)] = None,
     request: Request = None,
 ):
+    # Check email uniqueness
     if db.query(User).filter(User.email == data.email).first():
         raise HTTPException(status_code=400, detail="Email already registered")
+
+    # Check phone uniqueness (if provided)
+    if data.phone:
+        if db.query(User).filter(User.phone == data.phone).first():
+            raise HTTPException(status_code=400, detail="Phone number already registered. Each user must have a unique phone number.")
 
     if data.employee_id:
         if db.query(User).filter(User.employee_id == data.employee_id).first():
@@ -232,19 +238,22 @@ def create_user(
         user_email=current_user.email,
         action="create_user",
         resource_type="user",
-        details={"email": data.email},
+        details={"email": data.email, "phone": data.phone},
         request=request,
     ))
     try:
         db.commit()
         db.refresh(user)
-        
+
         # Refresh dynamic group memberships for the new user
         refresh_dynamic_groups_for_user(db, user)
-        
+
     except Exception as e:
         db.rollback()
-        if "unique" in str(e).lower() or "duplicate" in str(e).lower():
+        error_msg = str(e).lower()
+        if "unique" in error_msg or "duplicate" in error_msg:
+            if "phone" in error_msg or "phone" in str(data):
+                raise HTTPException(status_code=400, detail="Phone number already registered. Each user must have a unique phone number.")
             raise HTTPException(status_code=400, detail="A user with this email or employee ID already exists")
         raise HTTPException(status_code=500, detail="Failed to create user")
     return user
@@ -317,7 +326,14 @@ def update_user_endpoint(
     if data.email is not None and data.email != user.email:
         _check_email_unique(db, data.email, user_id)
 
+    if data.phone is not None and data.phone != user.phone:
+        _check_phone_unique(db, data.phone, user_id)
+
+    # Update user fields (exclude user_id - never allow changing user_id)
     for field, value in data.model_dump(exclude_unset=True).items():
+        # Skip user_id - it's the primary key and cannot be changed
+        if field == 'user_id':
+            continue
         if field == 'employee_id' and value == '':
             value = None
         setattr(user, field, value)
@@ -330,15 +346,14 @@ def update_user_endpoint(
         resource_id=user_id,
         request=request,
     ))
-    
+
     # Sync location changes between users.location_id and user_locations table
     if data.location_id is not None:
         from app.api.location_audience import _sync_user_location_primary
         _sync_user_location_primary(db, user_id, data.location_id)
-    
+
     db.commit()
     db.refresh(user)
-    from app.location_tasks import refresh_dynamic_groups_for_user
     refresh_dynamic_groups_for_user(db, user)
     return user
 
@@ -369,6 +384,21 @@ def _check_email_unique(db: Session, email: str, exclude_user_id: int) -> None:
         )
 
 
+def _check_phone_unique(db: Session, phone: str, exclude_user_id: int) -> None:
+    """Raise 400 if the phone number is already assigned to a different user."""
+    if not phone:  # Allow null/empty phone
+        return
+    existing = db.query(User).filter(
+        User.phone == phone,
+        User.id != exclude_user_id,
+    ).first()
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Phone number '{phone}' already assigned to another user. Each user must have a unique phone number.",
+        )
+
+
 def update_user(
     user_id: int,
     data: UserUpdate,
@@ -395,6 +425,9 @@ def update_user(
 
     if data.email is not None and data.email != user.email:
         _check_email_unique(db, data.email, user_id)
+
+    if data.phone is not None and data.phone != user.phone:
+        _check_phone_unique(db, data.phone, user_id)
 
     for field, value in data.model_dump(exclude_unset=True).items():
         if field == 'employee_id' and value == '':
@@ -435,11 +468,17 @@ def delete_user(
         Group.type == GroupType.DYNAMIC,
         Group.is_active == True
     ).all()
-    
+
     for group in dynamic_groups:
         if user in group.members:
             group.members.remove(user)
+
+    # Delete user_locations entries first (to avoid NOT NULL violation)
+    db.query(UserLocation).filter(UserLocation.user_id == user_id).delete()
     
+    # Delete user_location_history entries
+    db.query(UserLocationHistory).filter(UserLocationHistory.user_id == user_id).delete()
+
     db.delete(user)
     db.add(create_audit_log(
         user_id=current_user.id,
@@ -830,14 +869,14 @@ async def import_users_csv(
             if result.get('status') == 'failed':
                 emails_failed += 1
                 email_failures.append(f"Email to {_scrub_email(user_data['email'])} failed: {result.get('error', 'Unknown error')}")
-                logger.error(f"Welcome email failed for user_id={user.id}, email={_scrub_email(user_data['email'])}: {result.get('error')}")
+                logger.error(f"Welcome email failed for user_id={user_data.get('id', 'N/A')}, email={_scrub_email(user_data['email'])}: {result.get('error')}")
             else:
                 emails_sent += 1
-                logger.info(f"Welcome email sent to user_id={user.id}, email={_scrub_email(user_data['email'])}")
+                logger.info(f"Welcome email sent to user_id={user_data.get('id', 'N/A')}, email={_scrub_email(user_data['email'])}")
         except Exception as e:
             emails_failed += 1
             email_failures.append(f"Email to {_scrub_email(user_data['email'])} error: {str(e)}")
-            logger.error(f"Exception sending welcome email to user_id={user.id}, email={_scrub_email(user_data['email'])}: {e}")
+            logger.error(f"Exception sending welcome email to user_id={user_data.get('id', 'N/A')}, email={_scrub_email(user_data['email'])}: {e}")
 
     # Add secondary audit log for email results if there were newly created users
     if created_users and (emails_sent > 0 or emails_failed > 0):
