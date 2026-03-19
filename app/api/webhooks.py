@@ -114,7 +114,7 @@ async def validate_twilio_request(request: Request, body: bytes) -> bool:
 @router.post("/voice/response")
 async def handle_voice_response(
     request: Request,
-    db: Session = Depends(get_db),
+    db: Annotated[Session, Depends(get_db)],
 ):
     """Handle Twilio voice response when user presses 1 or 2."""
     # Read raw body FIRST (before any form parsing)
@@ -266,7 +266,7 @@ async def handle_voice_response(
 @router.post("/voice/status")
 async def handle_voice_status(
     request: Request,
-    db: Session = Depends(get_db),
+    db: Annotated[Session, Depends(get_db)],
 ):
     """Handle Twilio voice call status callbacks.
 
@@ -307,9 +307,9 @@ async def handle_voice_status(
 
 @router.get("/incoming-messages", response_model=List[IncomingMessageResponse])
 def get_incoming_messages(
-    limit: int = Query(50, ge=1, le=500),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    limit: Annotated[int, Query(ge=1, le=500)] = 50,
+    db: Annotated[Session, Depends(get_db)] = None,
+    current_user: Annotated[User, Depends(get_current_user)] = None,
 ):
     """View incoming messages and voice responses (authenticated users only).
 

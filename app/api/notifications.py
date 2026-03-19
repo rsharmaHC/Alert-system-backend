@@ -148,9 +148,9 @@ incidents_router = APIRouter(prefix="/incidents", tags=["Incidents"])
 
 @incidents_router.get("", response_model=List[IncidentResponse])
 def list_incidents(
-    status: Optional[IncidentStatus] = None,
-    severity: Optional[IncidentSeverity] = None,
-    limit: int = Query(20, ge=1, le=100),
+    status: Annotated[Optional[IncidentStatus], Query()] = None,
+    severity: Annotated[Optional[IncidentSeverity], Query()] = None,
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
     db: Annotated[Session, Depends(get_db)] = None,
     current_user: Annotated[User, Depends(get_current_user)] = None
 ):
@@ -244,10 +244,10 @@ notifications_router = APIRouter(prefix="/notifications", tags=["Notifications"]
 
 @notifications_router.get("", response_model=dict)
 def list_notifications(
-    page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100),
-    incident_id: Optional[int] = None,
-    status: Optional[NotificationStatus] = None,
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=100)] = 20,
+    incident_id: Annotated[Optional[int], Query()] = None,
+    status: Annotated[Optional[NotificationStatus], Query()] = None,
     db: Annotated[Session, Depends(get_db)] = None,
     current_user: Annotated[User, Depends(get_current_user)] = None
 ):
@@ -494,10 +494,10 @@ def get_notification(
 @notifications_router.get("/{notification_id}/delivery", response_model=List[DeliveryLogResponse])
 def get_delivery_logs(
     notification_id: int,
-    channel: Optional[AlertChannel] = None,
-    status: Optional[DeliveryStatus] = None,
-    limit: int = Query(100, ge=1, le=1000),
-    offset: int = Query(0, ge=0),
+    channel: Annotated[Optional[AlertChannel], Query()] = None,
+    status: Annotated[Optional[DeliveryStatus], Query()] = None,
+    limit: Annotated[int, Query(ge=1, le=1000)] = 100,
+    offset: Annotated[int, Query(ge=0)] = 0,
     db: Annotated[Session, Depends(get_db)] = None,
     current_user: Annotated[User, Depends(get_current_user)] = None
 ):
@@ -559,8 +559,8 @@ def get_delivery_logs(
 @notifications_router.get("/{notification_id}/responses", response_model=List[NotificationResponseOut])
 def get_responses(
     notification_id: int,
-    limit: int = Query(100, ge=1, le=1000),
-    offset: int = Query(0, ge=0),
+    limit: Annotated[int, Query(ge=1, le=1000)] = 100,
+    offset: Annotated[int, Query(ge=0)] = 0,
     db: Annotated[Session, Depends(get_db)] = None,
     current_user: Annotated[User, Depends(get_current_user)] = None
 ):

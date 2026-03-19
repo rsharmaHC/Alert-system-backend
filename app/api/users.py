@@ -156,13 +156,13 @@ def _sanitize_formula_characters(value: str) -> str:
 
 @router.get("", response_model=UserListResponse)
 def list_users(
-    page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100),
-    search: Optional[str] = None,
-    department: Optional[str] = None,
-    location_id: Optional[int] = None,
-    role: Optional[UserRole] = None,
-    is_active: Optional[bool] = None,
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=100)] = 20,
+    search: Annotated[Optional[str], Query()] = None,
+    department: Annotated[Optional[str], Query()] = None,
+    location_id: Annotated[Optional[int], Query()] = None,
+    role: Annotated[Optional[UserRole], Query()] = None,
+    is_active: Annotated[Optional[bool], Query()] = None,
     db: Annotated[Session, Depends(get_db)] = None,
     current_user: Annotated[User, Depends(get_current_user)] = None
 ):

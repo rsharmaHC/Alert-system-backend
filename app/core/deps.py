@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from typing import Annotated
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
@@ -48,8 +49,8 @@ def _check_token_session_validity(user: User, payload: dict) -> None:
 
 
 def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
-    db: Session = Depends(get_db)
+    credentials: Annotated[HTTPAuthorizationCredentials, Depends(security)],
+    db: Annotated[Session, Depends(get_db)]
 ) -> User:
     token = credentials.credentials
     payload = decode_token(token, token_type="access")
@@ -83,7 +84,7 @@ def get_current_user(
 
 
 def require_roles(*roles: UserRole):
-    def checker(current_user: User = Depends(get_current_user)):
+    def checker(current_user: Annotated[User, Depends(get_current_user)]):
         if current_user.role not in roles:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,

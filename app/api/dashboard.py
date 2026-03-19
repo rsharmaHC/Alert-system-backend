@@ -19,8 +19,8 @@ MAX_ACTIVITY_DAYS = 365  # Maximum days for activity queries
 
 @router.get("/stats")
 def get_dashboard_stats(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    db: Annotated[Session, Depends(get_db)],
+    current_user: Annotated[User, Depends(get_current_user)]
 ):
     now = datetime.now(timezone.utc)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -89,8 +89,8 @@ def get_dashboard_stats(
 
 @router.get("/map-data")
 def get_map_data(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    db: Annotated[Session, Depends(get_db)],
+    current_user: Annotated[User, Depends(get_current_user)]
 ):
     """Return location data with employee counts for the audience map.
 
@@ -143,8 +143,8 @@ def get_map_data(
 @router.get("/notification-activity")
 def get_notification_activity(
     days: int = 7,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    db: Annotated[Session, Depends(get_db)] = None,
+    current_user: Annotated[User, Depends(get_current_user)] = None
 ):
     """Daily notification counts for the last N days.
 

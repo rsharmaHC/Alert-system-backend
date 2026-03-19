@@ -467,12 +467,11 @@ async def entra_login():
 
 @router.get("/entra/callback")
 async def entra_callback(
-    code: str = Query(None),
-    state: str = Query(None),
-    error: str = Query(None),
-    error_description: str = Query(None),
-    req: Request = None,
-    response: Response = None,
+    request: Request,
+    code: Annotated[Optional[str], Query()] = None,
+    state: Annotated[Optional[str], Query()] = None,
+    error: Annotated[Optional[str], Query()] = None,
+    error_description: Annotated[Optional[str], Query()] = None,
     db: Annotated[Session, Depends(get_db)] = None,
 ):
     """Handle Microsoft Entra ID OAuth callback.
@@ -1408,8 +1407,8 @@ def _format_login_attempt(attempt) -> dict:
 
 @router.get("/login-attempts")
 def get_login_attempts(
-    limit: int = Query(default=50, ge=1, le=500),
-    offset: int = Query(default=0, ge=0),
+    limit: Annotated[int, Query(ge=1, le=500)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
     db: Annotated[Session, Depends(get_db)] = None,
     current_user: Annotated[User, Depends(require_admin)] = None
 ):

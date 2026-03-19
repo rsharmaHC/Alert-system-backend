@@ -305,8 +305,8 @@ def assign_user_to_location(
 def remove_user_from_location(
     data: UserLocationRemove,
     request: Request,
-    user_id: int = Query(..., description="User ID to remove"),
-    location_id: int = Query(..., description="Location ID to remove from"),
+    user_id: Annotated[int, Query(..., description="User ID to remove")],
+    location_id: Annotated[int, Query(..., description="Location ID to remove from")],
     db: Annotated[Session, Depends(get_db)] = None,
     current_user: Annotated[User, Depends(get_current_user)] = None
 ):
@@ -500,10 +500,10 @@ def update_user_geofence(
 @router.get("/location/{location_id}/members", response_model=LocationMemberListResponse)
 def get_location_members(
     location_id: int,
-    page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100),
-    status_filter: Optional[UserLocationStatus] = Query(None, alias="status"),
-    assignment_type: Optional[UserLocationAssignmentType] = None,
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=100)] = 20,
+    status_filter: Annotated[Optional[UserLocationStatus], Query(alias="status")] = None,
+    assignment_type: Annotated[Optional[UserLocationAssignmentType], Query()] = None,
     db: Annotated[Session, Depends(get_db)] = None,
     current_user: Annotated[User, Depends(get_current_user)] = None
 ):
@@ -608,7 +608,7 @@ def get_location_members(
 @router.get("/user/{user_id}/locations", response_model=List[UserLocationResponse])
 def get_user_locations(
     user_id: int,
-    include_inactive: bool = Query(False, description="Include inactive assignments"),
+    include_inactive: Annotated[bool, Query(description="Include inactive assignments")] = False,
     db: Annotated[Session, Depends(get_db)] = None,
     current_user: Annotated[User, Depends(get_current_user)] = None
 ):
@@ -640,9 +640,9 @@ def get_user_locations(
 @router.get("/location/{location_id}/history", response_model=UserLocationHistoryListResponse)
 def get_location_history(
     location_id: int,
-    page: int = Query(1, ge=1),
-    page_size: int = Query(50, ge=1, le=200),
-    action_filter: Optional[str] = Query(None, alias="action"),
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=200)] = 50,
+    action_filter: Annotated[Optional[str], Query(alias="action")] = None,
     db: Annotated[Session, Depends(get_db)] = None,
     current_user: Annotated[User, Depends(require_admin)] = None
 ):

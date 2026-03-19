@@ -440,11 +440,11 @@ def _validate_query(q: str) -> tuple[bool, Optional[str]]:
 @router.get("/autocomplete", response_model=LocationAutocompleteResponse)
 async def autocomplete(
     request: Request,
-    q: str = Query(..., description="Search query (minimum 3 characters)", min_length=3, max_length=200),
-    limit: int = Query(default=10, ge=1, le=20),
-    countrycodes: Optional[str] = Query(default=None, description="Comma-separated ISO country codes"),
-    viewbox: Optional[str] = Query(default=None, description="Bounding box: x1,y1,x2,y2"),
-    bounded: bool = Query(default=False),
+    q: Annotated[str, Query(..., description="Search query (minimum 3 characters)", min_length=3, max_length=200)],
+    limit: Annotated[int, Query(ge=1, le=20)] = 10,
+    countrycodes: Annotated[Optional[str], Query(default=None, description="Comma-separated ISO country codes")] = None,
+    viewbox: Annotated[Optional[str], Query(default=None, description="Bounding box: x1,y1,x2,y2")] = None,
+    bounded: Annotated[bool, Query()] = False,
 ):
     """
     Location autocomplete — provider-agnostic, permanently cached.
