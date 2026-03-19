@@ -466,6 +466,162 @@ async def entra_login():
     return RedirectResponse(url=auth_url, status_code=302)
 
 
+# ─── ENTRA CALLBACK HELPER FUNCTIONS ─────────────────────────────────────────
+
+def _entra_redirect_error(frontend_url: str, error_code: str, detail: str = "") -> RedirectResponse:
+    """Create error redirect response for Entra callback."""
+    if detail:
+        logger.warning(f"Entra callback error: {error_code} - {detail}")
+    return RedirectResponse(
+        url=f"{frontend_url}/#/login?error={error_code}&detail={detail}",
+        status_code=302,
+    )
+
+
+async def _entra_validate_state(state: str, redis) -> tuple[Optional[dict], Optional[str]]:
+    """Validate Entra OAuth state and return PKCE data. Returns (data, error)."""
+    if not state:
+        return None, "missing_params"
+    
+    oauth_data_raw = await redis.get(f"oauth_state:{state}")
+    if not oauth_data_raw:
+        logger.warning("Entra callback: invalid or expired state parameter")
+        return None, "invalid_state"
+    
+    # Delete state immediately (one-time use)
+    await redis.delete(f"oauth_state:{state}")
+    
+    try:
+        oauth_data = json.loads(oauth_data_raw)
+        return {
+            "code_verifier": oauth_data["code_verifier"],
+            "expected_nonce": oauth_data["nonce"]
+        }, None
+    except (json.JSONDecodeError, KeyError):
+        return None, "corrupted_state"
+
+
+def _check_email_domain(email: str) -> bool:
+    """Check if email domain is allowed. Returns True if allowed."""
+    if not settings.ALLOWED_EMAIL_DOMAINS:
+        return True
+    
+    allowed = [d.strip().lower() for d in settings.ALLOWED_EMAIL_DOMAINS.split(",") if d.strip()]
+    email_domain = email.split("@")[-1]
+    return not allowed or email_domain in allowed
+
+
+def _find_or_provision_user(db: Session, user_info: dict, request: Request) -> tuple[Optional[User], Optional[str]]:
+    """Find existing user or provision new one. Returns (user, error)."""
+    # Find by external_id or email
+    user = None
+    if user_info.get("external_id"):
+        user = db.query(User).filter(User.external_id == user_info["external_id"]).first()
+    
+    if not user:
+        user = db.query(User).filter(func.lower(User.email) == user_info["email"].lower()).first()
+    
+    if user:
+        # Update existing user
+        if user.auth_provider != "entra":
+            user.auth_provider = "entra"
+            user.external_id = user_info["external_id"]
+            logger.info(f"Linked existing user {user.id} to Entra ID")
+        
+        # Sync attributes
+        if user_info.get("first_name"):
+            user.first_name = user_info["first_name"]
+        if user_info.get("last_name"):
+            user.last_name = user_info["last_name"]
+        
+        return user, None
+    
+    # New user - check auto-provisioning
+    if not settings.AUTO_PROVISION_USERS:
+        logger.warning(f"Entra login for unknown user {user_info['email']} — auto-provisioning disabled")
+        return None, "user_not_found"
+    
+    # JIT provisioning
+    name_parts = user_info["name"].split() if user_info["name"] else []
+    first_name = user_info["first_name"] or (name_parts[0] if name_parts else "User")
+    last_name = user_info["last_name"] or (name_parts[-1] if len(name_parts) > 1 else ".")
+    
+    user = User(
+        email=user_info["email"],
+        hashed_password=None,
+        first_name=first_name,
+        last_name=last_name,
+        role=UserRole.VIEWER,
+        auth_provider="entra",
+        external_id=user_info["external_id"],
+        is_verified=True,
+    )
+    db.add(user)
+    db.flush()
+    
+    logger.info(f"JIT provisioned new Entra user: {user.email} (id={user.id})")
+    
+    db.add(create_audit_log(
+        user_id=user.id,
+        user_email=user.email,
+        action="user_provisioned_sso",
+        resource_type="user",
+        resource_id=user.id,
+        details={"provider": "entra", "external_id": user_info["external_id"]},
+        request=request,
+    ))
+    
+    return user, None
+
+
+async def _entra_callback_success(user: User, request: Request, response: Response, db: Session) -> RedirectResponse:
+    """Create success redirect response with tokens."""
+    from app.core.security import create_access_token, create_refresh_token
+    
+    # Issue tokens
+    access_token = create_access_token({"sub": str(user.id), "role": user.role})
+    refresh_token_str = create_refresh_token({"sub": str(user.id)})
+    
+    # Save refresh token
+    rt = RefreshToken(
+        user_id=user.id,
+        token=refresh_token_str,
+        expires_at=datetime.now(timezone.utc) + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
+    )
+    db.add(rt)
+    
+    # Update user
+    user.last_login = datetime.now(timezone.utc)
+    user.last_seen_at = datetime.now(timezone.utc)
+    user.is_online = True
+    user.is_enabled = True
+    
+    # Audit log
+    db.add(create_audit_log(
+        user_id=user.id,
+        user_email=user.email,
+        action="login_entra",
+        resource_type="user",
+        resource_id=user.id,
+        details={"provider": "entra"},
+        request=request,
+    ))
+    db.commit()
+    
+    # Set refresh token cookie
+    _set_refresh_cookie(response, refresh_token_str, settings.REFRESH_TOKEN_EXPIRE_DAYS)
+    
+    # Redirect to frontend
+    frontend_url = settings.FRONTEND_URL.rstrip("/")
+    redirect_url = (
+        f"{frontend_url}/auth/callback"
+        f"?access_token={access_token}"
+        f"&refresh_token={refresh_token_str}"
+    )
+    return RedirectResponse(url=redirect_url, status_code=302)
+
+
+# ─── ENTRA CALLBACK ENDPOINT ─────────────────────────────────────────────────
 @router.get("/entra/callback")
 async def entra_callback(
     request: Request,
@@ -476,193 +632,54 @@ async def entra_callback(
     error_description: Annotated[Optional[str], Query()] = None,
     db: Annotated[Session, Depends(get_db)] = None,
 ):
-    """Handle Microsoft Entra ID OAuth callback.
-
-    Validates the authorization code, exchanges it for tokens,
-    validates the ID token, finds or creates the user, and
-    issues TM Alert JWT tokens.
-
-    Redirects to frontend with tokens in URL fragment on success, or with error on failure.
-    """
+    """Handle Microsoft Entra ID OAuth callback."""
     frontend_url = settings.FRONTEND_URL.rstrip("/")
 
     # Handle Microsoft error response
     if error:
-        logger.warning(f"Entra callback error: {error} - {error_description}")
-        return RedirectResponse(
-            url=f"{frontend_url}/#/login?error=entra_auth_failed&detail={error}",
-            status_code=302,
-        )
+        return _entra_redirect_error(frontend_url, "entra_auth_failed", error)
 
     if not code or not state:
-        return RedirectResponse(
-            url=f"{frontend_url}/#/login?error=missing_params",
-            status_code=302,
-        )
+        return _entra_redirect_error(frontend_url, "missing_params")
 
-    # Verify state and retrieve PKCE verifier + nonce from Redis
+    # Validate state and retrieve PKCE data
     from app.services.rate_limiter import get_redis
     redis = await get_redis()
-    oauth_data_raw = await redis.get(f"oauth_state:{state}")
+    oauth_data, err = await _entra_validate_state(state, redis)
+    if err:
+        return _entra_redirect_error(frontend_url, err)
 
-    if not oauth_data_raw:
-        logger.warning("Entra callback: invalid or expired state parameter")
-        return RedirectResponse(
-            url=f"{frontend_url}/#/login?error=invalid_state",
-            status_code=302,
-        )
-
-    # Delete state immediately (one-time use)
-    await redis.delete(f"oauth_state:{state}")
-
-    try:
-        oauth_data = json.loads(oauth_data_raw)
-        code_verifier = oauth_data["code_verifier"]
-        expected_nonce = oauth_data["nonce"]
-    except (json.JSONDecodeError, KeyError):
-        return RedirectResponse(
-            url=f"{frontend_url}/#/login?error=corrupted_state",
-            status_code=302,
-        )
-
+    # Exchange code and validate ID token
     from app.services.entra_auth import get_entra_service
     entra = get_entra_service()
 
     try:
-        # Exchange authorization code for tokens
-        token_response = await entra.exchange_code_for_tokens(code, code_verifier)
+        token_response = await entra.exchange_code_for_tokens(code, oauth_data["code_verifier"])
         id_token = token_response.get("id_token")
-
         if not id_token:
             raise ValueError("No id_token in token response")
 
-        # Validate ID token (signature, audience, issuer, expiry, nonce)
-        claims = await entra.validate_id_token(id_token, expected_nonce)
+        claims = await entra.validate_id_token(id_token, oauth_data["expected_nonce"])
         user_info = entra.extract_user_info(claims)
 
-        if not user_info["email"]:
+        if not user_info.get("email"):
             raise ValueError("No email in ID token claims")
 
-        # Check email domain restriction
-        if settings.ALLOWED_EMAIL_DOMAINS:
-            allowed = [d.strip().lower() for d in settings.ALLOWED_EMAIL_DOMAINS.split(",") if d.strip()]
-            email_domain = user_info["email"].split("@")[-1]
-            if allowed and email_domain not in allowed:
-                logger.warning(f"Entra login blocked: email domain {email_domain} not in allowed list")
-                return RedirectResponse(
-                    url=f"{frontend_url}/#/login?error=domain_not_allowed",
-                    status_code=302,
-                )
-
-        # Find existing user by external_id (Entra OID) or email
-        user = None
-        if user_info["external_id"]:
-            user = db.query(User).filter(User.external_id == user_info["external_id"]).first()
-
-        if not user:
-            user = db.query(User).filter(func.lower(User.email) == user_info["email"].lower()).first()
-
-        if user:
-            # Existing user — link to Entra if not already linked
-            if user.auth_provider != "entra":
-                user.auth_provider = "entra"
-                user.external_id = user_info["external_id"]
-                logger.info(f"Linked existing user {user.id} to Entra ID")
-
-            # Sync attributes from Entra
-            if user_info["first_name"]:
-                user.first_name = user_info["first_name"]
-            if user_info["last_name"]:
-                user.last_name = user_info["last_name"]
-
-        elif settings.AUTO_PROVISION_USERS:
-            # Auto-create new user (JIT provisioning)
-            name_parts = user_info["name"].split() if user_info["name"] else []
-            first_name = user_info["first_name"] or (name_parts[0] if name_parts else "User")
-            last_name = user_info["last_name"] or (name_parts[-1] if len(name_parts) > 1 else ".")
-
-            user = User(
-                email=user_info["email"],
-                hashed_password=None,  # No local password for SSO users
-                first_name=first_name,
-                last_name=last_name,
-                role=UserRole.VIEWER,  # Default role — admin can upgrade
-                auth_provider="entra",
-                external_id=user_info["external_id"],
-                is_verified=True,  # Entra-authenticated users are pre-verified
-            )
-            db.add(user)
-            db.flush()  # Get user.id before creating tokens
-
-            logger.info(f"JIT provisioned new Entra user: {user.email} (id={user.id})")
-
-            # Audit log for JIT provisioning
-            db.add(create_audit_log(
-                user_id=user.id,
-                user_email=user.email,
-                action="user_provisioned_sso",
-                resource_type="user",
-                resource_id=user.id,
-                details={"provider": "entra", "external_id": user_info["external_id"]},
-                request=request,
-            ))
-        else:
-            # Auto-provisioning disabled, user doesn't exist
-            logger.warning(f"Entra login for unknown user {user_info['email']} — auto-provisioning disabled")
-            return RedirectResponse(
-                url=f"{frontend_url}/#/login?error=user_not_found",
-                status_code=302,
-            )
-
-        # Issue TM Alert tokens (same as local login)
-        from app.core.security import create_access_token, create_refresh_token
-        access_token = create_access_token({"sub": str(user.id), "role": user.role})
-        refresh_token_str = create_refresh_token({"sub": str(user.id)})
-
-        # Save refresh token
-        rt = RefreshToken(
-            user_id=user.id,
-            token=refresh_token_str,
-            expires_at=datetime.now(timezone.utc) + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
-        )
-        db.add(rt)
-
-        # Update login state
-        user.last_login = datetime.now(timezone.utc)
-        user.last_seen_at = datetime.now(timezone.utc)
-        user.is_online = True  # Mark as online on login
-        user.is_enabled = True  # Ensure account is enabled
-
-        # Audit log
-        db.add(create_audit_log(
-            user_id=user.id,
-            user_email=user.email,
-            action="login_sso",
-            resource_type="user",
-            resource_id=user.id,
-            details={"provider": "entra"},
-            request=request,
-        ))
-        db.commit()
-
-        # Set refresh token cookie
-        _set_refresh_cookie(response, refresh_token_str, settings.REFRESH_TOKEN_EXPIRE_DAYS)
-
-        # Redirect to frontend with tokens in URL query string
-        # AuthCallbackPage will capture these and store them
-        redirect_url = (
-            f"{frontend_url}/auth/callback"
-            f"?access_token={access_token}"
-            f"&refresh_token={refresh_token_str}"
-        )
-        return RedirectResponse(url=redirect_url, status_code=302)
-
     except Exception as e:
-        logger.error(f"Entra callback error: {e}", exc_info=True)
-        return RedirectResponse(
-            url=f"{frontend_url}/#/login?error=entra_auth_failed",
-            status_code=302,
-        )
+        logger.error(f"Entra callback error: {type(e).__name__}: {e}")
+        return _entra_redirect_error(frontend_url, "entra_auth_failed")
+
+    # Check email domain
+    if not _check_email_domain(user_info["email"]):
+        return _entra_redirect_error(frontend_url, "domain_not_allowed")
+
+    # Find or provision user
+    user, err = _find_or_provision_user(db, user_info, request)
+    if err:
+        return _entra_redirect_error(frontend_url, err)
+
+    # Issue tokens and redirect
+    return await _entra_callback_success(user, request, response, db)
 
 
 @router.post("/ldap/login")
