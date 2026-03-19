@@ -468,6 +468,7 @@ async def entra_login():
 @router.get("/entra/callback")
 async def entra_callback(
     request: Request,
+    response: Response,
     code: Annotated[Optional[str], Query()] = None,
     state: Annotated[Optional[str], Query()] = None,
     error: Annotated[Optional[str], Query()] = None,
@@ -602,7 +603,7 @@ async def entra_callback(
                 resource_type="user",
                 resource_id=user.id,
                 details={"provider": "entra", "external_id": user_info["external_id"]},
-                request=req,
+                request=request,
             ))
         else:
             # Auto-provisioning disabled, user doesn't exist
@@ -639,7 +640,7 @@ async def entra_callback(
             resource_type="user",
             resource_id=user.id,
             details={"provider": "entra"},
-            request=req,
+            request=request,
         ))
         db.commit()
 
