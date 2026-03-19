@@ -110,7 +110,7 @@ class EntraAuthService:
         return secrets.token_urlsafe(32)
 
     async def build_authorization_url(
-        self, state: str, code_challenge: str, nonce: str
+        self, state: str, code_challenge: str, nonce: str, require_mfa: bool = True
     ) -> str:
         """Build the Microsoft authorization URL for the redirect.
 
@@ -118,6 +118,8 @@ class EntraAuthService:
             state: CSRF protection state parameter
             code_challenge: PKCE code challenge (S256)
             nonce: Replay protection nonce
+            require_mfa: If True, signals Microsoft to require MFA during login.
+                         Uses 'max_age=0' to force a fresh authentication.
 
         Returns:
             Full authorization URL to redirect the user to
@@ -135,8 +137,22 @@ class EntraAuthService:
             "code_challenge_method": "S256",
             "nonce": nonce,
             "response_mode": "query",
-            "prompt": "select_account",
+            "prompt": "login",
         }
+
+        if require_mfa:
+            # Force Microsoft to re-authenticate the user on every login.
+            #
+            # max_age=0 → invalidates any existing SSO session, so Microsoft always
+            # shows the login screen and performs a fresh authentication including MFA.
+            # Without this, Microsoft reuses an existing session and returns amr=["pwd"]
+            # or amr=[] even if the user has MFA registered.
+            #
+            # prompt=login forces re-authentication (same effect as max_age=0) but skips
+            # the account picker. Combined with max_age=0 it is belt-and-suspenders: the
+            # user goes straight to the password+MFA screen.
+            params["max_age"] = "0"
+
         return f"{authorize_url}?{urlencode(params)}"
 
     async def exchange_code_for_tokens(
@@ -203,13 +219,19 @@ class EntraAuthService:
         jwks_client = self._get_jwks_client(jwks_uri)
         signing_key = jwks_client.get_signing_key_from_jwt(id_token)
 
+        # Add leeway for clock skew (60 seconds) - Microsoft servers and your server
+        # may have slightly different clocks. This is standard practice.
         claims = pyjwt.decode(
             id_token,
             signing_key.key,
             algorithms=["RS256"],
             audience=self.client_id,
             issuer=issuer,
-            options={"require": ["exp", "iss", "aud", "sub", "nonce"]},
+            options={
+                "require": ["exp", "iss", "aud", "sub", "nonce"],
+                "verify_exp": True,
+            },
+            leeway=60,  # Allow 60 seconds of clock skew
         )
 
         # Verify nonce matches
@@ -227,7 +249,7 @@ class EntraAuthService:
             claims: Decoded and validated ID token claims
 
         Returns:
-            Dict with: email, first_name, last_name, external_id (oid)
+            Dict with: email, first_name, last_name, external_id (oid), amr
         """
         return {
             "email": (
@@ -240,6 +262,7 @@ class EntraAuthService:
             "last_name": claims.get("family_name", ""),
             "external_id": claims.get("oid", ""),  # Entra Object ID — globally unique
             "name": claims.get("name", ""),
+            "amr": claims.get("amr", []),  # Authentication Methods References
         }
 
 
