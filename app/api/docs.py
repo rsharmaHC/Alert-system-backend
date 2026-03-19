@@ -85,7 +85,7 @@ router = APIRouter()
 
 
 @router.get("/docs", include_in_schema=False)
-async def swagger_docs(current_user: User = Depends(get_admin_or_super_admin_user)):
+async def swagger_docs(current_user: Annotated[User, Depends(get_admin_or_super_admin_user)]):
     """Protected Swagger UI — requires admin/super admin HTTP Basic Auth."""
     return get_swagger_ui_html(
         openapi_url="/api/v1/openapi.json",
@@ -95,7 +95,7 @@ async def swagger_docs(current_user: User = Depends(get_admin_or_super_admin_use
 
 
 @router.get("/redoc", include_in_schema=False)
-async def redoc_docs(current_user: User = Depends(get_admin_or_super_admin_user)):
+async def redoc_docs(current_user: Annotated[User, Depends(get_admin_or_super_admin_user)]):
     """Protected ReDoc — requires admin/super admin HTTP Basic Auth."""
     return get_redoc_html(
         openapi_url="/api/v1/openapi.json",
@@ -105,7 +105,7 @@ async def redoc_docs(current_user: User = Depends(get_admin_or_super_admin_user)
 
 
 @router.get("/openapi.json", include_in_schema=False)
-async def openapi(current_user: User = Depends(get_admin_or_super_admin_user)):
+async def openapi(current_user: Annotated[User, Depends(get_admin_or_super_admin_user)]):
     """Protected OpenAPI schema — requires admin/super admin HTTP Basic Auth."""
     from app.main import app
     return get_openapi(

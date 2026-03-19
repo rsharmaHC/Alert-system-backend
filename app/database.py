@@ -14,6 +14,11 @@ _SAFE_IDENTIFIER_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
 
 # Allowed SQL column types — whitelist approach for column_type since it cannot
 # be parameterized and has a much wider surface area than simple identifiers.
+# Column type constants
+COLUMN_TYPE_VARCHAR_255 = 'VARCHAR(255)'
+COLUMN_TYPE_VARCHAR_512 = 'VARCHAR(512)'
+
+# Allowed column types for validation (using constants for maintainability)
 _ALLOWED_COLUMN_TYPES = {
     'DOUBLE PRECISION',
     'FLOAT',
@@ -22,8 +27,8 @@ _ALLOWED_COLUMN_TYPES = {
     'SMALLINT',
     'BOOLEAN',
     'TEXT',
-    'VARCHAR(255)',
-    'VARCHAR(512)',
+    COLUMN_TYPE_VARCHAR_255,
+    COLUMN_TYPE_VARCHAR_512,
     'TIMESTAMP WITH TIME ZONE',
     'TIMESTAMP WITHOUT TIME ZONE',
     'DATE',
@@ -247,10 +252,10 @@ def ensure_sso_columns():
     db = SessionLocal()
     try:
         # Ensure auth_provider column
-        ensure_column_exists('users', 'auth_provider', 'VARCHAR(255)', nullable=False)
-        
-        # Ensure external_id column  
-        ensure_column_exists('users', 'external_id', 'VARCHAR(255)', nullable=True)
+        ensure_column_exists('users', 'auth_provider', COLUMN_TYPE_VARCHAR_255, nullable=False)
+
+        # Ensure external_id column
+        ensure_column_exists('users', 'external_id', COLUMN_TYPE_VARCHAR_255, nullable=True)
         
         # Ensure is_enabled column
         ensure_column_exists('users', 'is_enabled', 'BOOLEAN', nullable=False)

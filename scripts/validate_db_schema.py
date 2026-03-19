@@ -105,40 +105,49 @@ def validate_schema():
     return issues
 
 
+def _generate_create_table_sql(table_name):
+    """Generate CREATE TABLE SQL for a missing table."""
+    for model in Base.registry.mappers:
+        if model.local_table.name == table_name:
+            return str(CreateTable(model.local_table).compile(engine))
+    return None
+
+
+def _generate_add_column_sql(table_name, col):
+    """Generate ALTER TABLE ADD COLUMN SQL for a missing column."""
+    type_str = col['type'].compile(dialect=engine.dialect)
+    nullable_str = "NULL" if col['nullable'] else "NOT NULL"
+    default_str = ""
+
+    if col['server_default'] is not None:
+        default_str = f" DEFAULT {col['server_default'].arg}"
+    elif col['default'] is not None and hasattr(col['default'], 'arg'):
+        default_str = f" DEFAULT {col['default'].arg}"
+
+    return f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS {col['name']} {type_str} {nullable_str}{default_str};"
+
+
 def generate_fix_sql(issues):
     """Generate SQL statements to fix schema issues."""
     sql_statements = []
-    
+
     for issue in issues:
         if issue['type'] == 'missing_table':
-            # Find the model for this table
-            for model in Base.registry.mappers:
-                if model.local_table.name == issue['table']:
-                    create_stmt = str(CreateTable(model.local_table).compile(engine))
-                    sql_statements.append(f"-- Create table {issue['table']}")
-                    sql_statements.append(create_stmt + ";")
-                    break
-        
+            create_stmt = _generate_create_table_sql(issue['table'])
+            if create_stmt:
+                sql_statements.append(f"-- Create table {issue['table']}")
+                sql_statements.append(create_stmt + ";")
+
         elif issue['type'] == 'missing_column':
             col = issue['definition']
-            type_str = col['type'].compile(dialect=engine.dialect)
-            nullable_str = "NULL" if col['nullable'] else "NOT NULL"
-            default_str = ""
-            
-            if col['server_default'] is not None:
-                default_str = f" DEFAULT {col['server_default'].arg}"
-            elif col['default'] is not None and hasattr(col['default'], 'arg'):
-                default_str = f" DEFAULT {col['default'].arg}"
-            
-            # sql = f"ALTER TABLE {issue['table']} ADD COLUMN {col['name']} {type_str} {nullable_str}{default_str};"
-            sql = f"ALTER TABLE {issue['table']} ADD COLUMN IF NOT EXISTS {col['name']} {type_str} {nullable_str}{default_str};"
+            sql = _generate_add_column_sql(issue['table'], col)
             sql_statements.append(f"-- {issue['message']}")
             sql_statements.append(sql)
-        
+
         elif issue['type'] == 'extra_column':
             sql_statements.append(f"-- {issue['message']}")
             sql_statements.append(f"-- Consider removing: ALTER TABLE {issue['table']} DROP COLUMN {issue['column']};")
-    
+
     return sql_statements
 
 

@@ -9,13 +9,19 @@ Simulates:
 
 Usage:
     locust -f load_test.py --host=http://localhost:8000
-    
+
     # Run headless (no web UI)
     locust -f load_test.py --host=http://localhost:8000 --headless -u 1000 -r 100 -t 300s
     
     # Run with specific scenario
     locust -f load_test.py --host=http://localhost:8000 --headless -u 500 -r 50 -t 180s --tags auth,api
+
+Test Data Constants:
+    DEFAULT_ADMIN_EMAIL: Default admin email for testing
 """
+
+# Test data constants
+DEFAULT_ADMIN_EMAIL = "admin@tmalert.com"
 
 from locust import HttpUser, task, between, events
 from locust.runners import MasterRunner, WorkerRunner
@@ -52,7 +58,7 @@ class AlertSystemUser(HttpUser):
     
     # Test data
     test_credentials = [
-        {"email": "admin@tmalert.com", "password": DEFAULT_ADMIN_PASSWORD},
+        {"email": DEFAULT_ADMIN_EMAIL, "password": DEFAULT_ADMIN_PASSWORD},
         {"email": "manager@tmalert.com", "password": "Manager@123456"},
         {"email": "viewer@tmalert.com", "password": "Viewer@123456"},
     ]
@@ -179,7 +185,7 @@ class AuthLoadTest(HttpUser):
         login_response = self.client.post(
             LOGIN_ENDPOINT,
             json={
-                "email": "admin@tmalert.com",
+                "email": DEFAULT_ADMIN_EMAIL,
                 "password": DEFAULT_ADMIN_PASSWORD
             }
         )
@@ -221,7 +227,7 @@ class NotificationBroadcastTest(HttpUser):
         response = self.client.post(
             LOGIN_ENDPOINT,
             json={
-                "email": "admin@tmalert.com",
+                "email": DEFAULT_ADMIN_EMAIL,
                 "password": DEFAULT_ADMIN_PASSWORD
             }
         )
@@ -283,7 +289,7 @@ class LocationUpdateStormTest(HttpUser):
         response = self.client.post(
             LOGIN_ENDPOINT,
             json={
-                "email": "admin@tmalert.com",
+                "email": DEFAULT_ADMIN_EMAIL,
                 "password": DEFAULT_ADMIN_PASSWORD
             }
         )

@@ -41,43 +41,55 @@ def get_database_columns(inspector):
     return columns_by_table
 
 
-def check_schema():
-    """Check if all model columns exist in database."""
-    inspector = inspect(engine)
-    
-    model_columns = get_model_columns()
-    db_columns = get_database_columns(inspector)
-    
+def _collect_missing_columns(model_columns, db_columns):
+    """Collect missing tables and columns between models and database."""
     missing_columns = []
     missing_tables = []
-    
+
     for table_name, model_cols in model_columns.items():
         if table_name not in db_columns:
             missing_tables.append(table_name)
             continue
-        
+
         missing = model_cols - db_columns[table_name]
         if missing:
             for col in missing:
                 missing_columns.append(f"{table_name}.{col}")
-    
+
+    return missing_tables, missing_columns
+
+
+def _print_schema_issues(missing_tables, missing_columns):
+    """Print schema validation issues."""
     if missing_tables:
         print("❌ MISSING TABLES:")
         for table in missing_tables:
             print(f"   - {table}")
         print()
-    
+
     if missing_columns:
         print("❌ MISSING COLUMNS:")
         for col in missing_columns:
             print(f"   - {col}")
         print()
-    
+
+
+def check_schema():
+    """Check if all model columns exist in database."""
+    inspector = inspect(engine)
+
+    model_columns = get_model_columns()
+    db_columns = get_database_columns(inspector)
+
+    missing_tables, missing_columns = _collect_missing_columns(model_columns, db_columns)
+
+    _print_schema_issues(missing_tables, missing_columns)
+
     if missing_tables or missing_columns:
         print("⚠️  Run migrations: alembic upgrade head")
         print("⚠️  Or run: python scripts/validate_db_schema.py --fix")
         return False
-    
+
     print("✅ Database schema is valid - all columns exist")
     return True
 

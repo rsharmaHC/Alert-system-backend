@@ -437,14 +437,20 @@ def _validate_query(q: str) -> tuple[bool, Optional[str]]:
 
 # ─── ENDPOINTS ────────────────────────────────────────────────────────────────
 
-@router.get("/autocomplete", response_model=LocationAutocompleteResponse)
+@router.get(
+    "/autocomplete",
+    response_model=LocationAutocompleteResponse,
+    responses={
+        400: {"description": "Bad Request - Invalid query (must be 3-200 characters, valid characters only)"},
+    }
+)
 async def autocomplete(
     request: Request,
-    q: str = Query(..., description="Search query (minimum 3 characters)", min_length=3, max_length=200),
-    limit: int = Query(default=10, ge=1, le=20),
-    countrycodes: Optional[str] = Query(default=None, description="Comma-separated ISO country codes"),
-    viewbox: Optional[str] = Query(default=None, description="Bounding box: x1,y1,x2,y2"),
-    bounded: bool = Query(default=False),
+    q: Annotated[str, Query(..., description="Search query (minimum 3 characters)", min_length=3, max_length=200)],
+    limit: Annotated[int, Query(ge=1, le=20)] = 10,
+    countrycodes: Annotated[Optional[str], Query(description="Comma-separated ISO country codes")] = None,
+    viewbox: Annotated[Optional[str], Query(description="Bounding box: x1,y1,x2,y2")] = None,
+    bounded: Annotated[bool, Query()] = False,
 ):
     """
     Location autocomplete — provider-agnostic, permanently cached.
@@ -520,9 +526,14 @@ async def health_check():
     }
 
 
-@router.delete("/cache")
+@router.delete(
+    "/cache",
+    responses={
+        500: {"description": "Internal Server Error - Cache clear failed"},
+    }
+)
 async def clear_cache(
-    pattern: Optional[str] = Query(default=None),
+    pattern: Annotated[Optional[str], Query()] = None,
 ):
     """Admin endpoint to flush location cache."""
     try:

@@ -416,7 +416,7 @@ class TestSyncUserToRedis:
         mock_redis_client = MagicMock()
         mock_redis.from_url.return_value = mock_redis_client
 
-        _sync_user_to_redis(test_user.id, 40.7128, -74.0060)
+        _sync_user_to_redis(test_user.id, 40.7128, -74.0060)  # type: ignore[arg-type]
 
         # Verify GEO add was called
         mock_redis_client.geoadd.assert_called()
@@ -430,7 +430,7 @@ class TestSyncUserToRedis:
         mock_redis.from_url.return_value = mock_redis_client
 
         # Should not raise exception
-        _sync_user_to_redis(test_user.id, 40.7128, -74.0060)
+        _sync_user_to_redis(test_user.id, 40.7128, -74.0060)  # type: ignore[arg-type]
 
 
 # =============================================================================

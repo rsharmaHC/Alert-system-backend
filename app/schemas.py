@@ -136,7 +136,7 @@ class MFASetupConfirmRequest(BaseModel):
         if not v or not isinstance(v, str):
             raise ValueError(CODE_REQUIRED_MSG)
         code = v.strip()
-        if not re.match(r"^\d{6}$", code):
+        if not re.match(MFA_CODE_PATTERN, code):
             raise ValueError(CODE_FORMAT_MSG)
         return code
 
@@ -214,7 +214,7 @@ class MFAVerifyLoginRequest(BaseModel):
         if not v or not isinstance(v, str):
             raise ValueError(CODE_REQUIRED_MSG)
         code = v.strip()
-        if not re.match(r"^\d{6}$", code):
+        if not re.match(MFA_CODE_PATTERN, code):
             raise ValueError(CODE_FORMAT_MSG)
         return code
 
@@ -325,7 +325,7 @@ class MFARegenerateRecoveryCodesRequest(BaseModel):
             if not v or not isinstance(v, str):
                 raise ValueError("MFA code is required for TOTP method")
             code = v.strip()
-            if not re.match(r"^\d{6}$", code):
+            if not re.match(MFA_CODE_PATTERN, code):
                 raise ValueError("MFA code must be exactly 6 digits")
         return v
 
@@ -399,7 +399,7 @@ class MFAEnrollConfirmRequest(BaseModel):
         if not v or not isinstance(v, str):
             raise ValueError(CODE_REQUIRED_MSG)
         code = v.strip()
-        if not re.match(r"^\d{6}$", code):
+        if not re.match(MFA_CODE_PATTERN, code):
             raise ValueError(CODE_FORMAT_MSG)
         return code
 
@@ -491,7 +491,7 @@ class MFAResetConfirmRequest(BaseModel):
         if not v or not isinstance(v, str):
             raise ValueError(CODE_REQUIRED_MSG)
         code = v.strip()
-        if not re.match(r"^\d{6}$", code):
+        if not re.match(MFA_CODE_PATTERN, code):
             raise ValueError(CODE_FORMAT_MSG)
         return code
 

@@ -231,34 +231,34 @@ class TestGeofenceChecking:
         # Location at center with 5 mile radius
         location = MockLocation(1, "Test", 40.7128, -74.0060, 5.0)
         # User at same location (0 miles away)
-        result = check_geofence(40.7128, -74.0060, location)
+        result = check_geofence(40.7128, -74.0060, location)  # type: ignore[arg-type]
         assert result.is_inside is True
         assert result.distance_miles == 0.0
         assert result.margin_miles == 5.0
-    
+
     def test_outside_geofence(self):
         """Test point outside geofence."""
         location = MockLocation(1, "Test", 40.7128, -74.0060, 1.0)
         # User 10 miles away (approximately)
-        result = check_geofence(40.8528, -74.0060, location)
+        result = check_geofence(40.8528, -74.0060, location)  # type: ignore[arg-type]
         assert result.is_inside is False
         assert result.distance_miles > 1.0
         assert result.margin_miles < 0
-    
+
     def test_edge_of_geofence(self):
         """Test point exactly at geofence boundary."""
         location = MockLocation(1, "Test", 40.7128, -74.0060, 5.0)
         # Calculate point approximately 5 miles north
         # 1 degree latitude ≈ 69 miles
         lat_offset = 5.0 / 69.0
-        result = check_geofence(40.7128 + lat_offset, -74.0060, location)
+        result = check_geofence(40.7128 + lat_offset, -74.0060, location)  # type: ignore[arg-type]
         # Should be very close to boundary
         assert abs(result.distance_miles - 5.0) < 0.1
-    
+
     def test_missing_location_coordinates(self):
         """Test handling of location with no coordinates."""
         location = MockLocation(1, "Test", None, None, 5.0)
-        result = check_geofence(40.7128, -74.0060, location)
+        result = check_geofence(40.7128, -74.0060, location)  # type: ignore[arg-type]
         assert result.is_inside is False
         assert result.distance_miles == float('inf')
     

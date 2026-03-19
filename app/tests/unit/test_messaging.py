@@ -138,7 +138,7 @@ class TestEscapeXml:
 
     def test_escape_none_input(self):
         """Should handle None input."""
-        assert _escape_xml(None) == ""
+        assert _escape_xml(None) == ""  # type: ignore[arg-type]
 
 
 # =============================================================================

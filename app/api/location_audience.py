@@ -152,7 +152,17 @@ _assignment_limiter = RateLimiter(max_requests=100, window_seconds=60)  # 100/mi
 
 # ─── MANUAL ASSIGNMENT ENDPOINTS ──────────────────────────────────────────────
 
-@router.post("/assign", response_model=UserLocationResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/assign",
+    response_model=UserLocationResponse,
+    status_code=status.HTTP_201_CREATED,
+    responses={
+        400: {"description": "Bad Request - User is already assigned to this location"},
+        403: {"description": "Forbidden - User can only assign themselves (unless manager+)"},
+        404: {"description": "Not Found - User or location does not exist"},
+        429: {"description": "Too Many Requests - Rate limit exceeded (100 requests/min)"},
+    }
+)
 def assign_user_to_location(
     data: UserLocationAssign,
     request: Request,
@@ -301,12 +311,18 @@ def assign_user_to_location(
     )
 
 
-@router.post("/remove")
+@router.post(
+    "/remove",
+    responses={
+        403: {"description": "Forbidden - User can only remove themselves (unless manager+)"},
+        404: {"description": "Not Found - No active assignment found"},
+    }
+)
 def remove_user_from_location(
     data: UserLocationRemove,
     request: Request,
-    user_id: int = Query(..., description="User ID to remove"),
-    location_id: int = Query(..., description="Location ID to remove from"),
+    user_id: Annotated[int, Query(..., description="User ID to remove")],
+    location_id: Annotated[int, Query(..., description="Location ID to remove from")],
     db: Annotated[Session, Depends(get_db)] = None,
     current_user: Annotated[User, Depends(get_current_user)] = None
 ):
@@ -393,7 +409,14 @@ def remove_user_from_location(
 
 # ─── GEOFENCE-BASED ASSIGNMENT ENDPOINTS ──────────────────────────────────────
 
-@router.post("/geofence/update", response_model=UserGeofenceStatus)
+@router.post(
+    "/geofence/update",
+    response_model=UserGeofenceStatus,
+    responses={
+        400: {"description": "Bad Request - Invalid coordinates"},
+        429: {"description": "Too Many Requests - Rate limit exceeded"},
+    }
+)
 def update_user_geofence(
     data: UserLocationGeofenceUpdate,
     request: Request,
@@ -497,13 +520,19 @@ def update_user_geofence(
 
 # ─── VIEWING ENDPOINTS ────────────────────────────────────────────────────────
 
-@router.get("/location/{location_id}/members", response_model=LocationMemberListResponse)
+@router.get(
+    "/location/{location_id}/members",
+    response_model=LocationMemberListResponse,
+    responses={
+        404: {"description": "Not Found - Location does not exist"},
+    }
+)
 def get_location_members(
     location_id: int,
-    page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100),
-    status_filter: Optional[UserLocationStatus] = Query(None, alias="status"),
-    assignment_type: Optional[UserLocationAssignmentType] = None,
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=100)] = 20,
+    status_filter: Annotated[Optional[UserLocationStatus], Query(alias="status")] = None,
+    assignment_type: Annotated[Optional[UserLocationAssignmentType], Query()] = None,
     db: Annotated[Session, Depends(get_db)] = None,
     current_user: Annotated[User, Depends(get_current_user)] = None
 ):
@@ -605,10 +634,16 @@ def get_location_members(
         raise
 
 
-@router.get("/user/{user_id}/locations", response_model=List[UserLocationResponse])
+@router.get(
+    "/user/{user_id}/locations",
+    response_model=List[UserLocationResponse],
+    responses={
+        403: {"description": "Forbidden - User can only view their own locations (unless admin)"},
+    }
+)
 def get_user_locations(
     user_id: int,
-    include_inactive: bool = Query(False, description="Include inactive assignments"),
+    include_inactive: Annotated[bool, Query(description="Include inactive assignments")] = False,
     db: Annotated[Session, Depends(get_db)] = None,
     current_user: Annotated[User, Depends(get_current_user)] = None
 ):
@@ -637,12 +672,18 @@ def get_user_locations(
     return [_build_user_location_response(db, a) for a in assignments]
 
 
-@router.get("/location/{location_id}/history", response_model=UserLocationHistoryListResponse)
+@router.get(
+    "/location/{location_id}/history",
+    response_model=UserLocationHistoryListResponse,
+    responses={
+        404: {"description": "Not Found - Location does not exist"},
+    }
+)
 def get_location_history(
     location_id: int,
-    page: int = Query(1, ge=1),
-    page_size: int = Query(50, ge=1, le=200),
-    action_filter: Optional[str] = Query(None, alias="action"),
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=200)] = 50,
+    action_filter: Annotated[Optional[str], Query(alias="action")] = None,
     db: Annotated[Session, Depends(get_db)] = None,
     current_user: Annotated[User, Depends(require_admin)] = None
 ):
