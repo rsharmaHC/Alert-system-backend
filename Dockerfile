@@ -36,8 +36,14 @@ RUN sed -i 's/\r$//' start.sh && \
 # 4. Create tmp directory for celerybeat schedule with proper permissions
 RUN mkdir -p /tmp && chown appuser:appgroup /tmp
 
-# 5. Create secrets directory for bootstrap password
-RUN mkdir -p /run/secrets && chmod 1777 /run/secrets
+# 5. Create secrets directory for bootstrap password.
+# Previously chmod 1777 (world-writable with sticky bit) — any process in the
+# container could write to it. Restrict to the app user only so only the
+# expected uvicorn/celery processes read and write the bootstrap secret
+# (security review D-H3).
+RUN mkdir -p /run/secrets && \
+    chown appuser:appgroup /run/secrets && \
+    chmod 700 /run/secrets
 
 # 6. Switch to non-root user BEFORE CMD
 USER appuser
