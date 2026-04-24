@@ -535,16 +535,21 @@ async def global_exception_handler(request: Request, exc: Exception):
     
     logger.error(f"=== END EXCEPTION ===")
     
-    # Return user-friendly error (don't leak details in production)
-    is_debug = os.getenv("DEBUG", "false").lower() == "true"
-    return JSONResponse(
-        status_code=500,
-        content={
-            "detail": "Internal server error occurred",
-            "error_type": type(exc).__name__,
-            "error_message": str(exc) if is_debug else None,
-        }
+    # Return user-friendly error (don't leak details in production).
+    # DEBUG is only honoured in development so a stale env var cannot leak
+    # exception strings (which frequently contain SQL fragments or PII) in
+    # prod. The exception class name is also not returned — it was trivial
+    # backend fingerprinting (security review finding B-H6).
+    app_env = os.getenv("APP_ENV", "production").lower()
+    is_debug = (
+        app_env == "development"
+        and os.getenv("DEBUG", "false").lower() == "true"
     )
+    body = {"detail": "Internal server error occurred"}
+    if is_debug:
+        body["error_type"] = type(exc).__name__
+        body["error_message"] = str(exc)
+    return JSONResponse(status_code=500, content=body)
 
 
 # Request size limit middleware
