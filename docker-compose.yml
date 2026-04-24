@@ -39,6 +39,18 @@ services:
       - ENVIRONMENT=production
     env_file:
       - .env
+    # Use Python rather than curl — curl is not installed in python:3.11-slim
+    # (security review D-M5). /health returns 200 when uvicorn is ready.
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status==200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
     depends_on:
       db:
         condition: service_healthy
@@ -53,6 +65,14 @@ services:
       - SERVICE_TYPE=worker
     env_file:
       - .env
+    healthcheck:
+      # `celery inspect ping` round-trips through the broker, so this also
+      # verifies Redis connectivity.
+      test: ["CMD", "celery", "-A", "app.celery_app", "inspect", "ping", "-d", "celery@$$HOSTNAME", "--timeout=5"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
     depends_on:
       db:
         condition: service_healthy
@@ -67,6 +87,19 @@ services:
       - SERVICE_TYPE=beat
     env_file:
       - .env
+    healthcheck:
+      # Verify the beat scheduler has written a fresh heartbeat to its
+      # schedule file within the last 2 minutes (celery beat writes every
+      # tick).
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os,time,sys; p='/app/celerybeat-schedule'; sys.exit(0 if os.path.exists(p) and time.time()-os.path.getmtime(p)<120 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
     depends_on:
       db:
         condition: service_healthy
