@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Query, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, status, Query, Request
 from sqlalchemy.orm import Session
 from sqlalchemy import desc, update
 from typing import Annotated, Optional, List
@@ -773,8 +773,9 @@ async def _resolve_response_user(
 async def submit_response(
     notification_id: int,
     data: NotificationResponseCreate,
-    token: Optional[str] = None,
     channel: Optional[str] = None,  # email, sms, or web (default)
+    x_checkin_token: Annotated[Optional[str], Header()] = None,
+    token: Optional[str] = None,  # deprecated — kept for backward compat
     db: Annotated[Session, Depends(get_db)] = None,
     request: Request = None
 ):
@@ -783,13 +784,20 @@ async def submit_response(
 
     Two modes:
     1. Authenticated: Logged-in user responding to their own notification (Authorization header)
-    2. Token-based: User clicking link from email/SMS (JWT token query param, no auth header)
-    
+    2. Token-based: User clicking link from email/SMS — the check-in JWT is
+       supplied via the X-Checkin-Token header. Previously accepted as a
+       query parameter, which caused the token to be captured in proxy and
+       web-server access logs (security review F-H3); the query form is
+       still honoured for backward compatibility but should not be used by
+       new clients.
+
     Channel parameter:
     - email: User clicked link from email
     - sms: User clicked link from SMS
     - web: User logged in and responded from portal (default)
     """
+    # Prefer the header form; fall back to the legacy query param.
+    token = x_checkin_token or token
     from app.utils.checkin_link import verify_checkin_token
     from fastapi.security import HTTPBearer
 
