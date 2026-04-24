@@ -1584,7 +1584,31 @@ def change_password(
         RefreshToken.revoked == False
     ).update({"revoked": True})
 
+    # Clear the force-change flag so the user isn't blocked from future
+    # endpoints (see require_password_not_stale).
+    if getattr(current_user, "force_password_change", False):
+        current_user.force_password_change = False
+
     db.commit()
+
+    # Delete the bootstrap password file if this is the super-admin rotating
+    # the auto-generated initial password. The file was only ever meant as a
+    # one-shot handoff to the first operator; leaving it on disk after the
+    # rotation is a latent secret (security review B-L3).
+    if current_user.role == UserRole.SUPER_ADMIN:
+        try:
+            import os
+            bootstrap_path = "/run/secrets/bootstrap_pw"
+            if os.path.exists(bootstrap_path):
+                os.remove(bootstrap_path)
+                logger.info(
+                    "Deleted /run/secrets/bootstrap_pw after super-admin "
+                    "rotated the bootstrap password."
+                )
+        except OSError as e:
+            # Non-fatal — don't let a filesystem quirk block the rotation.
+            logger.warning("Could not delete bootstrap password file: %s", e)
+
     return {"message": "Password changed successfully"}
 
 
