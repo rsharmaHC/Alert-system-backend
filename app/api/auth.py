@@ -6,7 +6,7 @@ from typing import Annotated, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, Request, Query, Response, Body
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
-from sqlalchemy import desc, func
+from sqlalchemy import desc, func, update
 import redis
 import json
 from app.database import get_db
@@ -1272,30 +1272,59 @@ async def refresh_token(req: Request, response: Response, db: Annotated[Session,
             detail="Invalid refresh token"
         )
 
-    # Check token in DB
-    rt = db.query(RefreshToken).filter(
-        RefreshToken.token == refresh_token_str,
-        RefreshToken.revoked == False
-    ).first()
+    # Atomic revoke-and-rotate: the UPDATE succeeds exactly once per token.
+    # Two parallel requests with the same token produce one winner and one
+    # loser (affected row count = 0), closing the race where both requests
+    # previously passed a SELECT-then-UPDATE check.
+    now = datetime.now(timezone.utc)
+    rotate_stmt = (
+        update(RefreshToken)
+        .where(
+            RefreshToken.token == refresh_token_str,
+            RefreshToken.revoked == False,
+            RefreshToken.expires_at > now,
+        )
+        .values(revoked=True)
+        .returning(RefreshToken.id, RefreshToken.user_id)
+    )
+    rotated = db.execute(rotate_stmt).first()
 
-    if not rt or rt.expires_at < datetime.now(timezone.utc):
+    if rotated is None:
+        # The atomic update affected zero rows. Distinguish "unknown token"
+        # from "already-revoked token" — the latter is an RFC 6819 §5.2.2.3
+        # reuse signal and means the whole token family is compromised.
+        prior = db.query(RefreshToken).filter(
+            RefreshToken.token == refresh_token_str
+        ).first()
+        if prior is not None and prior.revoked:
+            db.query(RefreshToken).filter(
+                RefreshToken.user_id == prior.user_id,
+                RefreshToken.revoked == False,
+            ).update({RefreshToken.revoked: True}, synchronize_session=False)
+            db.commit()
+            logger.warning(
+                "Refresh token reuse detected; revoked token family for user_id=%s",
+                prior.user_id,
+            )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Refresh token expired"
         )
 
+    _rt_id, rt_user_id = rotated
+
     # Check if user exists (don't check is_active - that's for online presence, not account status)
     user = db.query(User).filter(
-        User.id == rt.user_id
+        User.id == rt_user_id
     ).first()
     if not user:
+        db.commit()  # persist the revoke even though we reject
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="User not found"
         )
 
-    # Revoke old token, issue new ones
-    rt.revoked = True
+    # Old token is already revoked atomically above; issue new ones.
     new_access = create_access_token({"sub": str(user.id), "role": user.role})
     new_refresh_str = create_refresh_token({"sub": str(user.id)})
 
