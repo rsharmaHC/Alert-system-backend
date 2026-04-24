@@ -509,8 +509,19 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
 
 def create_refresh_token(data: dict) -> str:
     to_encode = data.copy()
-    expire = datetime.now(timezone.utc) + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
-    to_encode.update({"exp": expire, "type": "refresh"})
+    now = datetime.now(timezone.utc)
+    expire = now + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
+    # Include iat and a random jti so two refresh tokens minted for the
+    # same user within the same second are still distinct — without these
+    # the JWT is fully determined by {sub, exp, type} and the
+    # refresh_tokens.token UNIQUE constraint fires on rapid re-use (e.g.
+    # when two requests race through the refresh flow).
+    to_encode.update({
+        "iat": now,
+        "exp": expire,
+        "type": "refresh",
+        "jti": secrets.token_urlsafe(16),
+    })
     return jwt.encode(to_encode, settings.REFRESH_SECRET_KEY, algorithm=ALGORITHM)
 
 

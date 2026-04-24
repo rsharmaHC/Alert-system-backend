@@ -25,8 +25,8 @@ Usage:
         return {"admin_action": "success"}
 """
 from datetime import datetime, timezone
-from typing import Annotated
-from fastapi import Depends, HTTPException, status
+from typing import Annotated, Optional
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 from app.database import get_db
@@ -37,7 +37,12 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-security = HTTPBearer()
+# auto_error=False so a missing Authorization header falls through to the
+# cookie path rather than raising 403 at dependency-resolution time. The
+# access-token HttpOnly cookie is the primary source after security review
+# F-C2; the header is kept for backward compatibility and for tooling /
+# tests that cannot easily present cookies.
+security = HTTPBearer(auto_error=False)
 
 
 def _validate_token_payload(payload: dict) -> str:
@@ -96,8 +101,9 @@ def _check_token_session_validity(user: User, payload: dict) -> None:
 
 
 def get_current_user(
-    credentials: Annotated[HTTPAuthorizationCredentials, Depends(security)],
-    db: Annotated[Session, Depends(get_db)]
+    request: Request,
+    credentials: Annotated[Optional[HTTPAuthorizationCredentials], Depends(security)],
+    db: Annotated[Session, Depends(get_db)],
 ) -> User:
     """
     Get current authenticated user from JWT access token.
@@ -130,7 +136,17 @@ def get_current_user(
     Raises:
         HTTPException: 401 if token invalid, expired, or user not found/disabled
     """
-    token = credentials.credentials
+    # Prefer the access_token HttpOnly cookie (security review F-C2); fall
+    # back to the Authorization: Bearer header for tooling, internal calls,
+    # and any client still on the pre-F-C2 protocol.
+    token = request.cookies.get("access_token") or (
+        credentials.credentials if credentials else None
+    )
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+        )
     payload = decode_token(token, token_type="access")
     user_id = _validate_token_payload(payload)
 

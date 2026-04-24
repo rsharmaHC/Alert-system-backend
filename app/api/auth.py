@@ -135,6 +135,47 @@ def _set_refresh_cookie(response: Response, token: str, expire_days: int) -> Non
     )
 
 
+def _set_access_cookie(response: Response, token: str, expire_minutes: int) -> None:
+    """
+    Attach the access token as an HttpOnly cookie (security review F-C2).
+
+    Storing the access token in sessionStorage exposed it to any XSS
+    payload; the HttpOnly cookie cannot be read by JavaScript. The
+    Authorization-header path still works during rollover so nothing
+    breaks while the frontend migrates.
+
+    Path '/' because the access cookie must accompany every API call,
+    not just /auth/*.
+    """
+    is_production = settings.APP_ENV != "development"
+    response.set_cookie(
+        key="access_token",
+        value=token,
+        httponly=True,
+        secure=True,
+        samesite=_get_samesite_policy(is_production),
+        path="/",
+        max_age=expire_minutes * 60,
+    )
+
+
+def _clear_session_cookies(response: Response) -> None:
+    """Clear access + refresh cookies (used on /logout)."""
+    is_production = settings.APP_ENV != "development"
+    samesite = _get_samesite_policy(is_production)
+    for name, path in (("access_token", "/"), ("refresh_token", "/api/v1/auth")):
+        response.set_cookie(
+            key=name,
+            value="",
+            httponly=True,
+            secure=True,
+            samesite=samesite,
+            path=path,
+            max_age=0,
+            expires=0,
+        )
+
+
 def format_lockout_time(seconds: int) -> str:
     """Format lockout duration in human-readable format."""
     if seconds < 60:
@@ -644,9 +685,11 @@ async def _entra_callback_success(user: User, request: Request, response: Respon
     ))
     db.commit()
 
-    # Set refresh token cookie — the frontend will exchange this for an
-    # access token by calling /auth/refresh on landing at /auth/callback.
+    # Set both session cookies — the access cookie replaces the frontend
+    # sessionStorage access token (F-C2), the refresh cookie was already in
+    # place. The callback page will call /auth/me to hydrate user state.
     _set_refresh_cookie(response, refresh_token_str, settings.REFRESH_TOKEN_EXPIRE_DAYS)
+    _set_access_cookie(response, access_token, settings.ACCESS_TOKEN_EXPIRE_MINUTES)
 
     # Redirect to frontend without any tokens in the URL. Tokens in a
     # redirect URL are logged by browsers, proxies, and Referer headers; a
@@ -816,6 +859,7 @@ async def _create_ldap_login_response(user: User, request: Request, response: Re
     db.commit()
 
     _set_refresh_cookie(response, refresh_token_str, settings.REFRESH_TOKEN_EXPIRE_DAYS)
+    _set_access_cookie(response, access_token, settings.ACCESS_TOKEN_EXPIRE_MINUTES)
 
     return LoginSuccessResponse(
         status="success",
@@ -1144,10 +1188,12 @@ async def _create_login_success_response(
     ))
     
     db.commit()
-    
-    # Set refresh token cookie
+
+    # Set session cookies (F-C2).
     _set_refresh_cookie(response, refresh_token_str, settings.REFRESH_TOKEN_EXPIRE_DAYS)
-    
+    _set_access_cookie(response, access_token, settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+
+
     return LoginSuccessResponse(
         status="success",
         access_token=access_token,
@@ -1345,8 +1391,9 @@ async def refresh_token(req: Request, response: Response, db: Annotated[Session,
     db.add(new_rt)
     db.commit()
 
-    # Set new refresh token as HttpOnly cookie
+    # Set new refresh + access cookies (F-C2).
     _set_refresh_cookie(response, new_refresh_str, settings.REFRESH_TOKEN_EXPIRE_DAYS)
+    _set_access_cookie(response, new_access, settings.ACCESS_TOKEN_EXPIRE_MINUTES)
 
     return TokenResponse(
         access_token=new_access,
@@ -1393,15 +1440,9 @@ def logout(
     current_user.is_online = False
     db.commit()
 
-    # Clear the HttpOnly cookie
-    # Must match the same settings as set_cookie
-    response.delete_cookie(
-        key="refresh_token",
-        path="/api/v1/auth",
-        secure=True,
-        httponly=True,
-        samesite="none",  # Must match set_cookie
-    )
+    # Clear both HttpOnly session cookies (security review F-C2: the access
+    # cookie didn't exist before, so this is safe to add unconditionally).
+    _clear_session_cookies(response)
     return {"message": "Logged out successfully"}
 
 
@@ -2293,6 +2334,7 @@ async def _finalize_mfa_login(
     logger.info(f"MFA verification complete, login successful for user {user.id}")
 
     _set_refresh_cookie(response, refresh_token_str, settings.REFRESH_TOKEN_EXPIRE_DAYS)
+    _set_access_cookie(response, access_token, settings.ACCESS_TOKEN_EXPIRE_MINUTES)
 
     response_data = {
         "status": "success",
@@ -2495,8 +2537,9 @@ async def verify_recovery_code_and_login(
 
     logger.info(f"Recovery code login successful for user {user_id}")
 
-    # Set refresh token as HttpOnly cookie (for same-origin fallback)
+    # Set refresh + access HttpOnly cookies (F-C2).
     _set_refresh_cookie(response, refresh_token_str, settings.REFRESH_TOKEN_EXPIRE_DAYS)
+    _set_access_cookie(response, access_token, settings.ACCESS_TOKEN_EXPIRE_MINUTES)
 
     return LoginSuccessResponse(
         status="success",
