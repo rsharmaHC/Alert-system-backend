@@ -363,10 +363,16 @@ def _escape_xml(text: str) -> str:
     return xml_escape(str(text))
 
 
-_BLOCKED_INTERNAL_HOSTNAMES = frozenset([
-    'localhost', 'internal', 'metadata', '169.254.169.254', '127.0.0.1', '::1'
-])
-_DEVELOPMENT_LOCAL_HOSTNAMES = frozenset(['localhost', '127.0.0.1', '::1'])
+# Non-IP hostname strings that must not be reachable as webhook targets.
+# Raw IP literals (127.0.0.1, ::1, 169.254.169.254, etc.) are intentionally
+# NOT in this list — they are caught programmatically by _is_private_ip
+# below, which uses the ipaddress module's is_loopback / is_link_local /
+# is_private / is_reserved properties. Hardcoding them here a second time
+# (a) is redundant and (b) triggers SonarQube S1313 without buying any
+# extra safety. 169.254.169.254 is the cloud-instance metadata endpoint
+# on AWS/Azure/GCP, in the 169.254.0.0/16 link-local range, so
+# is_link_local catches it.
+_BLOCKED_INTERNAL_HOSTNAMES = frozenset(['localhost', 'internal', 'metadata'])
 
 
 def _is_private_ip(hostname: str) -> bool:
@@ -376,6 +382,21 @@ def _is_private_ip(hostname: str) -> bool:
         return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
     except ValueError:
         return False  # Not a bare IP address
+
+
+def _is_development_local(hostname: str) -> bool:
+    """Return True if hostname is same-machine for dev-mode webhook targets.
+
+    Matches 'localhost' by name and every loopback address via
+    ipaddress.is_loopback (covers 127.0.0.0/8 and ::1). Replaces the
+    prior frozenset of hardcoded IP literals.
+    """
+    if hostname.lower() == 'localhost':
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
 
 
 def _has_private_resolved_ip(hostname: str) -> bool:
@@ -414,8 +435,8 @@ def _is_safe_url(url: str) -> bool:
         if not hostname:
             logger.warning("Webhook URL blocked: missing hostname")
             return False
-        # Allow localhost in development mode only
-        if settings.APP_ENV == "development" and hostname.lower() in _DEVELOPMENT_LOCAL_HOSTNAMES:
+        # Allow same-machine webhook targets in development mode only.
+        if settings.APP_ENV == "development" and _is_development_local(hostname):
             logger.info(f"Webhook URL allowed (development): {url}")
             return True
         if hostname.lower() in _BLOCKED_INTERNAL_HOSTNAMES or hostname.endswith('.internal'):
