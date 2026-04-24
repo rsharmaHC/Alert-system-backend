@@ -70,8 +70,24 @@ async def validate_twilio_request(request: Request, body: bytes) -> bool:
     Returns:
         True if signature is valid, False otherwise
     """
-    # Skip validation in development mode for local testing with ngrok
+    # Skip validation in development mode for local testing with ngrok.
+    # The previous check was only APP_ENV == "development"; if a prod
+    # container ever started with APP_ENV misconfigured (CI default,
+    # container cache, ops mistake) while reachable from the public
+    # internet, every Twilio webhook would become unauthenticated. Add a
+    # secondary guard that also requires the configured BACKEND_URL to be
+    # localhost-like (security review B-M1).
     if settings.APP_ENV == "development":
+        backend_url = (settings.BACKEND_URL or "").lower()
+        local_hosts = ("localhost", "127.0.0.1", "::1", "ngrok")
+        if not any(h in backend_url for h in local_hosts) and backend_url:
+            logger.error(
+                "Refusing to skip Twilio signature validation: APP_ENV=development "
+                "but BACKEND_URL=%s looks public. Set APP_ENV=production or point "
+                "BACKEND_URL at a local/ngrok host.",
+                settings.BACKEND_URL,
+            )
+            return False
         logger.debug("Skipping Twilio signature validation in development mode")
         return True
 
