@@ -26,13 +26,19 @@ ENV/
 *.swo
 *~
 
-# Testing
+# Testing — keep test artefacts out of production images
+# (security review D-M3; they add attack surface and image bloat)
 .pytest_cache/
 .coverage
+coverage.xml
 htmlcov/
 .tox/
 *.log
 logs/
+tests/
+pytest.ini
+requirements-test.txt
+test_prototype_pollution.py
 
 # Git
 .git/
