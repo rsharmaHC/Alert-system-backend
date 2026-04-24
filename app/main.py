@@ -685,15 +685,20 @@ app.add_middleware(SecurityHeadersMiddleware)
 # - CORS headers are present on ALL responses (including 413/500 errors from size limiters)
 # - Security headers are applied first, then CORS wraps everything
 # - Browser CORS checks pass for error responses from inner middleware
+# The previous allow_origin_regex permitted ANY host under *.railway.app or
+# *.railway.com with credentials=True, meaning any free-tier Railway app
+# could drive credentialed cross-origin requests against this API. Enumerate
+# exact origins in the ALLOWED_ORIGINS env var (parsed into allowed_origins
+# above) instead of using a subdomain wildcard. Security review B-H2.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
-    allow_origin_regex=r'^https://[a-zA-Z0-9-]+\.railway\.(app|com)$',  # Allow Railway subdomains for migration flexibility
     allow_credentials=True,
     # Only allow necessary HTTP methods
     allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
     # Only allow necessary headers - added X-CSRF-Token for CSRF protection
-    allow_headers=["Authorization", "Content-Type", "Accept", "X-CSRF-Token"],
+    # and X-Checkin-Token for safety-response links (security review F-H3).
+    allow_headers=["Authorization", "Content-Type", "Accept", "X-CSRF-Token", "X-Checkin-Token"],
     # Expose Retry-After and X-CSRF-Token headers for client use
     expose_headers=["Retry-After", "X-Request-ID", "X-CSRF-Token"],
 )
