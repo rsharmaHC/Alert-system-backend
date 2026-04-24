@@ -60,21 +60,8 @@ pytz==2024.1
 # =============================================================================
 # TESTING & QUALITY
 # =============================================================================
-pytest==8.2.0
-pytest-cov==5.0.0
-pytest-asyncio==0.23.6
-pytest-mock==3.14.0
-pytest-xdist==3.6.1
-pytest-timeout==2.3.1
-hypothesis==6.100.2
-locust==2.24.1
-mutmut==2.4.3
-
-# Linting & Type Checking
-ruff==0.4.4
-mypy==1.10.0
-
-# Security Scanning
-bandit==1.7.9
-safety==3.2.2
-pip-audit==2.7.3
+# Test tooling (pytest, hypothesis, locust, mutmut, ruff, mypy, bandit,
+# safety, pip-audit) lives in requirements-test.txt. Production images
+# should install requirements-prod.txt only; CI runs
+#   pip install -r requirements.txt -r requirements-test.txt
+# to get the full dev/test toolchain (security review Dep-L1).
